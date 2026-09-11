@@ -1,0 +1,35 @@
+schema: unbound-force
+
+context: |
+  Project: opencode-metrics
+  Type: OpenCode plugin (npm package, installed via opencode.json "plugin" array)
+  Runtime: Bun (executes inside the OpenCode process)
+  Language: TypeScript
+  SQLite: bun:sqlite (built-in, synchronous)
+  Config format: YAML
+  License: Apache-2.0
+  Plugin API: @opencode-ai/plugin (event hooks, SDK client, shell API)
+
+  This plugin collects session metrics automatically into a local SQLite
+  database (~/.local/share/opencode-metrics/metrics.db). It subscribes to
+  session.status events and UPSERTs session data on every idle transition.
+  The metrics database uses a dimensional model (sessions, projects,
+  measurements fact table, metric_definitions catalog) so new metrics are
+  new rows, not schema changes.
+
+  Companion components (separate repo: ansible-role-ai):
+  - Python collector scripts for backfill, rebuild, sync, and reports
+  - Ephemeral Grafana container with SQLite datasource and pre-provisioned dashboards
+  - Ansible tasks to deploy configuration, cron jobs, and containers
+
+  Conventions:
+  - Conventional commits with Signed-off-by trailer
+  - SPDX license identifiers in all source files
+  - Makefile for standard targets (build, test, lint, clean)
+  - Single source of truth for constants (no magic strings/numbers)
+
+rules:
+  tasks:
+    - Include documentation tasks (install, configure, test, troubleshoot)
+    - Each task should be independently testable
+    - Tasks should be ordered by dependency (foundations first)
