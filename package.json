@@ -1,0 +1,32 @@
+{
+	"name": "opencode-metrics",
+	"version": "0.1.0",
+	"description": "OpenCode plugin for automatic session metrics collection and analytics",
+	"license": "Apache-2.0",
+	"type": "module",
+	"files": [
+		"dist/"
+	],
+	"main": "dist/index.js",
+	"exports": {
+		".": "./dist/index.js"
+	},
+	"scripts": {
+		"build": "bun build src/index.ts --outdir dist --target bun",
+		"test": "bun test --coverage",
+		"lint": "bunx biome check ."
+	},
+	"keywords": [
+		"opencode",
+		"metrics",
+		"plugin",
+		"analytics"
+	],
+	"devDependencies": {
+		"@biomejs/biome": "^2.5.13",
+		"@opencode-ai/plugin": "^1.18.30"
+	},
+	"dependencies": {
+		"yaml": "^2.9.1"
+	}
+}

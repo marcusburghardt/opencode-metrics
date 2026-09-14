@@ -22,3 +22,16 @@
 .unbound-force/
 .muti-mind/
 .mx-f/
+
+# Project artifacts
+node_modules/
+dist/
+coverage/
+
+# SQLite databases
+*.db
+*.db-wal
+*.db-shm
+
+# OS
+.DS_Store

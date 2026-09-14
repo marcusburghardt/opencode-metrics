@@ -1,0 +1,16 @@
+# Source and test files — only dist/ is published
+src/
+*.test.ts
+
+# Spec and config directories
+openspec/
+.opencode/
+.specify/
+.github/
+
+# Build and dev artifacts
+coverage/
+tsconfig.json
+biome.json
+Makefile
+bun.lock

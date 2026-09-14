@@ -1,2 +1,851 @@
 # opencode-metrics
-Collect useful metrics from OpenCode to be used as needed.
+
+Automatic session metrics collection for [OpenCode](https://opencode.ai).
+Captures cost, token usage, session duration, diff stats, and classification
+data into a local SQLite database — queryable with standard SQL tools or
+Grafana dashboards.
+
+## Table of Contents
+
+- [Installation](#installation)
+  - [From npm](#from-npm)
+  - [From local checkout](#from-local-checkout)
+  - [Ansible integration](#ansible-integration)
+  - [Verifying the installation](#verifying-the-installation)
+- [Configuration](#configuration)
+  - [Config file location](#config-file-location)
+  - [Config fields](#config-fields)
+  - [Classification rules](#classification-rules)
+  - [Worked examples](#worked-examples)
+  - [Data directory location](#data-directory-location)
+- [Testing and Verification](#testing-and-verification)
+  - [Verifying metrics collection](#verifying-metrics-collection)
+  - [Example queries](#example-queries)
+  - [Running the test suite](#running-the-test-suite)
+- [Metric Reference](#metric-reference)
+- [Upgrade and Uninstall](#upgrade-and-uninstall)
+  - [Upgrading](#upgrading)
+  - [Uninstalling](#uninstalling)
+- [Troubleshooting](#troubleshooting)
+  - [Common issues](#common-issues)
+  - [Diagnostic commands](#diagnostic-commands)
+  - [Recovery procedures](#recovery-procedures)
+- [Grafana Integration](#grafana-integration)
+  - [Schema overview](#schema-overview)
+  - [Example Grafana queries](#example-grafana-queries)
+  - [Quickstart with ansible-role-ai](#quickstart-with-ansible-role-ai)
+  - [Manual Grafana setup](#manual-grafana-setup)
+
+## Installation
+
+### Prerequisites
+
+- **OpenCode** with plugin support (v1.18+)
+- **Bun** runtime — handled automatically by OpenCode (plugins run inside
+  OpenCode's Bun process)
+
+### From npm
+
+Add `opencode-metrics` to the `plugins` array in your OpenCode configuration
+file (`~/.config/opencode/config.json` or `opencode.json` in your project):
+
+```jsonc
+{
+  "plugins": ["opencode-metrics"]
+}
+```
+
+OpenCode resolves the plugin from npm on startup. No separate `npm install`
+step is required.
+
+### From local checkout
+
+Clone the repository and build:
+
+```sh
+git clone https://github.com/your-org/opencode-metrics.git
+cd opencode-metrics
+make build
+```
+
+Then reference the local path in your OpenCode config:
+
+```jsonc
+{
+  "plugins": ["./path/to/opencode-metrics"]
+}
+```
+
+OpenCode resolves local paths relative to the config file location. The
+`dist/index.js` entry point is used automatically (configured via
+`"main"` in `package.json`).
+
+### Ansible integration
+
+If you manage OpenCode installations with
+[ansible-role-ai](https://github.com/your-org/ansible-role-ai), add the
+plugin to the `ai_opencode_plugins` variable:
+
+```yaml
+ai_opencode_plugins:
+  - opencode-metrics
+```
+
+The role merges this into the generated OpenCode configuration during
+provisioning.
+
+### Verifying the installation
+
+1. **Check logs** — Start an OpenCode session and look for the
+   initialization message:
+
+   ```
+   [opencode-metrics] initialized
+   ```
+
+   OpenCode logs appear in the bottom status bar or in
+   `~/.local/share/opencode/log/`.
+
+2. **Verify the database** — After completing at least one prompt/response
+   cycle, the database file should exist:
+
+   ```sh
+   ls -la ~/.local/share/opencode-metrics/metrics.db
+   ```
+
+3. **Verify tables** — Open the database and confirm the schema:
+
+   ```sh
+   sqlite3 ~/.local/share/opencode-metrics/metrics.db ".tables"
+   ```
+
+   Expected output:
+
+   ```
+   measurements        metric_definitions  projects            sessions
+   ```
+
+## Configuration
+
+### Config file location
+
+```
+~/.local/share/opencode-metrics/config.yaml
+```
+
+The config file is auto-created with sensible defaults on the plugin's
+first run. If `$XDG_DATA_HOME` is set, the path becomes
+`$XDG_DATA_HOME/opencode-metrics/config.yaml`.
+
+The plugin never overwrites an existing config file — your customizations
+are preserved across upgrades.
+
+### Config fields
+
+```yaml
+# Schema version (currently 1)
+version: 1
+
+# Classification rules evaluated in order — first match wins.
+classification_rules:
+  - name: rule-name
+    description: Human-readable description
+    conditions:
+      - field: agent
+        values: ["build"]
+    exclude:
+      - field: bash_commands
+        pattern: 'gh pr create'
+```
+
+| Field                  | Type   | Required | Description                                       |
+|------------------------|--------|----------|---------------------------------------------------|
+| `version`              | number | yes      | Config schema version. Currently `1`.              |
+| `classification_rules` | array  | yes      | Ordered list of classification rules.              |
+
+### Classification rules
+
+Each rule has the following structure:
+
+```yaml
+- name: rule-name            # Required. Unique label stored in the sessions table.
+  description: "..."         # Optional. Human-readable explanation.
+  conditions:                # Required. Array of match conditions (AND logic).
+    - field: agent           # Field to match against.
+      values: ["build"]      # Exact match: field value is in this list.
+    - field: first_user_message
+      pattern: 'github\.com' # Regex match: field value matches this pattern.
+  exclude:                   # Optional. Array of exclusion conditions (OR logic).
+    - field: bash_commands
+      pattern: 'gh pr create'
+```
+
+**Condition fields** available for matching:
+
+| Field                | Type     | Description                                     |
+|----------------------|----------|-------------------------------------------------|
+| `agent`              | string   | Agent name (e.g., `build`, `plan`, `explore`)   |
+| `model`              | string   | Model identifier                                |
+| `first_user_message` | string   | Full text of the first user message              |
+| `part_content`       | string   | Concatenated text from all message parts         |
+| `bash_commands`      | string[] | Shell commands extracted from tool calls          |
+| `message_count`      | number   | Total messages in the session                    |
+
+**Matching types:**
+
+- `pattern` — Regular expression tested against the field value. Array
+  fields (`bash_commands`) are joined with newlines before matching.
+- `values` — Exact match: the field value must appear in the values list.
+  For array fields, any element matching is sufficient.
+
+**Rule evaluation:**
+
+1. Rules are evaluated **in order** — first match wins.
+2. All `conditions` must match (AND logic).
+3. If **any** `exclude` condition matches, the rule is rejected.
+4. An empty `conditions: []` array always matches (vacuous truth) — use
+   this for fallback rules.
+5. If no rules match, the session is classified as `"ad-hoc"`.
+6. Invalid regex patterns cause the entire rule to be skipped with a
+   warning log.
+
+**Default rules** (built-in, ordered):
+
+| Priority | Name              | Matches                                          |
+|----------|-------------------|--------------------------------------------------|
+| 1        | `pr-review`       | PR URL in first message, excludes `gh pr create` |
+| 2        | `pr-creation`     | `gh pr create` in bash commands                  |
+| 3        | `openspec-workflow` | Spec artifact references with plan/build agent  |
+| 4        | `multi-agent`     | Swarm agent prefixes (divisor-, cobalt-, gaze-)  |
+| 5        | `exploration`     | Agent is `explore`                               |
+| 6        | `planning`        | Agent is `plan`                                  |
+| 7        | `implementation`  | Agent is `build`                                 |
+| 8        | `ad-hoc`          | Fallback — empty conditions, always matches      |
+
+### Worked examples
+
+#### Adding a custom classification
+
+Add a `debugging` rule that matches sessions where the first user message
+mentions "bug", "error", or "fix", but is not a PR review:
+
+```yaml
+classification_rules:
+  # Insert before the ad-hoc fallback but after more specific rules.
+  # ... (keep existing rules above) ...
+
+  - name: debugging
+    description: Bug investigation and fixing sessions
+    conditions:
+      - field: first_user_message
+        pattern: '\b(bug|error|fix)\b'
+    exclude:
+      - field: first_user_message
+        pattern: 'github\.com/.+/pull/\d+'
+
+  # Keep ad-hoc as the last rule (fallback).
+  - name: ad-hoc
+    description: Unclassified sessions (default fallback)
+    conditions: []
+```
+
+#### Modifying PR review patterns
+
+Change the PR review rule to also match GitLab merge request URLs:
+
+```yaml
+  - name: pr-review
+    description: Pull/merge request review sessions
+    conditions:
+      - field: first_user_message
+        pattern: '(github\.com/.+/pull/\d+|gitlab\.com/.+/merge_requests/\d+)'
+    exclude:
+      - field: bash_commands
+        pattern: 'gh pr create|glab mr create'
+```
+
+#### Reordering rules
+
+Rule order matters because first match wins. If you want `multi-agent`
+to take priority over `openspec-workflow`, move it higher in the list:
+
+```yaml
+classification_rules:
+  - name: pr-review
+    # ...
+  - name: pr-creation
+    # ...
+  - name: multi-agent        # Moved up — now checked before openspec-workflow
+    # ...
+  - name: openspec-workflow
+    # ...
+```
+
+### Data directory location
+
+The data directory (containing `metrics.db` and `config.yaml`) is
+determined by the `$XDG_DATA_HOME` environment variable or defaults to
+`~/.local/share/opencode-metrics/`. This follows the XDG Base Directory
+Specification and cannot be overridden via config.yaml.
+
+| `$XDG_DATA_HOME`     | Data directory                              |
+|----------------------|---------------------------------------------|
+| Set (e.g. `/data`)   | `$XDG_DATA_HOME/opencode-metrics/`          |
+| Not set              | `~/.local/share/opencode-metrics/`          |
+
+## Testing and Verification
+
+### Verifying metrics collection
+
+After running at least one OpenCode session (completing a prompt/response
+cycle), verify data is being collected:
+
+```sh
+sqlite3 ~/.local/share/opencode-metrics/metrics.db \
+  "SELECT COUNT(*) AS sessions FROM sessions;"
+```
+
+You should see a non-zero count. If the count is 0, check the
+[Troubleshooting](#troubleshooting) section.
+
+### Example queries
+
+**Session count by day:**
+
+```sql
+SELECT date(started_at / 1000, 'unixepoch', 'localtime') AS day,
+       COUNT(*) AS sessions
+FROM sessions
+GROUP BY day
+ORDER BY day DESC
+LIMIT 14;
+```
+
+**Daily cost:**
+
+```sql
+SELECT date(recorded_at / 1000, 'unixepoch', 'localtime') AS day,
+       ROUND(SUM(value), 4) AS total_cost_usd
+FROM measurements
+WHERE metric_name = 'cost'
+GROUP BY day
+ORDER BY day DESC
+LIMIT 14;
+```
+
+**Classification distribution:**
+
+```sql
+SELECT classification,
+       COUNT(*) AS sessions,
+       ROUND(SUM(m.value), 4) AS total_cost
+FROM sessions s
+JOIN measurements m ON s.session_id = m.session_id
+WHERE m.metric_name = 'cost'
+GROUP BY classification
+ORDER BY total_cost DESC;
+```
+
+**Cache hit ratio (average per day):**
+
+```sql
+SELECT date(recorded_at / 1000, 'unixepoch', 'localtime') AS day,
+       ROUND(AVG(value) * 100, 1) AS avg_cache_hit_pct
+FROM measurements
+WHERE metric_name = 'cache_hit_ratio'
+GROUP BY day
+ORDER BY day DESC
+LIMIT 14;
+```
+
+**Top 10 most expensive sessions:**
+
+```sql
+SELECT s.session_id,
+       s.title,
+       s.classification,
+       s.model,
+       ROUND(m.value, 4) AS cost_usd
+FROM sessions s
+JOIN measurements m ON s.session_id = m.session_id
+WHERE m.metric_name = 'cost'
+ORDER BY m.value DESC
+LIMIT 10;
+```
+
+### Running the test suite
+
+```sh
+make test
+```
+
+This runs `bun test --coverage` and reports line coverage per module. The
+project targets a minimum of 80% line coverage.
+
+To run a specific test file:
+
+```sh
+bun test src/classifier.test.ts
+```
+
+To lint the codebase:
+
+```sh
+make lint
+```
+
+## Metric Reference
+
+All 12 metrics are recorded per session on every idle event (UPSERT
+semantics — the latest cumulative value is stored).
+
+| Metric Name        | Unit    | Description                                    | Aggregation |
+|--------------------|---------|------------------------------------------------|-------------|
+| `cost`             | usd     | Total session cost in USD                      | sum         |
+| `tokens_input`     | tokens  | Non-cached input tokens sent to the model      | sum         |
+| `tokens_output`    | tokens  | Output tokens generated by the model           | sum         |
+| `tokens_reasoning` | tokens  | Reasoning tokens consumed by the model         | sum         |
+| `tokens_cache_read`| tokens  | Input tokens served from prompt cache          | sum         |
+| `tokens_cache_write`| tokens | Input tokens written to prompt cache           | sum         |
+| `cache_hit_ratio`  | ratio   | Fraction of input tokens served from cache     | avg         |
+| `duration_seconds` | seconds | Wall-clock session duration in seconds         | sum         |
+| `files_changed`    | count   | Number of files changed in the session         | sum         |
+| `lines_added`      | count   | Lines added across all file changes            | sum         |
+| `lines_deleted`    | count   | Lines deleted across all file changes          | sum         |
+| `messages_total`   | count   | Total messages exchanged in the session        | sum         |
+
+**Derived metrics:**
+
+- `cache_hit_ratio` = `tokens_cache_read / (tokens_cache_read + tokens_input)`.
+  Returns 0 when the denominator is 0.
+- `duration_seconds` = `(time_updated - time_created) / 1000`.
+  Returns 0 when either timestamp is missing or the result would be negative.
+
+**Aggregation column** indicates the recommended SQL aggregate function
+for dashboard panels: `sum` for additive metrics, `avg` for ratios.
+
+**Timestamps:** All timestamp fields (`started_at`, `ended_at`,
+`recorded_at`) store Unix epoch **milliseconds** as INTEGER values. Use
+`date(column / 1000, 'unixepoch')` in SQL queries.
+
+## Upgrade and Uninstall
+
+### Upgrading
+
+Update the plugin to the latest version:
+
+```sh
+npm update opencode-metrics
+```
+
+Or, if installed from a local checkout:
+
+```sh
+cd opencode-metrics
+git pull
+make build
+```
+
+**Data preservation:** Your existing `metrics.db` database and
+`config.yaml` are preserved across upgrades. The schema uses `CREATE
+TABLE IF NOT EXISTS` and `INSERT OR IGNORE` for metric definitions, so
+the database is never destructively modified. Schema versioning
+(`PRAGMA user_version`) ensures future migrations are applied
+automatically on startup.
+
+### Uninstalling
+
+1. Remove the plugin from your OpenCode configuration:
+
+   ```jsonc
+   {
+     "plugins": [
+       // Remove "opencode-metrics" from this array
+     ]
+   }
+   ```
+
+2. (Optional) Delete the data directory:
+
+   ```sh
+   rm -rf ~/.local/share/opencode-metrics
+   ```
+
+   This removes `metrics.db`, `config.yaml`, and any WAL/SHM files. If
+   you used a custom `data_dir`, also delete that directory.
+
+## Troubleshooting
+
+### Common issues
+
+#### Plugin not loading
+
+**Symptom:** No `[opencode-metrics] initialized` message in logs.
+
+**Causes and fixes:**
+
+- **Plugin not in config:** Verify `opencode-metrics` appears in the
+  `plugins` array of your OpenCode config file.
+- **Wrong config file:** OpenCode reads `~/.config/opencode/config.json`
+  (global) or `opencode.json` (project-local). Ensure you edited the
+  correct one.
+- **npm resolution failure:** If using the npm name, ensure network
+  connectivity on first run. OpenCode needs to download the plugin.
+- **Local path incorrect:** If using a local path, ensure the path
+  resolves to a directory containing `package.json` with a valid `main`
+  entry.
+
+#### Database not created
+
+**Symptom:** `~/.local/share/opencode-metrics/metrics.db` does not exist
+after starting OpenCode.
+
+**Causes and fixes:**
+
+- **Plugin not loaded:** See "Plugin not loading" above.
+- **Directory permissions:** The plugin creates
+  `~/.local/share/opencode-metrics/` with mode `0o755`. Verify the parent
+  directory is writable:
+
+  ```sh
+  ls -la ~/.local/share/
+  ```
+
+- **XDG override:** If `$XDG_DATA_HOME` is set, the database is at
+  `$XDG_DATA_HOME/opencode-metrics/metrics.db` instead.
+
+#### Database locked errors
+
+**Symptom:** Log messages containing `SQLITE_BUSY` or
+`database is locked`.
+
+**Causes and fixes:**
+
+- **Multiple instances:** This is expected when many OpenCode instances
+  write simultaneously. The plugin retries up to 3 times with exponential
+  backoff (100ms → 200ms → 400ms). The `busy_timeout` pragma is set to
+  5000ms. Occasional messages are harmless — data is retried and written.
+- **External lock:** If another process holds a long-running transaction
+  on the database (e.g., a backup script or an open sqlite3 shell in
+  write mode), it can block the plugin. Close the external connection.
+- **Stale WAL file:** In rare cases, a crashed process may leave a stale
+  WAL file. See [Recovery procedures](#recovery-procedures).
+
+#### Config validation errors
+
+**Symptom:** Log messages like `Skipping rule 'rule-name': invalid regex`.
+
+**Causes and fixes:**
+
+- **Invalid regex:** Fix the regex pattern in `config.yaml`. Common
+  issues include unescaped special characters (`.` should be `\.` for
+  literal dots) and missing escape backslashes in YAML (use single quotes
+  around patterns to avoid YAML escape interpretation).
+- **Missing required fields:** Rules must have `name` (string) and
+  `conditions` (array). Missing fields cause the rule to be skipped.
+- **Type errors:** Conditions where `field` is not a string, or `values`
+  contains non-strings, cause the rule to be skipped.
+
+The plugin never crashes on config errors — it logs a warning and skips
+the malformed rule. Remaining valid rules continue to work.
+
+### Diagnostic commands
+
+**Check plugin log output:**
+
+```sh
+# Tail OpenCode logs for metrics-related messages
+grep -r "opencode-metrics" ~/.local/share/opencode/log/
+```
+
+**Inspect the database schema:**
+
+```sh
+sqlite3 ~/.local/share/opencode-metrics/metrics.db ".schema"
+```
+
+**Verify WAL mode is active:**
+
+```sh
+sqlite3 ~/.local/share/opencode-metrics/metrics.db "PRAGMA journal_mode;"
+```
+
+Expected output: `wal`
+
+**Check schema version:**
+
+```sh
+sqlite3 ~/.local/share/opencode-metrics/metrics.db "PRAGMA user_version;"
+```
+
+Expected output: `1`
+
+**Run an integrity check:**
+
+```sh
+sqlite3 ~/.local/share/opencode-metrics/metrics.db "PRAGMA integrity_check;"
+```
+
+Expected output: `ok`
+
+**Check metric definitions are seeded:**
+
+```sh
+sqlite3 ~/.local/share/opencode-metrics/metrics.db \
+  "SELECT metric_name, unit, aggregation FROM metric_definitions ORDER BY metric_name;"
+```
+
+### Recovery procedures
+
+#### Rebuild the database
+
+If the database is corrupted beyond repair:
+
+```sh
+# Back up the corrupted database (in case you need forensics).
+mv ~/.local/share/opencode-metrics/metrics.db \
+   ~/.local/share/opencode-metrics/metrics.db.bak
+
+# Remove WAL and SHM files.
+rm -f ~/.local/share/opencode-metrics/metrics.db-wal
+rm -f ~/.local/share/opencode-metrics/metrics.db-shm
+
+# Restart OpenCode — the plugin creates a fresh database automatically.
+```
+
+Note: Rebuilding the database loses historical data. If you need to
+recover data from a corrupted database, try the SQLite `.recover` command
+first:
+
+```sh
+sqlite3 ~/.local/share/opencode-metrics/metrics.db.bak ".recover" \
+  | sqlite3 ~/.local/share/opencode-metrics/metrics-recovered.db
+```
+
+#### Reset config to defaults
+
+```sh
+# Remove the existing config — the plugin writes a fresh default on
+# next startup.
+rm ~/.local/share/opencode-metrics/config.yaml
+
+# Restart OpenCode.
+```
+
+## Grafana Integration
+
+The metrics database is designed for direct querying by Grafana using
+the [frser-sqlite-datasource](https://github.com/fr-ser/grafana-sqlite-datasource)
+plugin.
+
+### Schema overview
+
+```
+┌──────────────┐     ┌──────────────┐     ┌────────────────────┐
+│   projects   │     │   sessions   │     │ metric_definitions │
+│──────────────│     │──────────────│     │────────────────────│
+│ project_id   │◄────│ project_id   │     │ metric_name        │
+│ name         │     │ session_id   │     │ unit               │
+│ worktree     │     │ agent        │     │ description        │
+│              │     │ model        │     │ aggregation        │
+│              │     │ classification│     └────────────────────┘
+│              │     │ title        │              │
+│              │     │ started_at   │              │
+│              │     │ ended_at     │     ┌────────────────┐
+│              │     │ metadata     │     │  measurements  │
+└──────────────┘     └──────┬───────┘     │────────────────│
+                            │             │ session_id     │
+                            └────────────►│ metric_name    │
+                                          │ value          │
+                                          │ recorded_at    │
+                                          └────────────────┘
+```
+
+**Mapping to Grafana panels:**
+
+| Panel Type   | Table             | Key Columns                     |
+|--------------|-------------------|---------------------------------|
+| Time series  | `measurements`    | `recorded_at` (x), `value` (y)  |
+| Stat / Gauge | `measurements`    | `SUM(value)` or `AVG(value)`    |
+| Table        | `sessions` + join | Session list with metrics        |
+| Pie chart    | `sessions`        | `classification` + `COUNT(*)`   |
+| Bar chart    | `sessions`        | `model` or `agent` grouping     |
+
+### Example Grafana queries
+
+All queries use the `recorded_at` or `started_at` column as the time
+axis. The frser-sqlite-datasource plugin expects a column named `time`
+for time-series panels.
+
+**Daily cost time-series:**
+
+```sql
+SELECT date(recorded_at / 1000, 'unixepoch') AS time,
+       ROUND(SUM(value), 4) AS cost
+FROM measurements
+WHERE metric_name = 'cost'
+  AND recorded_at >= $__from * 1000000
+  AND recorded_at <= $__to * 1000000
+GROUP BY time
+ORDER BY time;
+```
+
+> **Note:** The frser-sqlite-datasource `$__from` and `$__to` macros
+> provide epoch *microseconds*. Since `recorded_at` stores
+> *milliseconds*, multiply the macro by `1000000 / 1000 = 1000` or
+> divide `recorded_at` accordingly. Adjust the comparison based on your
+> datasource version — some versions provide milliseconds directly. Test
+> with your setup and adjust as needed.
+
+**Cost by project:**
+
+```sql
+SELECT p.name AS project,
+       ROUND(SUM(m.value), 4) AS total_cost
+FROM measurements m
+JOIN sessions s ON m.session_id = s.session_id
+JOIN projects p ON s.project_id = p.project_id
+WHERE m.metric_name = 'cost'
+GROUP BY p.name
+ORDER BY total_cost DESC;
+```
+
+**Cost by classification:**
+
+```sql
+SELECT s.classification,
+       ROUND(SUM(m.value), 4) AS total_cost,
+       COUNT(DISTINCT s.session_id) AS sessions
+FROM measurements m
+JOIN sessions s ON m.session_id = s.session_id
+WHERE m.metric_name = 'cost'
+GROUP BY s.classification
+ORDER BY total_cost DESC;
+```
+
+**Session count by day:**
+
+```sql
+SELECT date(started_at / 1000, 'unixepoch') AS time,
+       COUNT(*) AS sessions
+FROM sessions
+GROUP BY time
+ORDER BY time;
+```
+
+**Average cache hit ratio by day:**
+
+```sql
+SELECT date(recorded_at / 1000, 'unixepoch') AS time,
+       ROUND(AVG(value) * 100, 1) AS cache_hit_pct
+FROM measurements
+WHERE metric_name = 'cache_hit_ratio'
+GROUP BY time
+ORDER BY time;
+```
+
+**Top 10 most expensive sessions:**
+
+```sql
+SELECT s.title,
+       s.classification,
+       s.model,
+       s.agent,
+       ROUND(m.value, 4) AS cost_usd,
+       datetime(s.started_at / 1000, 'unixepoch', 'localtime') AS started
+FROM sessions s
+JOIN measurements m ON s.session_id = m.session_id
+WHERE m.metric_name = 'cost'
+ORDER BY m.value DESC
+LIMIT 10;
+```
+
+### Quickstart with ansible-role-ai
+
+The [ansible-role-ai](https://github.com/your-org/ansible-role-ai) role
+deploys an ephemeral Grafana container pre-configured with the
+frser-sqlite-datasource plugin and the metrics database. This is the
+fastest way to get dashboards running:
+
+```yaml
+# In your playbook or host_vars:
+ai_opencode_plugins:
+  - opencode-metrics
+
+ai_grafana_enabled: true
+```
+
+Run the playbook to provision:
+
+- The opencode-metrics plugin in your OpenCode config
+- A Grafana container with the SQLite datasource pre-configured
+- The metrics database bind-mounted into the container
+
+Refer to the ansible-role-ai documentation for detailed variable
+reference and dashboard provisioning.
+
+### Manual Grafana setup
+
+#### 1. Install the SQLite datasource plugin
+
+Install the [frser-sqlite-datasource](https://github.com/fr-ser/grafana-sqlite-datasource)
+plugin in your Grafana instance:
+
+```sh
+grafana cli plugins install frser-sqlite-datasource
+```
+
+Or add it to your Grafana container's `GF_INSTALL_PLUGINS` environment
+variable:
+
+```yaml
+environment:
+  GF_INSTALL_PLUGINS: frser-sqlite-datasource
+```
+
+#### 2. Configure the datasource
+
+In Grafana, add a new **SQLite** datasource:
+
+- **Path:** `/path/to/metrics.db`
+
+If Grafana runs in a container, bind-mount the database directory:
+
+```yaml
+volumes:
+  - ~/.local/share/opencode-metrics:/data/opencode-metrics:ro
+```
+
+Then set the datasource path to `/data/opencode-metrics/metrics.db`.
+
+#### 3. WAL mode considerations
+
+The database uses WAL (Write-Ahead Log) mode for concurrent access.
+When bind-mounting into a container, you must mount the **entire
+directory**, not just the `.db` file, because WAL mode uses companion
+files (`metrics.db-wal` and `metrics.db-shm`) that must be in the same
+directory as the main database file.
+
+```yaml
+# Correct — mount the directory:
+volumes:
+  - ~/.local/share/opencode-metrics:/data/opencode-metrics:ro
+
+# Incorrect — mounting just the file breaks WAL mode:
+# volumes:
+#   - ~/.local/share/opencode-metrics/metrics.db:/data/metrics.db:ro
+```
+
+The `:ro` (read-only) mount is recommended for Grafana since it only
+reads the database. WAL mode supports concurrent readers without
+blocking writers.
+
+#### 4. Create panels
+
+Use the [example queries](#example-grafana-queries) above as starting
+points for your dashboard panels. The `time` column alias is required
+for time-series panels in the frser-sqlite-datasource plugin.
+
+## License
+
+Apache-2.0
