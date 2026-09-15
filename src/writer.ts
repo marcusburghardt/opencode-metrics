@@ -77,17 +77,44 @@ export function upsertSession(db: Database, session: SessionRecord): void {
 	);
 }
 
+/** Options for writeMetrics(). */
+export interface WriteMetricsOptions {
+	/**
+	 * When true, skip computing and storing incremental deltas in
+	 * measurement_deltas. Use this for backfill imports where the
+	 * cumulative value is the only data available — recording a single
+	 * delta equal to the full cumulative value would distort time-sliced
+	 * aggregations (e.g., attributing a multi-day session's entire cost
+	 * to one day).
+	 */
+	skipDeltas?: boolean;
+}
+
 /**
- * Batch-upsert measurement rows for a session.
- * On conflict (same session_id + metric_name), overwrite value and
- * recorded_at so the latest measurement always wins.
+ * Batch-upsert measurement rows for a session, optionally computing
+ * and storing incremental deltas before each upsert.
+ *
+ * For each metric: (a) read the current cumulative value from
+ * measurements, (b) compute delta = new_value - previous_value,
+ * (c) INSERT OR IGNORE the delta into measurement_deltas if non-zero,
+ * (d) UPSERT into measurements as before.
+ *
+ * The OR IGNORE clause on the delta insert ensures that a primary key
+ * collision (near-impossible sub-millisecond idle events) degrades
+ * gracefully without aborting the cumulative upsert.
+ *
+ * Pass `{ skipDeltas: true }` for backfill imports where only
+ * cumulative totals are available.
  */
 export function writeMetrics(
 	db: Database,
 	sessionId: string,
 	metrics: ReadonlyArray<MetricRecord>,
+	options?: WriteMetricsOptions,
 ): void {
-	const stmt = db.prepare(
+	const skipDeltas = options?.skipDeltas ?? false;
+
+	const upsertStmt = db.prepare(
 		`INSERT INTO measurements (session_id, metric_name, value, recorded_at)
 		 VALUES (?, ?, ?, ?)
 		 ON CONFLICT(session_id, metric_name) DO UPDATE SET
@@ -95,8 +122,31 @@ export function writeMetrics(
 			recorded_at = excluded.recorded_at`,
 	);
 
+	if (skipDeltas) {
+		for (const metric of metrics) {
+			upsertStmt.run(sessionId, metric.metric_name, metric.value, metric.recorded_at);
+		}
+		return;
+	}
+
+	const readStmt = db.prepare(
+		"SELECT value FROM measurements WHERE session_id = ? AND metric_name = ?",
+	);
+	const deltaStmt = db.prepare(
+		`INSERT OR IGNORE INTO measurement_deltas (session_id, metric_name, delta, recorded_at)
+		 VALUES (?, ?, ?, ?)`,
+	);
+
 	for (const metric of metrics) {
-		stmt.run(sessionId, metric.metric_name, metric.value, metric.recorded_at);
+		const existing = readStmt.get(sessionId, metric.metric_name) as { value: number } | undefined;
+		const previousValue = existing?.value ?? 0;
+		const delta = metric.value - previousValue;
+
+		if (delta !== 0) {
+			deltaStmt.run(sessionId, metric.metric_name, delta, metric.recorded_at);
+		}
+
+		upsertStmt.run(sessionId, metric.metric_name, metric.value, metric.recorded_at);
 	}
 }
 

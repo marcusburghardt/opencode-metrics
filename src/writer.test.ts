@@ -244,6 +244,222 @@ describe("writer", () => {
 		});
 	});
 
+	describe("writeMetrics delta tracking", () => {
+		it("first write creates a delta row equal to the full value", () => {
+			writeMetrics(db, "sess-001", [
+				{ metric_name: "cost", value: 0.42, recorded_at: 1700000000000 },
+			]);
+
+			const deltas = db
+				.prepare("SELECT delta FROM measurement_deltas WHERE session_id = ? AND metric_name = ?")
+				.all("sess-001", "cost") as Array<{ delta: number }>;
+
+			expect(deltas.length).toBe(1);
+			expect(deltas[0].delta).toBeCloseTo(0.42);
+		});
+
+		it("second write creates a delta row with the difference", () => {
+			writeMetrics(db, "sess-001", [
+				{ metric_name: "cost", value: 0.42, recorded_at: 1700000000000 },
+			]);
+			writeMetrics(db, "sess-001", [
+				{ metric_name: "cost", value: 1.0, recorded_at: 1700001000000 },
+			]);
+
+			const deltas = db
+				.prepare(
+					"SELECT delta FROM measurement_deltas WHERE session_id = ? AND metric_name = ? ORDER BY recorded_at",
+				)
+				.all("sess-001", "cost") as Array<{ delta: number }>;
+
+			expect(deltas.length).toBe(2);
+			expect(deltas[0].delta).toBeCloseTo(0.42);
+			expect(deltas[1].delta).toBeCloseTo(0.58);
+		});
+
+		it("write with unchanged value creates no delta row (zero skipped)", () => {
+			writeMetrics(db, "sess-001", [
+				{ metric_name: "cost", value: 0.42, recorded_at: 1700000000000 },
+			]);
+			writeMetrics(db, "sess-001", [
+				{ metric_name: "cost", value: 0.42, recorded_at: 1700001000000 },
+			]);
+
+			const deltas = db
+				.prepare("SELECT delta FROM measurement_deltas WHERE session_id = ? AND metric_name = ?")
+				.all("sess-001", "cost") as Array<{ delta: number }>;
+
+			// Only the first write should produce a delta row.
+			expect(deltas.length).toBe(1);
+		});
+
+		it("SUM(delta) equals the final cumulative value after multiple updates", () => {
+			const values = [0.1, 0.3, 0.3, 0.75, 1.0];
+			for (let i = 0; i < values.length; i++) {
+				writeMetrics(db, "sess-001", [
+					{ metric_name: "cost", value: values[i], recorded_at: 1700000000000 + i * 1000 },
+				]);
+			}
+
+			const sumRow = db
+				.prepare(
+					"SELECT SUM(delta) AS total FROM measurement_deltas WHERE session_id = ? AND metric_name = ?",
+				)
+				.get("sess-001", "cost") as { total: number };
+
+			const measurementRow = db
+				.prepare("SELECT value FROM measurements WHERE session_id = ? AND metric_name = ?")
+				.get("sess-001", "cost") as { value: number };
+
+			expect(sumRow.total).toBeCloseTo(1.0);
+			expect(measurementRow.value).toBeCloseTo(1.0);
+		});
+
+		it("negative delta is recorded correctly (value decreases)", () => {
+			writeMetrics(db, "sess-001", [
+				{ metric_name: "files_changed", value: 5, recorded_at: 1700000000000 },
+			]);
+			writeMetrics(db, "sess-001", [
+				{ metric_name: "files_changed", value: 3, recorded_at: 1700001000000 },
+			]);
+
+			const deltas = db
+				.prepare(
+					"SELECT delta FROM measurement_deltas WHERE session_id = ? AND metric_name = ? ORDER BY recorded_at",
+				)
+				.all("sess-001", "files_changed") as Array<{ delta: number }>;
+
+			expect(deltas.length).toBe(2);
+			expect(deltas[0].delta).toBe(5);
+			expect(deltas[1].delta).toBe(-2);
+		});
+
+		it("multiple metrics in a single writeMetrics() call each get their own delta rows", () => {
+			writeMetrics(db, "sess-001", [
+				{ metric_name: "cost", value: 0.42, recorded_at: 1700000000000 },
+				{ metric_name: "tokens_input", value: 1500, recorded_at: 1700000000000 },
+			]);
+
+			const costDeltas = db
+				.prepare("SELECT delta FROM measurement_deltas WHERE session_id = ? AND metric_name = ?")
+				.all("sess-001", "cost") as Array<{ delta: number }>;
+
+			const tokenDeltas = db
+				.prepare("SELECT delta FROM measurement_deltas WHERE session_id = ? AND metric_name = ?")
+				.all("sess-001", "tokens_input") as Array<{ delta: number }>;
+
+			expect(costDeltas.length).toBe(1);
+			expect(costDeltas[0].delta).toBeCloseTo(0.42);
+			expect(tokenDeltas.length).toBe(1);
+			expect(tokenDeltas[0].delta).toBe(1500);
+		});
+
+		it("delta rows are rolled back when the enclosing transaction fails", () => {
+			const brokenTransaction = db.transaction(() => {
+				writeMetrics(db, "sess-rollback", [
+					{ metric_name: "cost", value: 0.42, recorded_at: 1700000000000 },
+				]);
+				throw new Error("simulated failure");
+			});
+
+			expect(() => brokenTransaction()).toThrow("simulated failure");
+
+			const deltas = db
+				.prepare("SELECT COUNT(*) AS count FROM measurement_deltas WHERE session_id = ?")
+				.get("sess-rollback") as { count: number };
+
+			expect(deltas.count).toBe(0);
+
+			const measurements = db
+				.prepare("SELECT COUNT(*) AS count FROM measurements WHERE session_id = ?")
+				.get("sess-rollback") as { count: number };
+
+			expect(measurements.count).toBe(0);
+		});
+
+		it("5-step invariant: individual deltas and SUM match expectations", () => {
+			const values = [0.1, 0.3, 0.3, 0.75, 1.0];
+			for (let i = 0; i < values.length; i++) {
+				writeMetrics(db, "sess-invariant", [
+					{ metric_name: "cost", value: values[i], recorded_at: 1700000000000 + i * 1000 },
+				]);
+			}
+
+			const deltas = db
+				.prepare(
+					"SELECT delta FROM measurement_deltas WHERE session_id = ? AND metric_name = ? ORDER BY recorded_at",
+				)
+				.all("sess-invariant", "cost") as Array<{ delta: number }>;
+
+			// Expected deltas: 0.10, 0.20, (skipped: 0.30→0.30 = 0), 0.45, 0.25
+			expect(deltas.length).toBe(4);
+			expect(deltas[0].delta).toBeCloseTo(0.1);
+			expect(deltas[1].delta).toBeCloseTo(0.2);
+			expect(deltas[2].delta).toBeCloseTo(0.45);
+			expect(deltas[3].delta).toBeCloseTo(0.25);
+
+			// SUM(delta) must equal the final cumulative value.
+			const sumRow = db
+				.prepare(
+					"SELECT SUM(delta) AS total FROM measurement_deltas WHERE session_id = ? AND metric_name = ?",
+				)
+				.get("sess-invariant", "cost") as { total: number };
+			expect(sumRow.total).toBeCloseTo(1.0);
+
+			// measurements.value must equal the final cumulative value.
+			const measurementRow = db
+				.prepare("SELECT value FROM measurements WHERE session_id = ? AND metric_name = ?")
+				.get("sess-invariant", "cost") as { value: number };
+			expect(measurementRow.value).toBeCloseTo(1.0);
+		});
+
+		it("skipDeltas option prevents delta row creation", () => {
+			writeMetrics(
+				db,
+				"sess-nodelete",
+				[
+					{ metric_name: "cost", value: 5.0, recorded_at: 1700000000000 },
+					{ metric_name: "tokens_input", value: 1000, recorded_at: 1700000000000 },
+				],
+				{ skipDeltas: true },
+			);
+
+			// Cumulative values should be written
+			const measurement = db
+				.prepare("SELECT value FROM measurements WHERE session_id = ? AND metric_name = ?")
+				.get("sess-nodelete", "cost") as { value: number };
+			expect(measurement.value).toBe(5.0);
+
+			// No delta rows should exist
+			const deltas = db
+				.prepare("SELECT COUNT(*) as count FROM measurement_deltas WHERE session_id = ?")
+				.get("sess-nodelete") as { count: number };
+			expect(deltas.count).toBe(0);
+		});
+
+		it("skipDeltas still allows subsequent live deltas", () => {
+			// Backfill with skipDeltas
+			writeMetrics(
+				db,
+				"sess-hybrid",
+				[{ metric_name: "cost", value: 5.0, recorded_at: 1700000000000 }],
+				{ skipDeltas: true },
+			);
+
+			// Subsequent live write without skipDeltas
+			writeMetrics(db, "sess-hybrid", [
+				{ metric_name: "cost", value: 7.5, recorded_at: 1700003600000 },
+			]);
+
+			// Should have one delta row: 7.5 - 5.0 = 2.5
+			const deltas = db
+				.prepare("SELECT delta FROM measurement_deltas WHERE session_id = ? AND metric_name = ?")
+				.all("sess-hybrid", "cost") as Array<{ delta: number }>;
+			expect(deltas.length).toBe(1);
+			expect(deltas[0].delta).toBeCloseTo(2.5);
+		});
+	});
+
 	describe("withRetry", () => {
 		it("returns the result on first success", async () => {
 			const result = await withRetry(() => 42);

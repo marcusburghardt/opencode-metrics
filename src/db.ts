@@ -184,6 +184,36 @@ function createSchema(db: Database): void {
 			strftime('%Y-%m-%dT%H:%M:%SZ', recorded_at / 1000, 'unixepoch') AS recorded_at_iso
 		FROM measurements
 	`);
+
+	// Task 1.1: measurement_deltas table — stores incremental changes per
+	// metric on each idle event, enabling accurate time-sliced aggregation
+	// (e.g., daily cost) even for multi-day sessions.
+	db.run(`
+		CREATE TABLE IF NOT EXISTS measurement_deltas (
+			session_id  TEXT,
+			metric_name TEXT,
+			delta       REAL,
+			recorded_at INTEGER,
+			PRIMARY KEY (session_id, metric_name, recorded_at)
+		)
+	`);
+
+	// Task 1.2: Secondary index for efficient cross-session aggregation
+	// queries that filter by metric name and aggregate across time ranges.
+	db.run(
+		"CREATE INDEX IF NOT EXISTS idx_deltas_metric_time ON measurement_deltas (metric_name, recorded_at)",
+	);
+
+	// Task 1.3: Convenience view — same pattern as v_measurements:
+	// expose recorded_at as epoch seconds and ISO-8601 string.
+	db.run(`
+		CREATE VIEW IF NOT EXISTS v_measurement_deltas AS
+		SELECT
+			session_id, metric_name, delta,
+			recorded_at / 1000 AS recorded_at_epoch,
+			strftime('%Y-%m-%dT%H:%M:%SZ', recorded_at / 1000, 'unixepoch') AS recorded_at_iso
+		FROM measurement_deltas
+	`);
 }
 
 /**

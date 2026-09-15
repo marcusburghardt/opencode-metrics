@@ -32,6 +32,7 @@ Grafana dashboards.
     - [Session analytics](#session-analytics)
     - [Code impact](#code-impact)
     - [Top sessions and KPIs](#top-sessions-and-kpis)
+    - [Delta-based queries (accurate daily cost)](#delta-based-queries-accurate-daily-cost)
   - [Running the test suite](#running-the-test-suite)
 - [Metric Reference](#metric-reference)
 - [Upgrade and Uninstall](#upgrade-and-uninstall)
@@ -411,16 +412,32 @@ run the backfill, check the [Troubleshooting](#troubleshooting) section.
 ### Example queries
 
 The database stores timestamps as epoch milliseconds. For convenience,
-two SQL views are provided that pre-convert timestamps:
+three SQL views are provided that pre-convert timestamps:
 
 - **`v_sessions`** — exposes `started_at_epoch` (seconds),
   `started_at_iso` (RFC3339), `ended_at_epoch`, `ended_at_iso`
 - **`v_measurements`** — exposes `recorded_at_epoch` (seconds),
   `recorded_at_iso` (RFC3339)
+- **`v_measurement_deltas`** — exposes `recorded_at_epoch` (seconds),
+  `recorded_at_iso` (RFC3339), with the incremental `delta` column
+
+**When to use each view:**
+
+- **`v_measurements`** — cumulative totals: total cost per session,
+  total cost by classification, total tokens per model. Use when you
+  need the final value for each session.
+- **`v_measurement_deltas`** — time-sliced aggregation: daily cost,
+  weekly trend, cost incurred today. Use when you need to attribute
+  costs to the time period they were incurred, especially for
+  multi-day sessions. Only meaningful for metrics with
+  `aggregation = 'sum'` in `metric_definitions` (cost, tokens, counts).
+  Non-summable metrics (`cache_hit_ratio` with `aggregation = 'avg'`)
+  have mechanically correct deltas but `SUM(delta)` produces
+  analytically meaningless results for ratios.
 
 Use the views for Grafana panels and casual queries. Use the base
-tables (`sessions`, `measurements`) when you need raw millisecond
-precision.
+tables (`sessions`, `measurements`, `measurement_deltas`) when you
+need raw millisecond precision.
 
 #### Cost overview
 
@@ -745,6 +762,52 @@ FROM v_measurements
 WHERE metric_name = 'cache_hit_ratio'
 ORDER BY time;
 ```
+
+#### Delta-based queries (accurate daily cost)
+
+The `v_measurement_deltas` view provides accurate time-sliced
+aggregation for multi-day sessions. Unlike `v_measurements` (which
+stores the cumulative total per session), deltas record the incremental
+change on each idle event — so `SUM(delta)` over a date range gives the
+exact cost incurred during that period.
+
+**Cost incurred today:**
+
+```sql
+SELECT ROUND(SUM(delta), 2) AS "Today's Cost"
+FROM v_measurement_deltas
+WHERE metric_name = 'cost'
+  AND date(recorded_at_epoch, 'unixepoch') = date('now');
+```
+
+**Daily cost breakdown for a specific session:**
+
+```sql
+SELECT date(recorded_at_epoch, 'unixepoch') AS day,
+       ROUND(SUM(delta), 2) AS cost_that_day
+FROM v_measurement_deltas
+WHERE session_id = 'ses_...'
+  AND metric_name = 'cost'
+GROUP BY day;
+```
+
+**Accurate daily cost trend (handles multi-day sessions correctly):**
+
+```sql
+SELECT date(recorded_at_epoch, 'unixepoch', 'localtime') AS day,
+       ROUND(SUM(delta), 2) AS cost_usd
+FROM v_measurement_deltas
+WHERE metric_name = 'cost'
+GROUP BY day
+ORDER BY day DESC
+LIMIT 14;
+```
+
+> **Note:** `SUM(delta)` is only meaningful for metrics with
+> `aggregation = 'sum'` in `metric_definitions` (cost, tokens, counts).
+> Non-summable metrics (`cache_hit_ratio` with `aggregation = 'avg'`)
+> have mechanically correct deltas but `SUM(delta)` produces
+> analytically meaningless results for ratios.
 
 ### Running the test suite
 

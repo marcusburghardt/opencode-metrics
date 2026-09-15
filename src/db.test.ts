@@ -8,13 +8,23 @@ import path from "node:path";
 import { initDatabase } from "./db";
 
 /** Helper tables expected in the v1 schema. */
-const EXPECTED_TABLES = ["projects", "sessions", "metric_definitions", "measurements"];
+const EXPECTED_TABLES = [
+	"projects",
+	"sessions",
+	"metric_definitions",
+	"measurements",
+	"measurement_deltas",
+];
 
 /** Helper views expected in the v1 schema. */
-const EXPECTED_VIEWS = ["v_sessions", "v_measurements"];
+const EXPECTED_VIEWS = ["v_sessions", "v_measurements", "v_measurement_deltas"];
 
 /** Helper indexes expected in the v1 schema. */
-const EXPECTED_INDEXES = ["idx_measurements_time", "idx_measurements_metric"];
+const EXPECTED_INDEXES = [
+	"idx_measurements_time",
+	"idx_measurements_metric",
+	"idx_deltas_metric_time",
+];
 
 describe("initDatabase", () => {
 	let tempDir: string;
@@ -199,6 +209,57 @@ describe("initDatabase", () => {
 		expect(row.recorded_at_epoch).toBe(1700003600);
 		expect(row.recorded_at_iso).toBe("2023-11-14T23:13:20Z");
 		expect(row.value).toBe(0.42);
+		expect(row.metric_name).toBe("cost");
+	});
+
+	it("measurement_deltas table exists with correct columns", () => {
+		const columns = db.prepare("PRAGMA table_info(measurement_deltas)").all() as Array<{
+			name: string;
+			type: string;
+		}>;
+
+		const columnMap = new Map(columns.map((col) => [col.name, col.type]));
+
+		expect(columnMap.get("session_id")).toBe("TEXT");
+		expect(columnMap.get("metric_name")).toBe("TEXT");
+		expect(columnMap.get("delta")).toBe("REAL");
+		expect(columnMap.get("recorded_at")).toBe("INTEGER");
+		expect(columns.length).toBe(4);
+	});
+
+	it("idx_deltas_metric_time index exists", () => {
+		const indexes = db
+			.prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+			.all() as Array<{ name: string }>;
+
+		const indexNames = indexes.map((row) => row.name);
+		expect(indexNames).toContain("idx_deltas_metric_time");
+	});
+
+	it("v_measurement_deltas view exists", () => {
+		const views = db
+			.prepare("SELECT name FROM sqlite_master WHERE type = 'view' ORDER BY name")
+			.all() as Array<{ name: string }>;
+
+		const viewNames = views.map((row) => row.name);
+		expect(viewNames).toContain("v_measurement_deltas");
+	});
+
+	it("v_measurement_deltas returns correct epoch and ISO columns", () => {
+		// Insert a delta row with known timestamp: 1700003600000 ms
+		// = 1700003600 epoch seconds = 2023-11-14T23:13:20Z
+		db.run(
+			`INSERT INTO measurement_deltas (session_id, metric_name, delta, recorded_at)
+			 VALUES ('s1', 'cost', 0.42, 1700003600000)`,
+		);
+
+		const row = db
+			.prepare("SELECT * FROM v_measurement_deltas WHERE session_id = 's1'")
+			.get() as Record<string, unknown>;
+
+		expect(row.recorded_at_epoch).toBe(1700003600);
+		expect(row.recorded_at_iso).toBe("2023-11-14T23:13:20Z");
+		expect(row.delta).toBe(0.42);
 		expect(row.metric_name).toBe("cost");
 	});
 });

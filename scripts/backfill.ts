@@ -437,6 +437,11 @@ async function runBackfill(args: CliArgs): Promise<BackfillStats> {
 						metadata: null,
 					});
 
+					// Skip delta writes: backfilled sessions only have cumulative
+					// totals. Recording delta = cumulative would distort
+					// time-sliced aggregations (e.g., attributing a multi-day
+					// session's entire cost to one day). Deltas accumulate
+					// organically from live idle events going forward.
 					writeMetrics(destDb, session.id, [
 						{ metric_name: "cost", value: session.cost ?? 0, recorded_at: recordedAt },
 						{ metric_name: "tokens_input", value: session.tokens_input ?? 0, recorded_at: recordedAt },
@@ -450,7 +455,7 @@ async function runBackfill(args: CliArgs): Promise<BackfillStats> {
 						{ metric_name: "lines_added", value: session.summary_additions ?? 0, recorded_at: recordedAt },
 						{ metric_name: "lines_deleted", value: session.summary_deletions ?? 0, recorded_at: recordedAt },
 						{ metric_name: "messages_total", value: messageCount, recorded_at: recordedAt },
-					]);
+					], { skipDeltas: true });
 				}
 
 				stats.totalSessions++;

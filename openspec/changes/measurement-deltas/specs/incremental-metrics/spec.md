@@ -98,7 +98,10 @@ measurements table.
 The writeMetrics() function SHALL, for each metric, read the current
 value from the measurements table, compute the delta
 (new_value - previous_value), insert the delta into measurement_deltas
-(if non-zero), and then perform the existing UPSERT into measurements.
+using INSERT OR IGNORE (if non-zero), and then perform the existing
+UPSERT into measurements. The OR IGNORE clause ensures that a
+primary key collision on the delta table (near-impossible sub-millisecond
+idle events) degrades gracefully without aborting the cumulative write.
 All operations SHALL occur within the caller's transaction scope.
 
 #### Scenario: writeMetrics called within a transaction
