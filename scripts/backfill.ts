@@ -380,20 +380,24 @@ async function runBackfill(args: CliArgs): Promise<BackfillStats> {
 
 		for (const session of sessions) {
 			try {
+				const messageCount = getMessageCount(sourceDb, session.id);
+
 				// Resolve agent — fall back to message data for older OpenCode
 				// versions (pre-May 2026) that didn't populate session-level columns.
+				// Sessions with zero messages are labeled "empty-session" rather
+				// than "unknown" to distinguish truly empty spawns from extraction
+				// failures.
+				const emptyLabel = messageCount === 0 ? "empty-session" : "unknown";
 				const agent = session.agent
 					|| getAgentFromMessages(sourceDb, session.id)
-					|| "unknown";
+					|| emptyLabel;
 
 				// Resolve model — same fallback strategy.
 				let modelId = extractModelId(session.model);
 				if (modelId === "unknown") {
 					const msgModel = getModelFromMessages(sourceDb, session.id);
-					if (msgModel) modelId = msgModel;
+					modelId = msgModel || emptyLabel;
 				}
-
-				const messageCount = getMessageCount(sourceDb, session.id);
 				const firstUserMessage = getFirstUserMessage(sourceDb, session.id);
 				const bashCommands = getBashCommands(sourceDb, session.id);
 				const partContent = getPartContent(sourceDb, session.id);
