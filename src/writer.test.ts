@@ -28,15 +28,15 @@ function makeSession(overrides: Partial<SessionRecord> = {}): SessionRecord {
 		model: "claude-opus-4-20250514",
 		classification: "implementation",
 		title: "Implement feature X",
-		started_at: 1700000000,
-		ended_at: 1700003600,
+		started_at: 1700000000000,
+		ended_at: 1700003600000,
 		metadata: null,
 		...overrides,
 	};
 }
 
 /** Factory for sample metric records. */
-function makeMetrics(recorded_at = 1700003600): MetricRecord[] {
+function makeMetrics(recorded_at = 1700003600000): MetricRecord[] {
 	return [
 		{ metric_name: "cost", value: 0.42, recorded_at },
 		{ metric_name: "tokens_input", value: 1500, recorded_at },

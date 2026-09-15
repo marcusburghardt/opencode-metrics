@@ -10,6 +10,9 @@ import { initDatabase } from "./db";
 /** Helper tables expected in the v1 schema. */
 const EXPECTED_TABLES = ["projects", "sessions", "metric_definitions", "measurements"];
 
+/** Helper views expected in the v1 schema. */
+const EXPECTED_VIEWS = ["v_sessions", "v_measurements"];
+
 /** Helper indexes expected in the v1 schema. */
 const EXPECTED_INDEXES = ["idx_measurements_time", "idx_measurements_metric"];
 
@@ -147,5 +150,55 @@ describe("initDatabase", () => {
 		const result = initDatabase(tempDir);
 		db = result.db;
 		expect(result.dataDir).toBe(tempDir);
+	});
+
+	it("creates v_sessions and v_measurements convenience views", () => {
+		const views = db
+			.prepare("SELECT name FROM sqlite_master WHERE type = 'view' ORDER BY name")
+			.all() as Array<{ name: string }>;
+
+		const viewNames = views.map((row) => row.name);
+		for (const expected of EXPECTED_VIEWS) {
+			expect(viewNames).toContain(expected);
+		}
+	});
+
+	it("v_sessions converts epoch milliseconds to epoch seconds and ISO-8601", () => {
+		// Insert a session with known epoch-millisecond timestamps.
+		// 1700000000000 ms = 2023-11-14T22:13:20Z
+		db.run(
+			`INSERT INTO sessions (session_id, project_id, agent, model, classification, title, started_at, ended_at)
+			 VALUES ('s1', 'p1', 'build', 'opus', 'impl', 'test', 1700000000000, 1700003600000)`,
+		);
+
+		const row = db.prepare("SELECT * FROM v_sessions WHERE session_id = 's1'").get() as Record<
+			string,
+			unknown
+		>;
+
+		expect(row.started_at_epoch).toBe(1700000000);
+		expect(row.ended_at_epoch).toBe(1700003600);
+		expect(row.started_at_iso).toBe("2023-11-14T22:13:20Z");
+		expect(row.ended_at_iso).toBe("2023-11-14T23:13:20Z");
+		// Dimension columns pass through unchanged.
+		expect(row.agent).toBe("build");
+		expect(row.classification).toBe("impl");
+	});
+
+	it("v_measurements converts epoch milliseconds to epoch seconds and ISO-8601", () => {
+		db.run(
+			`INSERT INTO measurements (session_id, metric_name, value, recorded_at)
+			 VALUES ('s1', 'cost', 0.42, 1700003600000)`,
+		);
+
+		const row = db.prepare("SELECT * FROM v_measurements WHERE session_id = 's1'").get() as Record<
+			string,
+			unknown
+		>;
+
+		expect(row.recorded_at_epoch).toBe(1700003600);
+		expect(row.recorded_at_iso).toBe("2023-11-14T23:13:20Z");
+		expect(row.value).toBe(0.42);
+		expect(row.metric_name).toBe("cost");
 	});
 });

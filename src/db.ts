@@ -159,6 +159,31 @@ function createSchema(db: Database): void {
 	db.run(
 		"CREATE INDEX IF NOT EXISTS idx_measurements_metric ON measurements (metric_name, recorded_at)",
 	);
+
+	// Convenience views exposing timestamps as epoch seconds and ISO-8601
+	// strings. Base tables store epoch milliseconds (SDK passthrough);
+	// these views eliminate the /1000 conversion gymnastics for Grafana
+	// and other downstream consumers.
+	db.run(`
+		CREATE VIEW IF NOT EXISTS v_sessions AS
+		SELECT
+			session_id, project_id, agent, model, classification, title,
+			started_at / 1000 AS started_at_epoch,
+			ended_at / 1000 AS ended_at_epoch,
+			strftime('%Y-%m-%dT%H:%M:%SZ', started_at / 1000, 'unixepoch') AS started_at_iso,
+			strftime('%Y-%m-%dT%H:%M:%SZ', ended_at / 1000, 'unixepoch') AS ended_at_iso,
+			metadata
+		FROM sessions
+	`);
+
+	db.run(`
+		CREATE VIEW IF NOT EXISTS v_measurements AS
+		SELECT
+			session_id, metric_name, value,
+			recorded_at / 1000 AS recorded_at_epoch,
+			strftime('%Y-%m-%dT%H:%M:%SZ', recorded_at / 1000, 'unixepoch') AS recorded_at_iso
+		FROM measurements
+	`);
 }
 
 /**

@@ -410,17 +410,26 @@ run the backfill, check the [Troubleshooting](#troubleshooting) section.
 
 ### Example queries
 
-All timestamps in the database are Unix epoch milliseconds. Divide by
-1000 to convert to epoch seconds for SQLite date functions.
+The database stores timestamps as epoch milliseconds. For convenience,
+two SQL views are provided that pre-convert timestamps:
+
+- **`v_sessions`** — exposes `started_at_epoch` (seconds),
+  `started_at_iso` (RFC3339), `ended_at_epoch`, `ended_at_iso`
+- **`v_measurements`** — exposes `recorded_at_epoch` (seconds),
+  `recorded_at_iso` (RFC3339)
+
+Use the views for Grafana panels and casual queries. Use the base
+tables (`sessions`, `measurements`) when you need raw millisecond
+precision.
 
 #### Cost overview
 
 **Daily cost:**
 
 ```sql
-SELECT date(recorded_at / 1000, 'unixepoch', 'localtime') AS day,
+SELECT date(recorded_at_epoch, 'unixepoch', 'localtime') AS day,
        ROUND(SUM(value), 2) AS cost_usd
-FROM measurements
+FROM v_measurements
 WHERE metric_name = 'cost'
 GROUP BY day
 ORDER BY day DESC
@@ -434,8 +443,8 @@ SELECT s.classification,
        COUNT(*) AS sessions,
        ROUND(SUM(m.value), 2) AS total_cost,
        ROUND(AVG(m.value), 4) AS avg_cost
-FROM sessions s
-JOIN measurements m ON s.session_id = m.session_id
+FROM v_sessions s
+JOIN v_measurements m ON s.session_id = m.session_id
 WHERE m.metric_name = 'cost'
 GROUP BY s.classification
 ORDER BY total_cost DESC;
@@ -447,8 +456,8 @@ ORDER BY total_cost DESC;
 SELECT p.name AS project,
        COUNT(DISTINCT s.session_id) AS sessions,
        ROUND(SUM(m.value), 2) AS cost_usd
-FROM measurements m
-JOIN sessions s ON m.session_id = s.session_id
+FROM v_measurements m
+JOIN v_sessions s ON m.session_id = s.session_id
 JOIN projects p ON s.project_id = p.project_id
 WHERE m.metric_name = 'cost'
 GROUP BY p.name
@@ -462,8 +471,8 @@ LIMIT 15;
 SELECT s.model,
        COUNT(*) AS sessions,
        ROUND(SUM(m.value), 2) AS cost_usd
-FROM measurements m
-JOIN sessions s ON m.session_id = s.session_id
+FROM v_measurements m
+JOIN v_sessions s ON m.session_id = s.session_id
 WHERE m.metric_name = 'cost'
 GROUP BY s.model
 ORDER BY cost_usd DESC;
@@ -473,9 +482,9 @@ ORDER BY cost_usd DESC;
 
 ```sql
 SELECT strftime('%Y-W%W',
-         datetime(recorded_at / 1000, 'unixepoch')) AS week,
+         datetime(recorded_at_epoch, 'unixepoch')) AS week,
        ROUND(SUM(value), 2) AS cost_usd
-FROM measurements
+FROM v_measurements
 WHERE metric_name = 'cost'
 GROUP BY week
 ORDER BY week;
@@ -489,9 +498,9 @@ SELECT day,
          ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
        ), 2) AS rolling_avg
 FROM (
-  SELECT date(recorded_at / 1000, 'unixepoch') AS day,
+  SELECT date(recorded_at_epoch, 'unixepoch') AS day,
          SUM(value) AS daily_cost
-  FROM measurements
+  FROM v_measurements
   WHERE metric_name = 'cost'
   GROUP BY day
 )
@@ -505,7 +514,7 @@ ORDER BY day;
 ```sql
 SELECT metric_name AS token_type,
        ROUND(SUM(value) / 1000000.0, 2) AS millions
-FROM measurements
+FROM v_measurements
 WHERE metric_name IN (
   'tokens_input', 'tokens_output', 'tokens_reasoning',
   'tokens_cache_read', 'tokens_cache_write'
@@ -517,9 +526,9 @@ ORDER BY millions DESC;
 **Cache hit ratio (average per day):**
 
 ```sql
-SELECT date(recorded_at / 1000, 'unixepoch', 'localtime') AS day,
+SELECT date(recorded_at_epoch, 'unixepoch', 'localtime') AS day,
        ROUND(AVG(value) * 100, 1) AS cache_hit_pct
-FROM measurements
+FROM v_measurements
 WHERE metric_name = 'cache_hit_ratio'
 GROUP BY day
 ORDER BY day DESC
@@ -532,8 +541,8 @@ LIMIT 14;
 SELECT s.classification,
        ROUND(AVG(m.value) * 100, 1) AS avg_cache_pct,
        COUNT(*) AS sessions
-FROM measurements m
-JOIN sessions s ON m.session_id = s.session_id
+FROM v_measurements m
+JOIN v_sessions s ON m.session_id = s.session_id
 WHERE m.metric_name = 'cache_hit_ratio'
 GROUP BY s.classification
 ORDER BY avg_cache_pct DESC;
@@ -547,7 +556,7 @@ SELECT ROUND(
   / NULLIF(SUM(CASE WHEN metric_name = 'tokens_output'
     THEN value END), 0) * 1000, 4
 ) AS "$/1K output tokens"
-FROM measurements;
+FROM v_measurements;
 ```
 
 #### Session analytics
@@ -555,9 +564,9 @@ FROM measurements;
 **Session count by day:**
 
 ```sql
-SELECT date(started_at / 1000, 'unixepoch', 'localtime') AS day,
+SELECT date(started_at_epoch, 'unixepoch', 'localtime') AS day,
        COUNT(*) AS sessions
-FROM sessions
+FROM v_sessions
 GROUP BY day
 ORDER BY day DESC
 LIMIT 14;
@@ -566,10 +575,10 @@ LIMIT 14;
 **Sessions by classification over time:**
 
 ```sql
-SELECT date(started_at / 1000, 'unixepoch', 'localtime') AS day,
+SELECT date(started_at_epoch, 'unixepoch', 'localtime') AS day,
        classification,
        COUNT(*) AS count
-FROM sessions
+FROM v_sessions
 GROUP BY day, classification
 ORDER BY day DESC;
 ```
@@ -580,8 +589,8 @@ ORDER BY day DESC;
 SELECT s.classification,
        ROUND(AVG(m.value) / 60, 1) AS avg_minutes,
        COUNT(*) AS sessions
-FROM measurements m
-JOIN sessions s ON m.session_id = s.session_id
+FROM v_measurements m
+JOIN v_sessions s ON m.session_id = s.session_id
 WHERE m.metric_name = 'duration_seconds'
 GROUP BY s.classification
 ORDER BY avg_minutes DESC;
@@ -600,7 +609,7 @@ SELECT
     ELSE '> 60 min'
   END AS duration_bucket,
   COUNT(*) AS sessions
-FROM measurements
+FROM v_measurements
 WHERE metric_name = 'duration_seconds'
 GROUP BY duration_bucket
 ORDER BY MIN(value);
@@ -609,13 +618,13 @@ ORDER BY MIN(value);
 **Sessions by agent type:**
 
 ```sql
-SELECT agent,
+SELECT s.agent,
        COUNT(*) AS sessions,
        ROUND(SUM(m.value), 2) AS cost_usd
-FROM sessions s
-JOIN measurements m ON s.session_id = m.session_id
+FROM v_sessions s
+JOIN v_measurements m ON s.session_id = m.session_id
 WHERE m.metric_name = 'cost'
-GROUP BY agent
+GROUP BY s.agent
 ORDER BY cost_usd DESC;
 ```
 
@@ -626,8 +635,8 @@ SELECT s.classification,
        ROUND(AVG(m.value), 0) AS avg_messages,
        MIN(m.value) AS min_messages,
        MAX(m.value) AS max_messages
-FROM measurements m
-JOIN sessions s ON m.session_id = s.session_id
+FROM v_measurements m
+JOIN v_sessions s ON m.session_id = s.session_id
 WHERE m.metric_name = 'messages_total'
 GROUP BY s.classification
 ORDER BY avg_messages DESC;
@@ -638,12 +647,12 @@ ORDER BY avg_messages DESC;
 **Lines changed over time:**
 
 ```sql
-SELECT date(recorded_at / 1000, 'unixepoch', 'localtime') AS day,
+SELECT date(recorded_at_epoch, 'unixepoch', 'localtime') AS day,
        SUM(CASE WHEN metric_name = 'lines_added'
            THEN value ELSE 0 END) AS added,
        SUM(CASE WHEN metric_name = 'lines_deleted'
            THEN value ELSE 0 END) AS deleted
-FROM measurements
+FROM v_measurements
 WHERE metric_name IN ('lines_added', 'lines_deleted')
 GROUP BY day
 ORDER BY day DESC
@@ -655,8 +664,8 @@ LIMIT 14;
 ```sql
 SELECT p.name AS project,
        SUM(m.value) AS files_changed
-FROM measurements m
-JOIN sessions s ON m.session_id = s.session_id
+FROM v_measurements m
+JOIN v_sessions s ON m.session_id = s.session_id
 JOIN projects p ON s.project_id = p.project_id
 WHERE m.metric_name = 'files_changed'
 GROUP BY p.name
@@ -672,7 +681,7 @@ SELECT ROUND(
   / NULLIF(SUM(CASE WHEN metric_name = 'files_changed'
     THEN value END), 0), 2
 ) AS "$ per file"
-FROM measurements;
+FROM v_measurements;
 ```
 
 #### Top sessions and KPIs
@@ -686,9 +695,9 @@ SELECT s.title,
        s.agent,
        p.name AS project,
        ROUND(m.value, 4) AS cost_usd,
-       date(s.started_at / 1000, 'unixepoch', 'localtime') AS date
-FROM sessions s
-JOIN measurements m ON s.session_id = m.session_id
+       s.started_at_iso AS date
+FROM v_sessions s
+JOIN v_measurements m ON s.session_id = m.session_id
 JOIN projects p ON s.project_id = p.project_id
 WHERE m.metric_name = 'cost'
 ORDER BY m.value DESC
@@ -709,8 +718,32 @@ SELECT
     THEN m.value END) * 100, 1) AS avg_cache_hit_pct,
   ROUND(SUM(CASE WHEN m.metric_name = 'tokens_output'
     THEN m.value END) / 1000000.0, 1) AS output_tokens_millions
-FROM sessions s
-JOIN measurements m ON s.session_id = m.session_id;
+FROM v_sessions s
+JOIN v_measurements m ON s.session_id = m.session_id;
+```
+
+#### Grafana time-series queries
+
+For Grafana panels using the frser-sqlite-datasource plugin, use the
+`_iso` columns as the time column (parsed natively as RFC3339):
+
+```sql
+-- Time-series: daily cost (set time column to "recorded_at_iso", type "String")
+SELECT recorded_at_iso AS time,
+       SUM(value) AS cost
+FROM v_measurements
+WHERE metric_name = 'cost'
+GROUP BY date(recorded_at_epoch, 'unixepoch')
+ORDER BY time;
+```
+
+```sql
+-- Time-series: cache hit ratio (set time column to "recorded_at_iso")
+SELECT recorded_at_iso AS time,
+       value AS cache_hit_ratio
+FROM v_measurements
+WHERE metric_name = 'cache_hit_ratio'
+ORDER BY time;
 ```
 
 ### Running the test suite
