@@ -12,6 +12,12 @@ Grafana dashboards.
   - [From local checkout](#from-local-checkout)
   - [Ansible integration](#ansible-integration)
   - [Verifying the installation](#verifying-the-installation)
+- [Historical Data Backfill](#historical-data-backfill)
+  - [Quick start](#quick-start)
+  - [What gets imported](#what-gets-imported)
+  - [CLI options](#cli-options)
+  - [Verifying the backfill](#verifying-the-backfill)
+  - [Idempotency and concurrency](#idempotency-and-concurrency)
 - [Configuration](#configuration)
   - [Config file location](#config-file-location)
   - [Config fields](#config-fields)
@@ -21,6 +27,11 @@ Grafana dashboards.
 - [Testing and Verification](#testing-and-verification)
   - [Verifying metrics collection](#verifying-metrics-collection)
   - [Example queries](#example-queries)
+    - [Cost overview](#cost-overview)
+    - [Token efficiency](#token-efficiency)
+    - [Session analytics](#session-analytics)
+    - [Code impact](#code-impact)
+    - [Top sessions and KPIs](#top-sessions-and-kpis)
   - [Running the test suite](#running-the-test-suite)
 - [Metric Reference](#metric-reference)
 - [Upgrade and Uninstall](#upgrade-and-uninstall)
@@ -124,6 +135,89 @@ provisioning.
    ```
    measurements        metric_definitions  projects            sessions
    ```
+
+## Historical Data Backfill
+
+The backfill script performs a one-time import of historical session data
+from OpenCode's internal database into the opencode-metrics database. This
+gives you full visibility into past sessions without waiting for new data
+to accumulate through the live plugin.
+
+### Quick start
+
+```sh
+make backfill
+```
+
+Zero configuration required. The script auto-detects the source database
+at `~/.local/share/opencode/opencode.db` and writes to the standard
+metrics database at `~/.local/share/opencode-metrics/metrics.db`.
+
+### What gets imported
+
+The backfill reads every session from OpenCode's internal database and
+writes all 12 metrics for each one:
+
+- **Token metrics:** `tokens_input`, `tokens_output`, `tokens_reasoning`,
+  `tokens_cache_read`, `tokens_cache_write`
+- **Cost:** `cost` (USD)
+- **Derived:** `cache_hit_ratio`, `duration_seconds`
+- **Diff stats:** `files_changed`, `lines_added`, `lines_deleted`
+- **Activity:** `messages_total`
+
+Each session is classified using the same rule-based classifier as the
+live plugin (the rules from your `config.yaml` are applied). Project
+metadata is also imported.
+
+### CLI options
+
+```sh
+bun run scripts/backfill.ts [options]
+```
+
+| Option            | Description                                         | Default                                     |
+|-------------------|-----------------------------------------------------|---------------------------------------------|
+| `--source <path>` | Path to OpenCode's internal database               | `~/.local/share/opencode/opencode.db`       |
+| `--dest <path>`   | Path to the metrics data directory                  | `~/.local/share/opencode-metrics/`          |
+| `--dry-run`       | Analyze source database without writing any data    | *(off)*                                     |
+| `--help`          | Show usage information                              | *(off)*                                     |
+
+Use `--dry-run` to preview how many sessions would be imported and their
+classification distribution before committing any writes.
+
+### Verifying the backfill
+
+After running the backfill, verify the imported data:
+
+```sh
+# Total sessions imported
+sqlite3 ~/.local/share/opencode-metrics/metrics.db \
+  "SELECT COUNT(*) AS sessions FROM sessions;"
+
+# Total cost across all sessions
+sqlite3 ~/.local/share/opencode-metrics/metrics.db \
+  "SELECT ROUND(SUM(value), 2) AS total_cost_usd
+   FROM measurements WHERE metric_name = 'cost';"
+
+# Classification distribution
+sqlite3 ~/.local/share/opencode-metrics/metrics.db \
+  "SELECT classification, COUNT(*) AS sessions
+   FROM sessions GROUP BY classification ORDER BY sessions DESC;"
+```
+
+### Idempotency and concurrency
+
+**Idempotent:** The backfill is safe to run multiple times. It uses
+`INSERT ON CONFLICT DO UPDATE` (UPSERT) semantics, so re-running on the
+same source data produces identical results without creating duplicate
+rows.
+
+**Concurrency:** For best results, run the backfill when the
+opencode-metrics plugin is not actively writing (i.e., no OpenCode
+sessions are running). While the database uses WAL mode and handles
+contention with `busy_timeout` and retry logic, avoiding concurrent
+writes eliminates the possibility of lock contention during the bulk
+import.
 
 ## Configuration
 
@@ -297,18 +391,166 @@ Specification and cannot be overridden via config.yaml.
 
 ### Verifying metrics collection
 
-After running at least one OpenCode session (completing a prompt/response
-cycle), verify data is being collected:
+The fastest way to populate the metrics database is to run
+`make backfill` (see [Historical Data Backfill](#historical-data-backfill)).
+This imports all historical sessions in one step, giving you immediate
+data to query and visualize.
+
+For ongoing collection, the plugin records metrics automatically. After
+completing at least one OpenCode prompt/response cycle, verify data is
+being collected:
 
 ```sh
 sqlite3 ~/.local/share/opencode-metrics/metrics.db \
   "SELECT COUNT(*) AS sessions FROM sessions;"
 ```
 
-You should see a non-zero count. If the count is 0, check the
-[Troubleshooting](#troubleshooting) section.
+You should see a non-zero count. If the count is 0 and you have not
+run the backfill, check the [Troubleshooting](#troubleshooting) section.
 
 ### Example queries
+
+All timestamps in the database are Unix epoch milliseconds. Divide by
+1000 to convert to epoch seconds for SQLite date functions.
+
+#### Cost overview
+
+**Daily cost:**
+
+```sql
+SELECT date(recorded_at / 1000, 'unixepoch', 'localtime') AS day,
+       ROUND(SUM(value), 2) AS cost_usd
+FROM measurements
+WHERE metric_name = 'cost'
+GROUP BY day
+ORDER BY day DESC
+LIMIT 14;
+```
+
+**Cost by classification:**
+
+```sql
+SELECT s.classification,
+       COUNT(*) AS sessions,
+       ROUND(SUM(m.value), 2) AS total_cost,
+       ROUND(AVG(m.value), 4) AS avg_cost
+FROM sessions s
+JOIN measurements m ON s.session_id = m.session_id
+WHERE m.metric_name = 'cost'
+GROUP BY s.classification
+ORDER BY total_cost DESC;
+```
+
+**Cost by project (top 15):**
+
+```sql
+SELECT p.name AS project,
+       COUNT(DISTINCT s.session_id) AS sessions,
+       ROUND(SUM(m.value), 2) AS cost_usd
+FROM measurements m
+JOIN sessions s ON m.session_id = s.session_id
+JOIN projects p ON s.project_id = p.project_id
+WHERE m.metric_name = 'cost'
+GROUP BY p.name
+ORDER BY cost_usd DESC
+LIMIT 15;
+```
+
+**Cost by model:**
+
+```sql
+SELECT s.model,
+       COUNT(*) AS sessions,
+       ROUND(SUM(m.value), 2) AS cost_usd
+FROM measurements m
+JOIN sessions s ON m.session_id = s.session_id
+WHERE m.metric_name = 'cost'
+GROUP BY s.model
+ORDER BY cost_usd DESC;
+```
+
+**Weekly cost trend:**
+
+```sql
+SELECT strftime('%Y-W%W',
+         datetime(recorded_at / 1000, 'unixepoch')) AS week,
+       ROUND(SUM(value), 2) AS cost_usd
+FROM measurements
+WHERE metric_name = 'cost'
+GROUP BY week
+ORDER BY week;
+```
+
+**7-day rolling average cost:**
+
+```sql
+SELECT day,
+       ROUND(AVG(daily_cost) OVER (
+         ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+       ), 2) AS rolling_avg
+FROM (
+  SELECT date(recorded_at / 1000, 'unixepoch') AS day,
+         SUM(value) AS daily_cost
+  FROM measurements
+  WHERE metric_name = 'cost'
+  GROUP BY day
+)
+ORDER BY day;
+```
+
+#### Token efficiency
+
+**Token usage by type:**
+
+```sql
+SELECT metric_name AS token_type,
+       ROUND(SUM(value) / 1000000.0, 2) AS millions
+FROM measurements
+WHERE metric_name IN (
+  'tokens_input', 'tokens_output', 'tokens_reasoning',
+  'tokens_cache_read', 'tokens_cache_write'
+)
+GROUP BY metric_name
+ORDER BY millions DESC;
+```
+
+**Cache hit ratio (average per day):**
+
+```sql
+SELECT date(recorded_at / 1000, 'unixepoch', 'localtime') AS day,
+       ROUND(AVG(value) * 100, 1) AS cache_hit_pct
+FROM measurements
+WHERE metric_name = 'cache_hit_ratio'
+GROUP BY day
+ORDER BY day DESC
+LIMIT 14;
+```
+
+**Cache hit ratio by classification:**
+
+```sql
+SELECT s.classification,
+       ROUND(AVG(m.value) * 100, 1) AS avg_cache_pct,
+       COUNT(*) AS sessions
+FROM measurements m
+JOIN sessions s ON m.session_id = s.session_id
+WHERE m.metric_name = 'cache_hit_ratio'
+GROUP BY s.classification
+ORDER BY avg_cache_pct DESC;
+```
+
+**Cost per 1K output tokens:**
+
+```sql
+SELECT ROUND(
+  SUM(CASE WHEN metric_name = 'cost' THEN value END)
+  / NULLIF(SUM(CASE WHEN metric_name = 'tokens_output'
+    THEN value END), 0) * 1000, 4
+) AS "$/1K output tokens"
+FROM measurements;
+```
+
+#### Session analytics
 
 **Session count by day:**
 
@@ -321,56 +563,154 @@ ORDER BY day DESC
 LIMIT 14;
 ```
 
-**Daily cost:**
+**Sessions by classification over time:**
 
 ```sql
-SELECT date(recorded_at / 1000, 'unixepoch', 'localtime') AS day,
-       ROUND(SUM(value), 4) AS total_cost_usd
-FROM measurements
-WHERE metric_name = 'cost'
-GROUP BY day
-ORDER BY day DESC
-LIMIT 14;
+SELECT date(started_at / 1000, 'unixepoch', 'localtime') AS day,
+       classification,
+       COUNT(*) AS count
+FROM sessions
+GROUP BY day, classification
+ORDER BY day DESC;
 ```
 
-**Classification distribution:**
+**Average session duration by classification:**
 
 ```sql
-SELECT classification,
+SELECT s.classification,
+       ROUND(AVG(m.value) / 60, 1) AS avg_minutes,
+       COUNT(*) AS sessions
+FROM measurements m
+JOIN sessions s ON m.session_id = s.session_id
+WHERE m.metric_name = 'duration_seconds'
+GROUP BY s.classification
+ORDER BY avg_minutes DESC;
+```
+
+**Duration distribution (bucketed):**
+
+```sql
+SELECT
+  CASE
+    WHEN value < 60 THEN '< 1 min'
+    WHEN value < 300 THEN '1-5 min'
+    WHEN value < 900 THEN '5-15 min'
+    WHEN value < 1800 THEN '15-30 min'
+    WHEN value < 3600 THEN '30-60 min'
+    ELSE '> 60 min'
+  END AS duration_bucket,
+  COUNT(*) AS sessions
+FROM measurements
+WHERE metric_name = 'duration_seconds'
+GROUP BY duration_bucket
+ORDER BY MIN(value);
+```
+
+**Sessions by agent type:**
+
+```sql
+SELECT agent,
        COUNT(*) AS sessions,
-       ROUND(SUM(m.value), 4) AS total_cost
+       ROUND(SUM(m.value), 2) AS cost_usd
 FROM sessions s
 JOIN measurements m ON s.session_id = m.session_id
 WHERE m.metric_name = 'cost'
-GROUP BY classification
-ORDER BY total_cost DESC;
+GROUP BY agent
+ORDER BY cost_usd DESC;
 ```
 
-**Cache hit ratio (average per day):**
+**Messages per session by classification:**
+
+```sql
+SELECT s.classification,
+       ROUND(AVG(m.value), 0) AS avg_messages,
+       MIN(m.value) AS min_messages,
+       MAX(m.value) AS max_messages
+FROM measurements m
+JOIN sessions s ON m.session_id = s.session_id
+WHERE m.metric_name = 'messages_total'
+GROUP BY s.classification
+ORDER BY avg_messages DESC;
+```
+
+#### Code impact
+
+**Lines changed over time:**
 
 ```sql
 SELECT date(recorded_at / 1000, 'unixepoch', 'localtime') AS day,
-       ROUND(AVG(value) * 100, 1) AS avg_cache_hit_pct
+       SUM(CASE WHEN metric_name = 'lines_added'
+           THEN value ELSE 0 END) AS added,
+       SUM(CASE WHEN metric_name = 'lines_deleted'
+           THEN value ELSE 0 END) AS deleted
 FROM measurements
-WHERE metric_name = 'cache_hit_ratio'
+WHERE metric_name IN ('lines_added', 'lines_deleted')
 GROUP BY day
 ORDER BY day DESC
 LIMIT 14;
 ```
 
-**Top 10 most expensive sessions:**
+**Files changed by project:**
 
 ```sql
-SELECT s.session_id,
-       s.title,
+SELECT p.name AS project,
+       SUM(m.value) AS files_changed
+FROM measurements m
+JOIN sessions s ON m.session_id = s.session_id
+JOIN projects p ON s.project_id = p.project_id
+WHERE m.metric_name = 'files_changed'
+GROUP BY p.name
+ORDER BY files_changed DESC
+LIMIT 15;
+```
+
+**Cost per file changed:**
+
+```sql
+SELECT ROUND(
+  SUM(CASE WHEN metric_name = 'cost' THEN value END)
+  / NULLIF(SUM(CASE WHEN metric_name = 'files_changed'
+    THEN value END), 0), 2
+) AS "$ per file"
+FROM measurements;
+```
+
+#### Top sessions and KPIs
+
+**Top 20 most expensive sessions:**
+
+```sql
+SELECT s.title,
        s.classification,
        s.model,
-       ROUND(m.value, 4) AS cost_usd
+       s.agent,
+       p.name AS project,
+       ROUND(m.value, 4) AS cost_usd,
+       date(s.started_at / 1000, 'unixepoch', 'localtime') AS date
 FROM sessions s
 JOIN measurements m ON s.session_id = m.session_id
+JOIN projects p ON s.project_id = p.project_id
 WHERE m.metric_name = 'cost'
 ORDER BY m.value DESC
-LIMIT 10;
+LIMIT 20;
+```
+
+**Summary KPIs:**
+
+```sql
+SELECT
+  COUNT(DISTINCT s.session_id) AS total_sessions,
+  COUNT(DISTINCT s.project_id) AS total_projects,
+  ROUND(SUM(CASE WHEN m.metric_name = 'cost'
+    THEN m.value END), 2) AS total_cost_usd,
+  ROUND(AVG(CASE WHEN m.metric_name = 'cost'
+    THEN m.value END), 4) AS avg_session_cost,
+  ROUND(AVG(CASE WHEN m.metric_name = 'cache_hit_ratio'
+    THEN m.value END) * 100, 1) AS avg_cache_hit_pct,
+  ROUND(SUM(CASE WHEN m.metric_name = 'tokens_output'
+    THEN m.value END) / 1000000.0, 1) AS output_tokens_millions
+FROM sessions s
+JOIN measurements m ON s.session_id = m.session_id;
 ```
 
 ### Running the test suite

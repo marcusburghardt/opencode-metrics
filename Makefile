@@ -2,7 +2,7 @@
 #
 # opencode-metrics — build, test, lint, clean targets
 
-.PHONY: build test lint clean
+.PHONY: build test lint clean backfill
 
 build:
 	bun build src/index.ts --outdir dist --target bun
@@ -18,3 +18,8 @@ lint:
 
 clean:
 	rm -rf dist
+
+# Import historical sessions from OpenCode's internal database into
+# the opencode-metrics database. Safe to run multiple times (idempotent).
+backfill:
+	bun run scripts/backfill.ts
