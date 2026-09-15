@@ -231,6 +231,34 @@ function getPartContent(sourceDb: Database, sessionId: string): string {
 	return rows.map((r) => r.text ?? "").join("\n");
 }
 
+/**
+ * Fallback: extract agent from the first user message when session.agent is NULL.
+ * Older OpenCode versions (before ~May 2026) did not populate session-level agent.
+ */
+function getAgentFromMessages(sourceDb: Database, sessionId: string): string | null {
+	const row = sourceDb.prepare(`
+		SELECT json_extract(data, '$.agent') as agent
+		FROM message
+		WHERE session_id = ? AND json_extract(data, '$.role') = 'user'
+		ORDER BY time_created ASC LIMIT 1
+	`).get(sessionId) as { agent: string | null } | null;
+	return row?.agent ?? null;
+}
+
+/**
+ * Fallback: extract model from the first assistant message when session.model is NULL.
+ * Older OpenCode versions (before ~May 2026) did not populate session-level model.
+ */
+function getModelFromMessages(sourceDb: Database, sessionId: string): string | null {
+	const row = sourceDb.prepare(`
+		SELECT json_extract(data, '$.modelID') as modelID
+		FROM message
+		WHERE session_id = ? AND json_extract(data, '$.role') = 'assistant'
+		ORDER BY time_created ASC LIMIT 1
+	`).get(sessionId) as { modelID: string | null } | null;
+	return row?.modelID ?? null;
+}
+
 export function deriveProjectName(name: string | null, worktree: string | null): string {
 	if (name) return name;
 	if (worktree) return path.basename(worktree);
@@ -352,7 +380,19 @@ async function runBackfill(args: CliArgs): Promise<BackfillStats> {
 
 		for (const session of sessions) {
 			try {
-				const modelId = extractModelId(session.model);
+				// Resolve agent — fall back to message data for older OpenCode
+				// versions (pre-May 2026) that didn't populate session-level columns.
+				const agent = session.agent
+					|| getAgentFromMessages(sourceDb, session.id)
+					|| "unknown";
+
+				// Resolve model — same fallback strategy.
+				let modelId = extractModelId(session.model);
+				if (modelId === "unknown") {
+					const msgModel = getModelFromMessages(sourceDb, session.id);
+					if (msgModel) modelId = msgModel;
+				}
+
 				const messageCount = getMessageCount(sourceDb, session.id);
 				const firstUserMessage = getFirstUserMessage(sourceDb, session.id);
 				const bashCommands = getBashCommands(sourceDb, session.id);
@@ -360,7 +400,7 @@ async function runBackfill(args: CliArgs): Promise<BackfillStats> {
 
 				// Classify
 				const classification = classify(config.classification_rules, {
-					agent: session.agent ?? "unknown",
+					agent,
 					model: modelId,
 					first_user_message: firstUserMessage,
 					part_content: partContent,
@@ -384,7 +424,7 @@ async function runBackfill(args: CliArgs): Promise<BackfillStats> {
 					upsertSession(destDb, {
 						session_id: session.id,
 						project_id: session.project_id,
-						agent: session.agent ?? "unknown",
+						agent,
 						model: modelId,
 						classification,
 						title: session.title ?? "untitled",
