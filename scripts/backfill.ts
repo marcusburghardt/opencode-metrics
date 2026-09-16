@@ -21,6 +21,13 @@ import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 
+import {
+	type BashToolCall,
+	extractIssuesReferenced,
+	extractPRsCreated,
+	extractPRsReviewed,
+	resolveRepoContext,
+} from "../src/artifacts";
 import { classify } from "../src/classifier";
 import { loadConfig } from "../src/config";
 import { getDataDir, initDatabase } from "../src/db";
@@ -28,7 +35,7 @@ import {
 	computeCacheHitRatio,
 	computeDurationSeconds,
 } from "../src/extractor";
-import { upsertProject, upsertSession, writeMetrics } from "../src/writer";
+import { upsertArtifacts, upsertProject, upsertSession, writeMetrics } from "../src/writer";
 
 // ---------------------------------------------------------------------------
 // CLI parsing
@@ -205,7 +212,7 @@ function getFirstUserMessage(sourceDb: Database, sessionId: string): string {
 
 function getBashCommands(sourceDb: Database, sessionId: string): string[] {
 	const rows = sourceDb.prepare(`
-		SELECT json_extract(data, '$.args.command') as command
+		SELECT json_extract(data, '$.state.input.command') as command
 		FROM part
 		WHERE session_id = ?
 		  AND json_extract(data, '$.type') = 'tool'
@@ -213,10 +220,36 @@ function getBashCommands(sourceDb: Database, sessionId: string): string[] {
 			json_extract(data, '$.tool') LIKE '%bash%'
 			OR json_extract(data, '$.tool') LIKE '%shell%'
 		  )
-		  AND json_extract(data, '$.args.command') IS NOT NULL
+		  AND json_extract(data, '$.state.input.command') IS NOT NULL
 	`).all(sessionId) as Array<{ command: string }>;
 
 	return rows.map((r) => r.command);
+}
+
+/**
+ * Extract bash tool calls with output from the source database.
+ * Returns BashToolCall objects for artifact extraction, including the
+ * tool output field needed to parse PR URLs from `gh pr create` output.
+ */
+function getBashToolCalls(sourceDb: Database, sessionId: string): BashToolCall[] {
+	const rows = sourceDb.prepare(`
+		SELECT
+			json_extract(data, '$.state.input.command') as command,
+			json_extract(data, '$.state.output') as output
+		FROM part
+		WHERE session_id = ?
+		  AND json_extract(data, '$.type') = 'tool'
+		  AND (
+			json_extract(data, '$.tool') LIKE '%bash%'
+			OR json_extract(data, '$.tool') LIKE '%shell%'
+		  )
+		  AND json_extract(data, '$.state.input.command') IS NOT NULL
+	`).all(sessionId) as Array<{ command: string; output: string | null }>;
+
+	return rows.map((r) => ({
+		command: r.command,
+		output: r.output ?? undefined,
+	}));
 }
 
 function getPartContent(sourceDb: Database, sessionId: string): string {
@@ -359,6 +392,14 @@ async function runBackfill(args: CliArgs): Promise<BackfillStats> {
 		console.log(`Imported ${projects.length} projects`);
 	}
 
+	// Build worktree map for repo context resolution. Cache resolved
+	// repo contexts per project to avoid redundant git remote lookups.
+	const worktreeMap = new Map<string, string>();
+	for (const proj of projects) {
+		if (proj.worktree) worktreeMap.set(proj.id, proj.worktree);
+	}
+	const repoContextCache = new Map<string, string | null>();
+
 	// --- Backfill sessions in batches ---
 	const batchSize = 100;
 	let offset = 0;
@@ -424,6 +465,21 @@ async function runBackfill(args: CliArgs): Promise<BackfillStats> {
 
 				const recordedAt = session.time_updated || session.time_created || Date.now();
 
+				// Resolve repo context for artifact extraction (cached per project).
+				if (!repoContextCache.has(session.project_id)) {
+					const worktree = worktreeMap.get(session.project_id);
+					const ctx = worktree ? resolveRepoContext(worktree) : null;
+					repoContextCache.set(session.project_id, ctx);
+				}
+				const repoContext = repoContextCache.get(session.project_id) ?? null;
+
+				// Extract PR/issue artifacts from bash tool calls.
+				const toolCalls = getBashToolCalls(sourceDb, session.id);
+				const prsCreated = extractPRsCreated(toolCalls);
+				const prsReviewed = extractPRsReviewed(toolCalls, repoContext);
+				const issuesReferenced = extractIssuesReferenced(toolCalls, repoContext);
+				const allArtifacts = [...prsCreated, ...prsReviewed, ...issuesReferenced];
+
 				if (destDb) {
 					upsertSession(destDb, {
 						session_id: session.id,
@@ -455,7 +511,15 @@ async function runBackfill(args: CliArgs): Promise<BackfillStats> {
 						{ metric_name: "lines_added", value: session.summary_additions ?? 0, recorded_at: recordedAt },
 						{ metric_name: "lines_deleted", value: session.summary_deletions ?? 0, recorded_at: recordedAt },
 						{ metric_name: "messages_total", value: messageCount, recorded_at: recordedAt },
+						{ metric_name: "prs_created", value: prsCreated.length, recorded_at: recordedAt },
+						{ metric_name: "prs_reviewed", value: prsReviewed.length, recorded_at: recordedAt },
+						{ metric_name: "issues_referenced", value: issuesReferenced.length, recorded_at: recordedAt },
 					], { skipDeltas: true });
+
+					// Write artifact detail rows (INSERT OR IGNORE for PK dedup).
+					if (allArtifacts.length > 0) {
+						upsertArtifacts(destDb, session.id, allArtifacts, recordedAt);
+					}
 				}
 
 				stats.totalSessions++;

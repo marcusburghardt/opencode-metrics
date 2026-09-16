@@ -1,5 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import {
+	type BashToolCall,
+	type ExtractedArtifact,
+	extractIssuesReferenced,
+	extractPRsCreated,
+	extractPRsReviewed,
+	resolveRepoContext,
+} from "./artifacts";
 import type { ClassificationContext } from "./classifier";
 import type { SessionRecord } from "./writer";
 
@@ -63,6 +71,8 @@ export interface PartInfo {
 	tool?: string;
 	/** Tool call arguments (for type "tool" parts). */
 	args?: Record<string, unknown>;
+	/** Tool call output (for type "tool" parts). */
+	output?: string;
 }
 
 /** Simplified project data returned by the SDK adapter. */
@@ -78,6 +88,7 @@ export interface ExtractedData {
 	session: SessionRecord;
 	metrics: Array<{ metric_name: string; value: number; recorded_at: number }>;
 	classificationContext: ClassificationContext;
+	artifacts: ExtractedArtifact[];
 }
 
 /**
@@ -144,6 +155,22 @@ function extractBashCommands(messages: MessageInfo[]): string[] {
 		.filter((p) => p.type === "tool" && isShellTool(p.tool))
 		.map((p) => extractCommandFromArgs(p.args))
 		.filter((cmd): cmd is string => cmd !== undefined);
+}
+
+/**
+ * Extract bash/shell tool calls with output from all messages.
+ * Returns BashToolCall objects for use by artifact extraction functions.
+ */
+export function extractBashToolCalls(messages: MessageInfo[]): BashToolCall[] {
+	return messages
+		.flatMap((m) => m.parts ?? [])
+		.filter((p) => p.type === "tool" && isShellTool(p.tool))
+		.map((p) => {
+			const command = extractCommandFromArgs(p.args);
+			if (!command) return undefined;
+			return { command, output: p.output } as BashToolCall;
+		})
+		.filter((tc): tc is BashToolCall => tc !== undefined);
 }
 
 /**
@@ -239,7 +266,9 @@ function buildMetrics(
  * - Project dimension record
  * - Session dimension record (classification set to "unknown" — caller
  *   is responsible for running the classifier and updating it)
- * - 12 metric measurements including derived cache_hit_ratio and duration_seconds
+ * - 15 metric measurements including derived cache_hit_ratio, duration_seconds,
+ *   and PR/issue artifact counts
+ * - PR/issue artifact references extracted from bash tool calls
  * - Classification context for the rule-based classifier
  *
  * Returns null if sessionId is empty. Missing fields on the session or
@@ -303,6 +332,26 @@ export async function extractSessionData(
 		recordedAt,
 	);
 
+	// Extract PR/issue artifacts from bash tool calls.
+	const bashToolCalls = extractBashToolCalls(messages);
+	const repoContext = project?.path ? resolveRepoContext(project.path) : null;
+
+	const prsCreated = extractPRsCreated(bashToolCalls);
+	const prsReviewed = extractPRsReviewed(bashToolCalls, repoContext);
+	const issuesReferenced = extractIssuesReferenced(bashToolCalls, repoContext);
+	const artifacts = [...prsCreated, ...prsReviewed, ...issuesReferenced];
+
+	// Append artifact count metrics alongside the base 12 metrics.
+	metrics.push(
+		{ metric_name: "prs_created", value: prsCreated.length, recorded_at: recordedAt },
+		{ metric_name: "prs_reviewed", value: prsReviewed.length, recorded_at: recordedAt },
+		{
+			metric_name: "issues_referenced",
+			value: issuesReferenced.length,
+			recorded_at: recordedAt,
+		},
+	);
+
 	return {
 		project: {
 			project_id: projectId,
@@ -329,5 +378,6 @@ export async function extractSessionData(
 			bash_commands: bashCommands,
 			message_count: messageCount,
 		},
+		artifacts,
 	};
 }

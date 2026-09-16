@@ -33,8 +33,10 @@ Grafana dashboards.
     - [Code impact](#code-impact)
     - [Top sessions and KPIs](#top-sessions-and-kpis)
     - [Delta-based queries (accurate daily cost)](#delta-based-queries-accurate-daily-cost)
+    - [PR and Issue Analytics](#pr-and-issue-analytics)
   - [Running the test suite](#running-the-test-suite)
 - [Metric Reference](#metric-reference)
+- [Insights](#insights)
 - [Upgrade and Uninstall](#upgrade-and-uninstall)
   - [Upgrading](#upgrading)
   - [Uninstalling](#uninstalling)
@@ -134,7 +136,8 @@ provisioning.
    Expected output:
 
    ```
-   measurements        metric_definitions  projects            sessions
+    measurements        metric_definitions  projects
+    session_artifacts   sessions
    ```
 
 ## Historical Data Backfill
@@ -157,7 +160,7 @@ metrics database at `~/.local/share/opencode-metrics/metrics.db`.
 ### What gets imported
 
 The backfill reads every session from OpenCode's internal database and
-writes all 12 metrics for each one:
+writes all 15 metrics for each one:
 
 - **Token metrics:** `tokens_input`, `tokens_output`, `tokens_reasoning`,
   `tokens_cache_read`, `tokens_cache_write`
@@ -165,6 +168,11 @@ writes all 12 metrics for each one:
 - **Derived:** `cache_hit_ratio`, `duration_seconds`
 - **Diff stats:** `files_changed`, `lines_added`, `lines_deleted`
 - **Activity:** `messages_total`
+- **Artifacts:** `prs_created`, `prs_reviewed`, `issues_referenced`
+
+PR and issue references are extracted from `gh` CLI commands in tool-call
+output. Each extracted reference is also stored as a row in the
+`session_artifacts` table for cross-session artifact queries.
 
 Each session is classified using the same rule-based classifier as the
 live plugin (the rules from your `config.yaml` are applied). Project
@@ -204,6 +212,10 @@ sqlite3 ~/.local/share/opencode-metrics/metrics.db \
 sqlite3 ~/.local/share/opencode-metrics/metrics.db \
   "SELECT classification, COUNT(*) AS sessions
    FROM sessions GROUP BY classification ORDER BY sessions DESC;"
+
+# Artifact counts by type
+sqlite3 ~/.local/share/opencode-metrics/metrics.db \
+  "SELECT artifact_type, COUNT(*) FROM session_artifacts GROUP BY 1;"
 ```
 
 ### Idempotency and concurrency
@@ -412,7 +424,7 @@ run the backfill, check the [Troubleshooting](#troubleshooting) section.
 ### Example queries
 
 The database stores timestamps as epoch milliseconds. For convenience,
-three SQL views are provided that pre-convert timestamps:
+four SQL views are provided that pre-convert timestamps:
 
 - **`v_sessions`** — exposes `started_at_epoch` (seconds),
   `started_at_iso` (RFC3339), `ended_at_epoch`, `ended_at_iso`
@@ -420,6 +432,9 @@ three SQL views are provided that pre-convert timestamps:
   `recorded_at_iso` (RFC3339)
 - **`v_measurement_deltas`** — exposes `recorded_at_epoch` (seconds),
   `recorded_at_iso` (RFC3339), with the incremental `delta` column
+- **`v_session_artifacts`** — exposes `recorded_at_epoch` (seconds),
+  `recorded_at_iso` (RFC3339) for each artifact row, plus
+  `session_id`, `artifact_type`, and `reference`
 
 **When to use each view:**
 
@@ -809,6 +824,157 @@ LIMIT 14;
 > have mechanically correct deltas but `SUM(delta)` produces
 > analytically meaningless results for ratios.
 
+#### PR and Issue Analytics
+
+**Cost per PR created (total and average):**
+
+```sql
+SELECT COUNT(*) AS total_prs,
+       ROUND(SUM(m.value), 2) AS total_cost,
+       ROUND(SUM(m.value) / NULLIF(COUNT(*), 0), 2) AS avg_cost_per_pr
+FROM v_session_artifacts a
+JOIN v_measurements m ON a.session_id = m.session_id
+WHERE a.artifact_type = 'pr-created'
+  AND m.metric_name = 'cost';
+```
+
+**Total cost to deliver a specific PR:**
+
+```sql
+SELECT a.reference AS pr,
+       COUNT(DISTINCT a.session_id) AS sessions,
+       ROUND(SUM(m.value), 2) AS total_cost
+FROM v_session_artifacts a
+JOIN v_measurements m ON a.session_id = m.session_id
+WHERE a.reference = 'org/repo#123'
+  AND m.metric_name = 'cost'
+GROUP BY a.reference;
+```
+
+**Most expensive PRs:**
+
+```sql
+SELECT a.reference AS pr,
+       COUNT(DISTINCT a.session_id) AS sessions,
+       ROUND(SUM(m.value), 2) AS total_cost
+FROM v_session_artifacts a
+JOIN v_measurements m ON a.session_id = m.session_id
+WHERE a.artifact_type = 'pr-created'
+  AND m.metric_name = 'cost'
+GROUP BY a.reference
+ORDER BY total_cost DESC
+LIMIT 20;
+```
+
+**Sessions that touched a specific PR:**
+
+```sql
+SELECT s.session_id,
+       s.title,
+       s.classification,
+       a.artifact_type,
+       ROUND(m.value, 4) AS cost_usd,
+       s.started_at_iso AS date
+FROM v_session_artifacts a
+JOIN v_sessions s ON a.session_id = s.session_id
+JOIN v_measurements m ON a.session_id = m.session_id
+WHERE a.reference = 'org/repo#123'
+  AND m.metric_name = 'cost'
+ORDER BY s.started_at_iso;
+```
+
+**PR activity over time (PRs created per week):**
+
+```sql
+SELECT strftime('%Y-W%W',
+         datetime(a.recorded_at_epoch, 'unixepoch')) AS week,
+       COUNT(*) AS prs_created
+FROM v_session_artifacts a
+WHERE a.artifact_type = 'pr-created'
+GROUP BY week
+ORDER BY week;
+```
+
+**Cost per PR trend over time (weekly):**
+
+```sql
+SELECT strftime('%Y-W%W',
+         datetime(a.recorded_at_epoch, 'unixepoch')) AS week,
+       COUNT(*) AS prs,
+       ROUND(SUM(m.value), 2) AS total_cost,
+       ROUND(SUM(m.value) / NULLIF(COUNT(*), 0), 2) AS cost_per_pr
+FROM v_session_artifacts a
+JOIN v_measurements m ON a.session_id = m.session_id
+WHERE a.artifact_type = 'pr-created'
+  AND m.metric_name = 'cost'
+GROUP BY week
+ORDER BY week;
+```
+
+**PR activity by classification:**
+
+```sql
+SELECT s.classification,
+       a.artifact_type,
+       COUNT(*) AS artifact_count,
+       COUNT(DISTINCT a.session_id) AS sessions
+FROM v_session_artifacts a
+JOIN v_sessions s ON a.session_id = s.session_id
+GROUP BY s.classification, a.artifact_type
+ORDER BY artifact_count DESC;
+```
+
+**PRs per session (batching efficiency):**
+
+```sql
+SELECT s.session_id,
+       s.title,
+       COUNT(*) AS prs_in_session,
+       ROUND(m.value, 4) AS cost_usd
+FROM v_session_artifacts a
+JOIN v_sessions s ON a.session_id = s.session_id
+JOIN v_measurements m ON a.session_id = m.session_id
+WHERE a.artifact_type = 'pr-created'
+  AND m.metric_name = 'cost'
+GROUP BY s.session_id
+ORDER BY prs_in_session DESC
+LIMIT 20;
+```
+
+**Sessions with zero PRs/issues (non-deliverable spend):**
+
+```sql
+SELECT s.session_id,
+       s.title,
+       s.classification,
+       ROUND(m.value, 4) AS cost_usd
+FROM v_sessions s
+JOIN v_measurements m ON s.session_id = m.session_id
+LEFT JOIN v_session_artifacts a ON s.session_id = a.session_id
+WHERE m.metric_name = 'cost'
+  AND a.session_id IS NULL
+ORDER BY m.value DESC
+LIMIT 20;
+```
+
+**Cost per PR by project (repository-level ROI):**
+
+```sql
+SELECT p.name AS project,
+       COUNT(DISTINCT a.reference) AS prs,
+       ROUND(SUM(m.value), 2) AS total_cost,
+       ROUND(SUM(m.value) / NULLIF(COUNT(DISTINCT a.reference), 0),
+             2) AS cost_per_pr
+FROM v_session_artifacts a
+JOIN v_sessions s ON a.session_id = s.session_id
+JOIN v_measurements m ON a.session_id = m.session_id
+JOIN projects p ON s.project_id = p.project_id
+WHERE a.artifact_type = 'pr-created'
+  AND m.metric_name = 'cost'
+GROUP BY p.name
+ORDER BY cost_per_pr DESC;
+```
+
 ### Running the test suite
 
 ```sh
@@ -832,7 +998,7 @@ make lint
 
 ## Metric Reference
 
-All 12 metrics are recorded per session on every idle event (UPSERT
+All 15 metrics are recorded per session on every idle event (UPSERT
 semantics — the latest cumulative value is stored).
 
 | Metric Name        | Unit    | Description                                    | Aggregation |
@@ -849,6 +1015,9 @@ semantics — the latest cumulative value is stored).
 | `lines_added`      | count   | Lines added across all file changes            | sum         |
 | `lines_deleted`    | count   | Lines deleted across all file changes          | sum         |
 | `messages_total`   | count   | Total messages exchanged in the session        | sum         |
+| `prs_created`      | count   | PRs created in the session                     | sum         |
+| `prs_reviewed`     | count   | PRs reviewed in the session                    | sum         |
+| `issues_referenced`| count   | Issues referenced in the session               | sum         |
 
 **Derived metrics:**
 
@@ -863,6 +1032,44 @@ for dashboard panels: `sum` for additive metrics, `avg` for ratios.
 **Timestamps:** All timestamp fields (`started_at`, `ended_at`,
 `recorded_at`) store Unix epoch **milliseconds** as INTEGER values. Use
 `date(column / 1000, 'unixepoch')` in SQL queries.
+
+## Insights
+
+With PR and issue tracking, several analytics become possible that
+connect cost data to concrete deliverables:
+
+**Cost-per-deliverable** — Calculate the cost per PR created, cost per
+review performed, and cost per PR broken down by project or model. This
+answers "how much does each unit of output cost?" rather than measuring
+raw spend.
+
+**Value density** — Identify how many PRs each session produces (batching
+efficiency), what fraction of spend goes to sessions with zero
+deliverables (non-deliverable spend ratio), and which sessions produce
+the most value relative to their cost.
+
+**PR lifecycle** — Track the total cost to deliver a specific PR across
+all sessions that touched it. A single PR may span creation, review
+rounds, and follow-up fixes — cross-session aggregation via the
+`session_artifacts` table reveals the true cost of delivery.
+
+**Cross-metric correlations** — Combine artifact counts with existing
+metrics for deeper analysis:
+- **Review quality indicators:** `prs_reviewed × tokens_output` measures
+  feedback volume per review.
+- **Creation efficiency:** `prs_created × files_changed` correlates PR
+  size with cost.
+- **Project-level ROI:** Compare total cost by project against PRs
+  produced by project to identify which repositories get the best return
+  on AI spend.
+
+**Trend analysis** — Track changes over time to spot improvements or
+regressions:
+- PRs created per week (delivery velocity)
+- Cost per PR over time (efficiency trend)
+- Review rounds per PR declining (quality improvement)
+- PR creation by classification (workflow evolution)
+- Issue-to-PR ratio (planning overhead)
 
 ## Upgrade and Uninstall
 
@@ -888,6 +1095,10 @@ TABLE IF NOT EXISTS` and `INSERT OR IGNORE` for metric definitions, so
 the database is never destructively modified. Schema versioning
 (`PRAGMA user_version`) ensures future migrations are applied
 automatically on startup.
+
+> **Note:** Existing users should re-run `make backfill` after upgrading
+> to populate artifact data for historical sessions. The backfill is
+> idempotent and safe to re-run.
 
 ### Uninstalling
 
@@ -1014,7 +1225,7 @@ Expected output: `wal`
 sqlite3 ~/.local/share/opencode-metrics/metrics.db "PRAGMA user_version;"
 ```
 
-Expected output: `1`
+Expected output: `2`
 
 **Run an integrity check:**
 
@@ -1091,10 +1302,19 @@ plugin.
 │              │     │ metadata     │     │  measurements  │
 └──────────────┘     └──────┬───────┘     │────────────────│
                             │             │ session_id     │
-                            └────────────►│ metric_name    │
-                                          │ value          │
-                                          │ recorded_at    │
-                                          └────────────────┘
+                            ├────────────►│ metric_name    │
+                            │             │ value          │
+                            │             │ recorded_at    │
+                            │             └────────────────┘
+                            │
+                            │             ┌───────────────────┐
+                            │             │ session_artifacts  │
+                            │             │───────────────────│
+                            └────────────►│ session_id        │
+                                          │ artifact_type     │
+                                          │ reference         │
+                                          │ recorded_at       │
+                                          └───────────────────┘
 ```
 
 **Mapping to Grafana panels:**

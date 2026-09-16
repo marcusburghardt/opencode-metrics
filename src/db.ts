@@ -9,7 +9,7 @@ import path from "node:path";
  * Schema version for the metrics database.
  * Increment when altering table definitions or adding required migrations.
  */
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 /**
  * V1 metric catalog — seeded into metric_definitions on first database creation.
@@ -91,6 +91,24 @@ const METRIC_DEFINITIONS: ReadonlyArray<{
 		metric_name: "messages_total",
 		unit: "count",
 		description: "Total messages exchanged in the session",
+		aggregation: "sum",
+	},
+	{
+		metric_name: "prs_created",
+		unit: "count",
+		description: "PRs created in the session",
+		aggregation: "sum",
+	},
+	{
+		metric_name: "prs_reviewed",
+		unit: "count",
+		description: "PRs reviewed in the session",
+		aggregation: "sum",
+	},
+	{
+		metric_name: "issues_referenced",
+		unit: "count",
+		description: "Issues referenced in the session",
 		aggregation: "sum",
 	},
 ] as const;
@@ -185,6 +203,36 @@ function createSchema(db: Database): void {
 		FROM measurements
 	`);
 
+	// Session artifacts table — records specific PRs and issues a session
+	// interacted with. PK deduplication ensures the same PR referenced
+	// multiple times (view + diff + checks) produces one row, not three.
+	db.run(`
+		CREATE TABLE IF NOT EXISTS session_artifacts (
+			session_id    TEXT,
+			artifact_type TEXT,
+			reference     TEXT,
+			recorded_at   INTEGER,
+			PRIMARY KEY (session_id, artifact_type, reference)
+		)
+	`);
+
+	// Secondary index for cross-session artifact queries (e.g., "all
+	// sessions that touched PR org/repo#123").
+	db.run(
+		"CREATE INDEX IF NOT EXISTS idx_artifacts_reference ON session_artifacts (reference, artifact_type)",
+	);
+
+	// Convenience view — same pattern as v_measurements: expose
+	// recorded_at as epoch seconds and ISO-8601 string.
+	db.run(`
+		CREATE VIEW IF NOT EXISTS v_session_artifacts AS
+		SELECT
+			session_id, artifact_type, reference,
+			recorded_at / 1000 AS recorded_at_epoch,
+			strftime('%Y-%m-%dT%H:%M:%SZ', recorded_at / 1000, 'unixepoch') AS recorded_at_iso
+		FROM session_artifacts
+	`);
+
 	// Task 1.1: measurement_deltas table — stores incremental changes per
 	// metric on each idle event, enabling accurate time-sliced aggregation
 	// (e.g., daily cost) even for multi-day sessions.
@@ -274,11 +322,14 @@ export function initDatabase(dataDirOverride?: string): InitDatabaseResult {
 
 	createSchema(db);
 
-	// Schema versioning: set user_version on initial creation only.
+	// Schema versioning: set user_version when the database schema is
+	// behind the current version. CREATE TABLE/INDEX/VIEW IF NOT EXISTS
+	// makes the migration idempotent — the version bump reflects the
+	// actual schema state after createSchema() runs.
 	const versionRow = db.prepare("PRAGMA user_version").get() as { user_version: number } | null;
 	const currentVersion = versionRow?.user_version ?? 0;
 
-	if (currentVersion === 0) {
+	if (currentVersion < SCHEMA_VERSION) {
 		db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);
 	}
 

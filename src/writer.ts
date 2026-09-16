@@ -180,23 +180,49 @@ export async function withRetry<T>(fn: () => T, maxRetries = 3): Promise<T> {
 	throw new Error("withRetry: exhausted retries");
 }
 
+/**
+ * Insert artifact rows for a session using INSERT OR IGNORE.
+ * The PK constraint (session_id, artifact_type, reference) handles
+ * deduplication — the same PR referenced multiple times in a session
+ * produces one row.
+ */
+export function upsertArtifacts(
+	db: Database,
+	sessionId: string,
+	artifacts: ReadonlyArray<{ artifact_type: string; reference: string }>,
+	recordedAt: number,
+): void {
+	const stmt = db.prepare(
+		`INSERT OR IGNORE INTO session_artifacts (session_id, artifact_type, reference, recorded_at)
+		 VALUES (?, ?, ?, ?)`,
+	);
+	for (const artifact of artifacts) {
+		stmt.run(sessionId, artifact.artifact_type, artifact.reference, recordedAt);
+	}
+}
+
 /** Composite payload for writeSessionData(). */
 export interface WriteSessionDataInput {
 	project: ProjectRecord;
 	session: SessionRecord;
 	metrics: MetricRecord[];
+	artifacts?: Array<{ artifact_type: string; reference: string }>;
 }
 
 /**
  * Write all session data atomically in a single transaction.
- * Wraps upsertProject + upsertSession + writeMetrics inside
- * db.transaction() and uses withRetry() for SQLITE_BUSY handling.
+ * Wraps upsertProject + upsertSession + writeMetrics + upsertArtifacts
+ * inside db.transaction() and uses withRetry() for SQLITE_BUSY handling.
  */
 export async function writeSessionData(db: Database, data: WriteSessionDataInput): Promise<void> {
 	const transactionFn = db.transaction(() => {
 		upsertProject(db, data.project);
 		upsertSession(db, data.session);
 		writeMetrics(db, data.session.session_id, data.metrics);
+		if (data.artifacts && data.artifacts.length > 0) {
+			const recordedAt = data.session.ended_at || Date.now();
+			upsertArtifacts(db, data.session.session_id, data.artifacts, recordedAt);
+		}
 	});
 
 	await withRetry(() => transactionFn());
