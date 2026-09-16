@@ -38,6 +38,7 @@ function makeSession(overrides: Partial<SessionRecord> = {}): SessionRecord {
 		started_at: 1700000000000,
 		ended_at: 1700003600000,
 		metadata: null,
+		budget_tag: null,
 		...overrides,
 	};
 }
@@ -149,6 +150,58 @@ describe("writer", () => {
 			expect(row.title).toBe("Updated title");
 			expect(row.ended_at).toBe(1700007200);
 			expect(row.metadata).toBe('{"key":"value"}');
+		});
+
+		it("writes session with budget_tag correctly", () => {
+			upsertSession(db, makeSession({ budget_tag: "infra" }));
+
+			const row = db.prepare("SELECT * FROM sessions WHERE session_id = ?").get("sess-001") as {
+				budget_tag: string | null;
+			};
+
+			expect(row.budget_tag).toBe("infra");
+		});
+
+		it("writes session with null budget_tag correctly", () => {
+			upsertSession(db, makeSession({ budget_tag: null }));
+
+			const row = db.prepare("SELECT * FROM sessions WHERE session_id = ?").get("sess-001") as {
+				budget_tag: string | null;
+			};
+
+			expect(row.budget_tag).toBeNull();
+		});
+
+		it("updates budget_tag on re-upsert", () => {
+			upsertSession(db, makeSession({ budget_tag: null }));
+
+			// Verify initially null.
+			const row1 = db
+				.prepare("SELECT budget_tag FROM sessions WHERE session_id = ?")
+				.get("sess-001") as {
+				budget_tag: string | null;
+			};
+			expect(row1.budget_tag).toBeNull();
+
+			// Re-upsert with a budget tag.
+			upsertSession(db, makeSession({ budget_tag: "frontend" }));
+
+			const row2 = db
+				.prepare("SELECT budget_tag FROM sessions WHERE session_id = ?")
+				.get("sess-001") as {
+				budget_tag: string | null;
+			};
+			expect(row2.budget_tag).toBe("frontend");
+
+			// Re-upsert back to null.
+			upsertSession(db, makeSession({ budget_tag: null }));
+
+			const row3 = db
+				.prepare("SELECT budget_tag FROM sessions WHERE session_id = ?")
+				.get("sess-001") as {
+				budget_tag: string | null;
+			};
+			expect(row3.budget_tag).toBeNull();
 		});
 	});
 

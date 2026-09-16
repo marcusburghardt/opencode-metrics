@@ -84,6 +84,34 @@ classification_rules:
   - name: ad-hoc
     description: Unclassified sessions (default fallback)
     conditions: []
+
+# Budget rules assign cost-tracking tags to sessions.
+# Each rule's conditions work like classification rules (AND logic).
+# Rules are evaluated in order; first match wins.
+# budget_rules:
+#   # Tag sessions by message prefix pattern
+#   - budget_tag: project-alpha
+#     conditions:
+#       - field: first_user_message
+#         pattern: '^\\[alpha\\]'
+#
+#   # Tag sessions by project name
+#   - budget_tag: team-backend
+#     conditions:
+#       - field: project_name
+#         values: ["api-service", "data-pipeline"]
+#
+#   # Combined pattern and values with exclusion
+#   - budget_tag: infra-ops
+#     conditions:
+#       - field: agent
+#         values: ["build"]
+#       - field: first_user_message
+#         pattern: 'terraform|ansible'
+#     exclude:
+#       - field: first_user_message
+#         pattern: 'test|dry-run'
+budget_rules: []
 `;
 
 /**
@@ -103,6 +131,21 @@ export const DEFAULT_CONFIG: MetricsConfig = (() => {
 	// Pre-compile regex patterns on default rules so they match the
 	// shape produced by loadConfig() for user-provided configs.
 	for (const rule of config.classification_rules) {
+		for (const cond of rule.conditions) {
+			compileConditionPattern(cond);
+		}
+		if (rule.exclude) {
+			for (const cond of rule.exclude) {
+				compileConditionPattern(cond);
+			}
+		}
+	}
+
+	// Ensure budget_rules exists and pre-compile any regex patterns.
+	if (!Array.isArray(config.budget_rules)) {
+		config.budget_rules = [];
+	}
+	for (const rule of config.budget_rules) {
 		for (const cond of rule.conditions) {
 			compileConditionPattern(cond);
 		}

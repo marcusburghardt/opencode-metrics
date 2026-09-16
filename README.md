@@ -23,6 +23,7 @@ Grafana dashboards.
   - [Config fields](#config-fields)
   - [Classification rules](#classification-rules)
   - [Worked examples](#worked-examples)
+  - [Budget rules](#budget-rules)
   - [Data directory location](#data-directory-location)
 - [Testing and Verification](#testing-and-verification)
   - [Verifying metrics collection](#verifying-metrics-collection)
@@ -34,6 +35,7 @@ Grafana dashboards.
     - [Top sessions and KPIs](#top-sessions-and-kpis)
     - [Delta-based queries (accurate daily cost)](#delta-based-queries-accurate-daily-cost)
     - [PR and Issue Analytics](#pr-and-issue-analytics)
+    - [Budget analytics](#budget-analytics)
   - [Running the test suite](#running-the-test-suite)
 - [Metric Reference](#metric-reference)
 - [Insights](#insights)
@@ -269,6 +271,7 @@ classification_rules:
 |------------------------|--------|----------|---------------------------------------------------|
 | `version`              | number | yes      | Config schema version. Currently `1`.              |
 | `classification_rules` | array  | yes      | Ordered list of classification rules.              |
+| `budget_rules`         | array  | no       | Ordered list of budget tagging rules. Defaults to `[]`. |
 
 ### Classification rules
 
@@ -386,6 +389,121 @@ classification_rules:
     # ...
   - name: openspec-workflow
     # ...
+```
+
+### Budget rules
+
+Budget rules assign cost-tracking tags (`budget_tag`) to sessions,
+enabling spend analysis per project, team, or initiative. They use the
+same condition/exclude structure as classification rules but are
+evaluated independently — a session gets both a `classification` and a
+`budget_tag`.
+
+Each rule has the following structure:
+
+```yaml
+budget_rules:
+  - budget_tag: Q3-platform           # Required. Tag stored in sessions table.
+    description: Q3 platform revamp   # Optional. Human-readable explanation.
+    conditions:                       # Required. Array of match conditions (AND logic).
+      - field: first_user_message
+        pattern: '\[Q3-platform\]'
+    exclude:                          # Optional. Array of exclusion conditions (OR logic).
+      - field: agent
+        values: ["explore"]
+```
+
+**Condition fields** — the same fields available to classification rules,
+plus `project_name`:
+
+| Field                | Type     | Description                                     |
+|----------------------|----------|-------------------------------------------------|
+| `agent`              | string   | Agent name (e.g., `build`, `plan`, `explore`)   |
+| `model`              | string   | Model identifier                                |
+| `first_user_message` | string   | Full text of the first user message              |
+| `part_content`       | string   | Concatenated text from all message parts         |
+| `bash_commands`      | string[] | Shell commands extracted from tool calls          |
+| `message_count`      | number   | Total messages in the session                    |
+| `project_name`       | string   | Project name from the OpenCode session context   |
+
+**Rule evaluation:**
+
+1. Rules are evaluated **in order** — first match wins.
+2. All `conditions` must match (AND logic).
+3. If **any** `exclude` condition matches, the rule is rejected.
+4. If no rules match, the session's `budget_tag` is `NULL`.
+5. Invalid regex patterns cause the rule to be skipped with a warning
+   log.
+
+> **Note:** Sessions that do not match any budget rule have
+> `budget_tag = NULL`. Use `WHERE budget_tag IS NOT NULL` to select only
+> budget-tagged sessions, or `WHERE budget_tag IS NULL` to find
+> untagged spend.
+
+#### Worked examples
+
+##### Tagging by message prefix
+
+Tag sessions where the first user message starts with a prefix like
+`[Q3-platform]`:
+
+```yaml
+budget_rules:
+  - budget_tag: Q3-platform
+    description: Q3 platform revamp budget
+    conditions:
+      - field: first_user_message
+        pattern: '\[Q3-platform\]'
+```
+
+##### Tagging by project name
+
+Tag sessions from specific repositories using exact values:
+
+```yaml
+budget_rules:
+  - budget_tag: team-backend
+    conditions:
+      - field: project_name
+        values: ["api-service", "data-pipeline"]
+```
+
+##### Combined conditions with exclusion
+
+Tag sessions by agent type and message content, excluding dry-run or
+test sessions:
+
+```yaml
+budget_rules:
+  - budget_tag: infra-ops
+    conditions:
+      - field: agent
+        values: ["build"]
+      - field: first_user_message
+        pattern: 'terraform|ansible'
+    exclude:
+      - field: first_user_message
+        pattern: 'test|dry-run'
+```
+
+##### Multiple budget rules
+
+Budget rules are evaluated in order — first match wins. Place more
+specific rules before general ones:
+
+```yaml
+budget_rules:
+  # Specific: message prefix takes priority
+  - budget_tag: Q3-platform
+    conditions:
+      - field: first_user_message
+        pattern: '\[Q3-platform\]'
+
+  # General: catch-all for backend projects
+  - budget_tag: team-backend
+    conditions:
+      - field: project_name
+        values: ["api-service", "data-pipeline"]
 ```
 
 ### Data directory location
@@ -973,6 +1091,97 @@ WHERE a.artifact_type = 'pr-created'
   AND m.metric_name = 'cost'
 GROUP BY p.name
 ORDER BY cost_per_pr DESC;
+```
+
+#### Budget analytics
+
+Budget analytics queries use the `budget_tag` column on `v_sessions` to
+slice cost data by budget. Sessions that do not match any budget rule
+have `budget_tag = NULL`.
+
+**Total cost per budget tag:**
+
+```sql
+SELECT s.budget_tag,
+       COUNT(*) AS sessions,
+       ROUND(SUM(m.value), 2) AS total_cost
+FROM v_sessions s
+JOIN v_measurements m ON s.session_id = m.session_id
+WHERE m.metric_name = 'cost'
+  AND s.budget_tag IS NOT NULL
+GROUP BY s.budget_tag
+ORDER BY total_cost DESC;
+```
+
+**Daily cost per budget tag:**
+
+```sql
+SELECT date(m.recorded_at_epoch, 'unixepoch', 'localtime') AS day,
+       s.budget_tag,
+       ROUND(SUM(m.value), 2) AS cost_usd
+FROM v_sessions s
+JOIN v_measurements m ON s.session_id = m.session_id
+WHERE m.metric_name = 'cost'
+  AND s.budget_tag IS NOT NULL
+GROUP BY day, s.budget_tag
+ORDER BY day DESC, cost_usd DESC;
+```
+
+**Cost by budget and classification (cross-tabulation):**
+
+```sql
+SELECT s.budget_tag,
+       s.classification,
+       COUNT(*) AS sessions,
+       ROUND(SUM(m.value), 2) AS total_cost
+FROM v_sessions s
+JOIN v_measurements m ON s.session_id = m.session_id
+WHERE m.metric_name = 'cost'
+  AND s.budget_tag IS NOT NULL
+GROUP BY s.budget_tag, s.classification
+ORDER BY s.budget_tag, total_cost DESC;
+```
+
+**Sessions by budget tag:**
+
+```sql
+SELECT s.budget_tag,
+       COUNT(*) AS sessions,
+       ROUND(AVG(m.value), 4) AS avg_cost,
+       ROUND(MIN(m.value), 4) AS min_cost,
+       ROUND(MAX(m.value), 4) AS max_cost
+FROM v_sessions s
+JOIN v_measurements m ON s.session_id = m.session_id
+WHERE m.metric_name = 'cost'
+  AND s.budget_tag IS NOT NULL
+GROUP BY s.budget_tag
+ORDER BY sessions DESC;
+```
+
+**Budget spend over time (weekly):**
+
+```sql
+SELECT strftime('%Y-W%W',
+         datetime(m.recorded_at_epoch, 'unixepoch')) AS week,
+       s.budget_tag,
+       ROUND(SUM(m.value), 2) AS cost_usd
+FROM v_sessions s
+JOIN v_measurements m ON s.session_id = m.session_id
+WHERE m.metric_name = 'cost'
+  AND s.budget_tag IS NOT NULL
+GROUP BY week, s.budget_tag
+ORDER BY week, cost_usd DESC;
+```
+
+**Untagged spend (sessions without a budget tag):**
+
+```sql
+SELECT COUNT(*) AS sessions,
+       ROUND(SUM(m.value), 2) AS untagged_cost
+FROM v_sessions s
+JOIN v_measurements m ON s.session_id = m.session_id
+WHERE m.metric_name = 'cost'
+  AND s.budget_tag IS NULL;
 ```
 
 ### Running the test suite

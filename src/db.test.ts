@@ -98,9 +98,9 @@ describe("initDatabase", () => {
 		expect(row.journal_mode).toBe("wal");
 	});
 
-	it("sets user_version to 2", () => {
+	it("sets user_version to 3", () => {
 		const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
-		expect(row.user_version).toBe(2);
+		expect(row.user_version).toBe(3);
 	});
 
 	it("preserves user_version on subsequent calls", () => {
@@ -113,7 +113,91 @@ describe("initDatabase", () => {
 		db = second.db;
 
 		const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
-		expect(row.user_version).toBe(2);
+		expect(row.user_version).toBe(3);
+	});
+
+	it("fresh database has budget_tag column on sessions table", () => {
+		const columns = db.prepare("PRAGMA table_info(sessions)").all() as Array<{
+			name: string;
+			type: string;
+		}>;
+
+		const columnMap = new Map(columns.map((col) => [col.name, col.type]));
+		expect(columnMap.has("budget_tag")).toBe(true);
+		expect(columnMap.get("budget_tag")).toBe("TEXT");
+	});
+
+	it("migration from v2 adds budget_tag column without data loss", () => {
+		// Close the current v3 database and simulate a v2 database.
+		db.close();
+
+		// Create a fresh temp dir for the v2 simulation.
+		const v2Dir = mkdtempSync(path.join(tmpdir(), "ocm-v2-migration-"));
+		const v2DbPath = path.join(v2Dir, "metrics.db");
+		const { Database } = require("bun:sqlite");
+		const v2Db = new Database(v2DbPath, { create: true });
+
+		// Create a v2-style sessions table (without budget_tag).
+		v2Db.run(`
+			CREATE TABLE sessions (
+				session_id     TEXT PRIMARY KEY,
+				project_id     TEXT,
+				agent          TEXT,
+				model          TEXT,
+				classification TEXT,
+				title          TEXT,
+				started_at     INTEGER,
+				ended_at       INTEGER,
+				metadata       TEXT
+			)
+		`);
+
+		// Insert a session row with v2 schema.
+		v2Db.run(
+			`INSERT INTO sessions (session_id, project_id, agent, model, classification, title, started_at, ended_at, metadata)
+			 VALUES ('existing-sess', 'proj-1', 'build', 'opus', 'impl', 'existing session', 1700000000000, 1700003600000, '{"key":"val"}')`,
+		);
+
+		// Mark as v2.
+		v2Db.run("PRAGMA user_version = 2");
+		v2Db.close();
+
+		// Now run initDatabase on this v2 directory — should migrate to v3.
+		const migrated = initDatabase(v2Dir);
+		db = migrated.db;
+
+		// Schema version should be 3.
+		const versionRow = db.prepare("PRAGMA user_version").get() as { user_version: number };
+		expect(versionRow.user_version).toBe(3);
+
+		// budget_tag column should exist.
+		const columns = db.prepare("PRAGMA table_info(sessions)").all() as Array<{
+			name: string;
+			type: string;
+		}>;
+		const columnMap = new Map(columns.map((col) => [col.name, col.type]));
+		expect(columnMap.has("budget_tag")).toBe(true);
+
+		// Existing data should be preserved — no data loss.
+		const row = db
+			.prepare("SELECT * FROM sessions WHERE session_id = ?")
+			.get("existing-sess") as Record<string, unknown>;
+		expect(row.project_id).toBe("proj-1");
+		expect(row.agent).toBe("build");
+		expect(row.model).toBe("opus");
+		expect(row.classification).toBe("impl");
+		expect(row.title).toBe("existing session");
+		expect(row.metadata).toBe('{"key":"val"}');
+		// budget_tag should be NULL for pre-existing rows.
+		expect(row.budget_tag).toBeNull();
+
+		// Cleanup
+		db.close();
+		rmSync(v2Dir, { recursive: true, force: true });
+
+		// Re-open original tempDir for afterEach cleanup
+		const result = initDatabase(tempDir);
+		db = result.db;
 	});
 
 	it("seeds 15 metric definitions", () => {

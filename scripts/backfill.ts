@@ -28,7 +28,7 @@ import {
 	extractPRsReviewed,
 	resolveRepoContext,
 } from "../src/artifacts";
-import { classify } from "../src/classifier";
+import { classify, classifyBudget } from "../src/classifier";
 import { loadConfig } from "../src/config";
 import { getDataDir, initDatabase } from "../src/db";
 import {
@@ -443,15 +443,22 @@ async function runBackfill(args: CliArgs): Promise<BackfillStats> {
 				const bashCommands = getBashCommands(sourceDb, session.id);
 				const partContent = getPartContent(sourceDb, session.id);
 
-				// Classify
-				const classification = classify(config.classification_rules, {
+				// Classify work-type and budget tag.
+				const matchedProject = projects.find((p) => p.id === session.project_id);
+				const classificationContext = {
 					agent,
 					model: modelId,
+					project_name: deriveProjectName(
+						matchedProject?.name ?? null,
+						matchedProject?.worktree ?? null,
+					),
 					first_user_message: firstUserMessage,
 					part_content: partContent,
 					bash_commands: bashCommands,
 					message_count: messageCount,
-				});
+				};
+				const classification = classify(config.classification_rules, classificationContext);
+				const budgetTag = classifyBudget(config.budget_rules ?? [], classificationContext);
 
 				// Derived metrics
 				const cacheHitRatio = computeCacheHitRatio(
@@ -491,6 +498,7 @@ async function runBackfill(args: CliArgs): Promise<BackfillStats> {
 						started_at: session.time_created ?? 0,
 						ended_at: session.time_updated ?? 0,
 						metadata: null,
+						budget_tag: budgetTag,
 					});
 
 					// Skip delta writes: backfilled sessions only have cumulative

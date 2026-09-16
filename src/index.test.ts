@@ -135,6 +135,7 @@ describe("handleSessionIdle", () => {
 	let db: Database;
 	let config: MetricsConfig;
 	let cache: ClassificationCache;
+	let budgetCache: ClassificationCache;
 
 	beforeEach(() => {
 		tempDir = mkdtempSync(path.join(tmpdir(), "ocm-index-"));
@@ -142,6 +143,7 @@ describe("handleSessionIdle", () => {
 		db = result.db;
 		config = DEFAULT_CONFIG;
 		cache = new ClassificationCache();
+		budgetCache = new ClassificationCache();
 	});
 
 	afterEach(() => {
@@ -152,7 +154,7 @@ describe("handleSessionIdle", () => {
 	it("full flow: extract, classify, write to DB", async () => {
 		const { client } = makeClient();
 
-		await handleSessionIdle(client, "sess-001", db, config, cache);
+		await handleSessionIdle(client, "sess-001", db, config, cache, budgetCache);
 
 		// Verify project was written
 		const project = db.prepare("SELECT * FROM projects WHERE project_id = ?").get("proj-001") as {
@@ -194,7 +196,7 @@ describe("handleSessionIdle", () => {
 		// Explore agent should be classified as "exploration"
 		const { client } = makeClient({ session: { agent: "explore" } });
 
-		await handleSessionIdle(client, "sess-explore", db, config, cache);
+		await handleSessionIdle(client, "sess-explore", db, config, cache, budgetCache);
 
 		const session = db
 			.prepare("SELECT classification FROM sessions WHERE session_id = ?")
@@ -207,10 +209,10 @@ describe("handleSessionIdle", () => {
 		const { client } = makeClient();
 
 		// First call populates the cache
-		await handleSessionIdle(client, "sess-cached", db, config, cache);
+		await handleSessionIdle(client, "sess-cached", db, config, cache, budgetCache);
 
 		// Second call should use the cache (same message count)
-		await handleSessionIdle(client, "sess-cached", db, config, cache);
+		await handleSessionIdle(client, "sess-cached", db, config, cache, budgetCache);
 
 		// Session should still be correctly classified
 		const session = db
@@ -223,7 +225,7 @@ describe("handleSessionIdle", () => {
 	it("skips extraction when session_id is empty", async () => {
 		const { client, logs } = makeClient();
 
-		await handleSessionIdle(client, "", db, config, cache);
+		await handleSessionIdle(client, "", db, config, cache, budgetCache);
 
 		// No data should be written
 		const count = db.prepare("SELECT COUNT(*) AS count FROM sessions").get() as {
@@ -242,9 +244,9 @@ describe("handleSessionIdle", () => {
 
 		// handleSessionIdle should throw (caller is responsible for catch)
 		// In the real plugin, the event handler wraps this in try/catch.
-		await expect(handleSessionIdle(client, "sess-err", db, config, cache)).rejects.toThrow(
-			"SDK connection timeout",
-		);
+		await expect(
+			handleSessionIdle(client, "sess-err", db, config, cache, budgetCache),
+		).rejects.toThrow("SDK connection timeout");
 	});
 
 	it("error isolation: SDK messages failure does not propagate", async () => {
@@ -252,15 +254,15 @@ describe("handleSessionIdle", () => {
 			messagesError: new Error("messages endpoint unavailable"),
 		});
 
-		await expect(handleSessionIdle(client, "sess-err2", db, config, cache)).rejects.toThrow(
-			"messages endpoint unavailable",
-		);
+		await expect(
+			handleSessionIdle(client, "sess-err2", db, config, cache, budgetCache),
+		).rejects.toThrow("messages endpoint unavailable");
 	});
 
 	it("writes all 12 metrics for a complete session", async () => {
 		const { client } = makeClient();
 
-		await handleSessionIdle(client, "sess-metrics", db, config, cache);
+		await handleSessionIdle(client, "sess-metrics", db, config, cache, budgetCache);
 
 		const metrics = db
 			.prepare("SELECT metric_name FROM measurements WHERE session_id = ? ORDER BY metric_name")
@@ -285,7 +287,7 @@ describe("handleSessionIdle", () => {
 		const { client: client1 } = makeClient({
 			session: { title: "First title" },
 		});
-		await handleSessionIdle(client1, "sess-update", db, config, cache);
+		await handleSessionIdle(client1, "sess-update", db, config, cache, budgetCache);
 
 		// Second call with different title — cache is invalidated by new message count
 		const { client: client2 } = makeClient({
@@ -296,7 +298,7 @@ describe("handleSessionIdle", () => {
 				{ id: "msg-3", role: "user", parts: [{ type: "text", content: "more" }] },
 			],
 		});
-		await handleSessionIdle(client2, "sess-update", db, config, cache);
+		await handleSessionIdle(client2, "sess-update", db, config, cache, budgetCache);
 
 		const session = db
 			.prepare("SELECT title FROM sessions WHERE session_id = ?")
@@ -315,7 +317,7 @@ describe("handleSessionIdle", () => {
 			},
 		});
 
-		await handleSessionIdle(client, "sess-derived", db, config, cache);
+		await handleSessionIdle(client, "sess-derived", db, config, cache, budgetCache);
 
 		const cacheRatio = db
 			.prepare("SELECT value FROM measurements WHERE session_id = ? AND metric_name = ?")
@@ -328,6 +330,81 @@ describe("handleSessionIdle", () => {
 			.get("sess-derived", "duration_seconds") as { value: number } | null;
 
 		expect(duration?.value).toBe(1800);
+	});
+
+	it("sets budget_tag when budget rules match", async () => {
+		const { client } = makeClient();
+
+		const configWithBudget: MetricsConfig = {
+			...config,
+			budget_rules: [
+				{
+					budget_tag: "team-build",
+					conditions: [{ field: "agent", values: ["build"] }],
+				},
+			],
+		};
+
+		await handleSessionIdle(client, "sess-budget", db, configWithBudget, cache, budgetCache);
+
+		const session = db
+			.prepare("SELECT budget_tag FROM sessions WHERE session_id = ?")
+			.get("sess-budget") as { budget_tag: string | null } | null;
+
+		expect(session?.budget_tag).toBe("team-build");
+	});
+
+	it("sets budget_tag to null when no budget rules match", async () => {
+		const { client } = makeClient({ session: { agent: "explore" } });
+
+		const configWithBudget: MetricsConfig = {
+			...config,
+			budget_rules: [
+				{
+					budget_tag: "only-build",
+					conditions: [{ field: "agent", values: ["build"] }],
+				},
+			],
+		};
+
+		await handleSessionIdle(client, "sess-no-budget", db, configWithBudget, cache, budgetCache);
+
+		const session = db
+			.prepare("SELECT budget_tag FROM sessions WHERE session_id = ?")
+			.get("sess-no-budget") as { budget_tag: string | null } | null;
+
+		expect(session?.budget_tag).toBeNull();
+	});
+
+	it("budget cache is independent of classification cache", async () => {
+		const { client } = makeClient();
+
+		const configWithBudget: MetricsConfig = {
+			...config,
+			budget_rules: [
+				{
+					budget_tag: "infra-ops",
+					conditions: [{ field: "agent", values: ["build"] }],
+				},
+			],
+		};
+
+		// First call populates both caches
+		await handleSessionIdle(client, "sess-indep", db, configWithBudget, cache, budgetCache);
+
+		// Classification cache should have the work-type classification
+		const cachedClassification = cache.get("sess-indep", 2);
+		expect(cachedClassification).toBe("implementation");
+
+		// Budget cache should have the budget tag independently
+		const cachedBudget = budgetCache.get("sess-indep", 2);
+		expect(cachedBudget).toBe("infra-ops");
+
+		// Verify the two caches are distinct instances — clearing one
+		// does not affect the other.
+		const freshBudgetCache = new ClassificationCache();
+		expect(freshBudgetCache.get("sess-indep", 2)).toBeNull();
+		expect(cache.get("sess-indep", 2)).toBe("implementation");
 	});
 });
 

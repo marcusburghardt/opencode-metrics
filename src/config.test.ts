@@ -169,6 +169,148 @@ describe("config", () => {
 			expect(config.classification_rules.length).toBe(1);
 		});
 
+		it("defaults budget_rules to empty array when absent", () => {
+			const yaml = [
+				"version: 1",
+				"classification_rules:",
+				"  - name: rule",
+				"    conditions: []",
+			].join("\n");
+			writeFileSync(path.join(tempDir, "config.yaml"), yaml);
+
+			const config = loadConfig(tempDir);
+
+			expect(config.budget_rules).toEqual([]);
+		});
+
+		it("loads valid budget rules", () => {
+			const yaml = [
+				"version: 1",
+				"classification_rules:",
+				"  - name: rule",
+				"    conditions: []",
+				"budget_rules:",
+				"  - budget_tag: project-alpha",
+				"    conditions:",
+				"      - field: first_user_message",
+				"        pattern: '^\\[alpha\\]'",
+				"  - budget_tag: team-backend",
+				"    conditions:",
+				"      - field: project_name",
+				"        values: ['api-service', 'data-pipeline']",
+			].join("\n");
+			writeFileSync(path.join(tempDir, "config.yaml"), yaml);
+
+			const config = loadConfig(tempDir);
+
+			expect(config.budget_rules.length).toBe(2);
+			expect(config.budget_rules[0].budget_tag).toBe("project-alpha");
+			expect(config.budget_rules[0].conditions[0].field).toBe("first_user_message");
+			expect(config.budget_rules[0].conditions[0].pattern).toBe("^\\[alpha\\]");
+			expect(config.budget_rules[0].conditions[0].compiledPattern).toBeInstanceOf(RegExp);
+			expect(config.budget_rules[1].budget_tag).toBe("team-backend");
+			expect(config.budget_rules[1].conditions[0].values).toEqual([
+				"api-service",
+				"data-pipeline",
+			]);
+		});
+
+		it("skips budget rules with missing budget_tag", () => {
+			const yaml = [
+				"version: 1",
+				"classification_rules: []",
+				"budget_rules:",
+				"  - conditions:",
+				"      - field: agent",
+				"        values: ['build']",
+				"  - budget_tag: ''",
+				"    conditions:",
+				"      - field: agent",
+				"        values: ['build']",
+				"  - budget_tag: valid-tag",
+				"    conditions:",
+				"      - field: agent",
+				"        values: ['build']",
+			].join("\n");
+			writeFileSync(path.join(tempDir, "config.yaml"), yaml);
+			const warnings: string[] = [];
+
+			const config = loadConfig(tempDir, (msg) => warnings.push(msg));
+
+			expect(config.budget_rules.length).toBe(1);
+			expect(config.budget_rules[0].budget_tag).toBe("valid-tag");
+			expect(warnings.filter((w) => w.includes("budget_tag")).length).toBe(2);
+		});
+
+		it("skips budget rules with invalid regex in conditions", () => {
+			const yaml = [
+				"version: 1",
+				"classification_rules: []",
+				"budget_rules:",
+				"  - budget_tag: bad-regex-rule",
+				"    conditions:",
+				"      - field: agent",
+				"        pattern: '[invalid('",
+				"  - budget_tag: good-rule",
+				"    conditions:",
+				"      - field: agent",
+				"        values: ['build']",
+			].join("\n");
+			writeFileSync(path.join(tempDir, "config.yaml"), yaml);
+			const warnings: string[] = [];
+
+			const config = loadConfig(tempDir, (msg) => warnings.push(msg));
+
+			expect(config.budget_rules.length).toBe(1);
+			expect(config.budget_rules[0].budget_tag).toBe("good-rule");
+			expect(warnings.some((w) => w.includes("invalid regex"))).toBe(true);
+		});
+
+		it("skips budget rules with missing conditions array", () => {
+			const yaml = [
+				"version: 1",
+				"classification_rules: []",
+				"budget_rules:",
+				"  - budget_tag: no-conditions",
+				'    conditions: "not-an-array"',
+				"  - budget_tag: valid-rule",
+				"    conditions:",
+				"      - field: agent",
+				"        values: ['build']",
+			].join("\n");
+			writeFileSync(path.join(tempDir, "config.yaml"), yaml);
+			const warnings: string[] = [];
+
+			const config = loadConfig(tempDir, (msg) => warnings.push(msg));
+
+			expect(config.budget_rules.length).toBe(1);
+			expect(config.budget_rules[0].budget_tag).toBe("valid-rule");
+			expect(warnings.some((w) => w.includes("conditions"))).toBe(true);
+		});
+
+		it("loads budget rules with exclude conditions", () => {
+			const yaml = [
+				"version: 1",
+				"classification_rules: []",
+				"budget_rules:",
+				"  - budget_tag: with-exclude",
+				"    conditions:",
+				"      - field: agent",
+				"        values: ['build']",
+				"    exclude:",
+				"      - field: first_user_message",
+				"        pattern: 'test|dry-run'",
+			].join("\n");
+			writeFileSync(path.join(tempDir, "config.yaml"), yaml);
+
+			const config = loadConfig(tempDir);
+
+			expect(config.budget_rules.length).toBe(1);
+			expect(config.budget_rules[0].exclude).toBeDefined();
+			expect(config.budget_rules[0].exclude?.length).toBe(1);
+			expect(config.budget_rules[0].exclude?.[0].pattern).toBe("test|dry-run");
+		});
+
 		it("handles rule with exclude conditions", () => {
 			const yaml = [
 				"version: 1",
@@ -230,6 +372,12 @@ describe("config", () => {
 					DEFAULT_CONFIG.classification_rules[i].name,
 				);
 			}
+		});
+
+		it("default config parses with an empty budget_rules array", () => {
+			expect(DEFAULT_CONFIG.budget_rules).toBeDefined();
+			expect(Array.isArray(DEFAULT_CONFIG.budget_rules)).toBe(true);
+			expect(DEFAULT_CONFIG.budget_rules.length).toBe(0);
 		});
 	});
 });
