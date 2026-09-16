@@ -95,6 +95,10 @@
 - [ ] 6.1 Update `scripts/backfill.ts` to apply
   `classifyBudget()` to each backfilled session using the loaded
   config's budget_rules. Set budget_tag on the session record.
+  Add tests verifying: session with matching budget rule receives
+  budget_tag, session with no matching rule receives NULL
+  budget_tag, re-running backfill with updated budget_rules
+  overwrites budget_tag.
   **Files**: `scripts/backfill.ts`
 
 ## 7. Documentation
@@ -120,3 +124,5 @@
   Quality), budget classification is fully optional with no new
   dependencies (Composability First), all config inputs are
   validated (Security by Default).
+
+<!-- spec-review: passed -->

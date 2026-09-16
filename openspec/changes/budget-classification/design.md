@@ -81,7 +81,8 @@ Adding the field is purely additive.
 Two separate instances are created in `handleSessionIdle()`. The
 cache class is generic enough (it stores `string` keyed by
 session ID + message count) that no rename or generalization is
-needed.
+needed. Total cache footprint with budget classification enabled
+is two bounded LRU instances (up to 2000 entries combined).
 
 ### D6: Schema migration via conditional ALTER TABLE
 

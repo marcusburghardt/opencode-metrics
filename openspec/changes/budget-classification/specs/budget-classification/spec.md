@@ -67,8 +67,9 @@ NULL.
 The plugin SHALL validate budget_rules entries using the same
 validation logic as classification_rules. Invalid rules SHALL be
 skipped with a warning log. The budget_tag field SHALL be a
-non-empty string. Conditions and exclude arrays SHALL follow the
-same validation contract as classification rules.
+non-empty string. budget_tag SHOULD be limited to 128 characters.
+Conditions and exclude arrays SHALL follow the same validation
+contract as classification rules.
 
 #### Scenario: Invalid regex in budget rule
 
@@ -98,8 +99,10 @@ same validation contract as classification rules.
 ### Requirement: Budget classification cache
 
 Budget classification results SHALL be cached per session using the
-same caching strategy as work-type classification. The cache SHALL
-be invalidated when the session's message count changes.
+same caching strategy as work-type classification. The budget
+classification cache SHALL be bounded to a maximum of 1000 entries
+using LRU eviction. The cache SHALL be invalidated when the
+session's message count changes.
 
 #### Scenario: Cache hit on repeated idle events
 
@@ -116,12 +119,21 @@ be invalidated when the session's message count changes.
 - **THEN** the cache SHALL be invalidated
 - **AND** the session SHALL be re-classified against budget rules
 
+#### Scenario: Budget cache eviction under pressure
+
+- **GIVEN** the budget classification cache contains 1000 entries
+- **WHEN** a new session requires budget classification
+- **THEN** the least recently used budget cache entry SHALL be evicted
+- **AND** the new budget classification result SHALL be cached
+
 ### Requirement: Budget classification in backfill
 
 The backfill script SHALL apply budget_rules to historical sessions
 using the same classifyBudget() function as the live plugin. The
 budget_tag SHALL be written to the sessions table for each backfilled
-session.
+session. Budget classification during backfill SHALL be idempotent.
+Re-running backfill with updated budget_rules SHALL re-evaluate and
+overwrite previously assigned budget_tags.
 
 #### Scenario: Historical session receives budget tag
 

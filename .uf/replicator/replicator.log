@@ -6,3 +6,4 @@
 2026/09/16 11:37:20 INFO tool call tool=hivemind_store duration=724.488µs success=true
 2026/09/16 11:37:28 INFO tool call tool=hivemind_store duration=529.587µs success=true
 2026/09/16 11:37:33 INFO tool call tool=hivemind_store duration=592.353µs success=true
+2026/09/16 14:34:13 INFO tool call tool=forge_worktree_list duration=1.806163ms success=true
