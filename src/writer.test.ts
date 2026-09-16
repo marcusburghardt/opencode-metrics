@@ -7,7 +7,14 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { initDatabase } from "./db";
 import type { MetricRecord, ProjectRecord, SessionRecord } from "./writer";
-import { upsertProject, upsertSession, withRetry, writeMetrics, writeSessionData } from "./writer";
+import {
+	upsertArtifacts,
+	upsertProject,
+	upsertSession,
+	withRetry,
+	writeMetrics,
+	writeSessionData,
+} from "./writer";
 
 /** Factory for a valid project record. */
 function makeProject(overrides: Partial<ProjectRecord> = {}): ProjectRecord {
@@ -241,6 +248,101 @@ describe("writer", () => {
 				.prepare("SELECT COUNT(*) AS count FROM projects WHERE project_id = ?")
 				.get("proj-fail") as { count: number };
 			expect(projectRow.count).toBe(0);
+		});
+	});
+
+	describe("upsertArtifacts", () => {
+		it("inserts artifact rows with correct columns", () => {
+			upsertArtifacts(
+				db,
+				"sess-001",
+				[{ artifact_type: "pr-created", reference: "org/repo#42" }],
+				1700003600000,
+			);
+
+			const row = db
+				.prepare("SELECT * FROM session_artifacts WHERE session_id = ?")
+				.get("sess-001") as {
+				session_id: string;
+				artifact_type: string;
+				reference: string;
+				recorded_at: number;
+			};
+
+			expect(row.session_id).toBe("sess-001");
+			expect(row.artifact_type).toBe("pr-created");
+			expect(row.reference).toBe("org/repo#42");
+			expect(row.recorded_at).toBe(1700003600000);
+		});
+
+		it("duplicate PK produces one row (OR IGNORE)", () => {
+			upsertArtifacts(
+				db,
+				"sess-001",
+				[{ artifact_type: "pr-created", reference: "org/repo#42" }],
+				1700003600000,
+			);
+			upsertArtifacts(
+				db,
+				"sess-001",
+				[{ artifact_type: "pr-created", reference: "org/repo#42" }],
+				1700003600001,
+			);
+
+			const count = db
+				.prepare("SELECT COUNT(*) AS count FROM session_artifacts WHERE session_id = ?")
+				.get("sess-001") as { count: number };
+			expect(count.count).toBe(1);
+		});
+
+		it("handles multiple artifacts in a single call", () => {
+			upsertArtifacts(
+				db,
+				"sess-001",
+				[
+					{ artifact_type: "pr-created", reference: "org/repo#1" },
+					{ artifact_type: "pr-reviewed", reference: "org/repo#2" },
+					{ artifact_type: "issue-referenced", reference: "org/repo#3" },
+				],
+				1700003600000,
+			);
+
+			const rows = db
+				.prepare("SELECT * FROM session_artifacts WHERE session_id = ? ORDER BY reference")
+				.all("sess-001") as Array<{ artifact_type: string; reference: string }>;
+
+			expect(rows.length).toBe(3);
+			expect(rows[0].artifact_type).toBe("pr-created");
+			expect(rows[1].artifact_type).toBe("pr-reviewed");
+			expect(rows[2].artifact_type).toBe("issue-referenced");
+		});
+
+		it("participates in transaction (rollback removes artifact rows)", () => {
+			const brokenTransaction = db.transaction(() => {
+				upsertProject(db, makeProject({ project_id: "proj-fail" }));
+				upsertSession(db, makeSession({ session_id: "sess-fail" }));
+				upsertArtifacts(
+					db,
+					"sess-fail",
+					[{ artifact_type: "pr-created", reference: "org/repo#1" }],
+					1700003600000,
+				);
+				throw new Error("simulated failure after artifacts");
+			});
+
+			expect(() => brokenTransaction()).toThrow("simulated failure after artifacts");
+
+			// Artifact rows from the failed transaction must not exist.
+			const artifactRow = db
+				.prepare("SELECT COUNT(*) AS count FROM session_artifacts WHERE session_id = ?")
+				.get("sess-fail") as { count: number };
+			expect(artifactRow.count).toBe(0);
+
+			// Session from the failed transaction must not exist either.
+			const sessionRow = db
+				.prepare("SELECT COUNT(*) AS count FROM sessions WHERE session_id = ?")
+				.get("sess-fail") as { count: number };
+			expect(sessionRow.count).toBe(0);
 		});
 	});
 

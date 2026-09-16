@@ -90,8 +90,8 @@ describe("extractSessionData", () => {
 		expect(result?.session.ended_at).toBe(1700003600000);
 		expect(result?.session.classification).toBe("unknown");
 
-		// Metrics: all 12 present
-		expect(result?.metrics.length).toBe(12);
+		// Metrics: all 15 present (12 base + 3 artifact counts)
+		expect(result?.metrics.length).toBe(15);
 
 		const costMetric = result?.metrics.find((m) => m.metric_name === "cost");
 		expect(costMetric?.value).toBeCloseTo(0.42);

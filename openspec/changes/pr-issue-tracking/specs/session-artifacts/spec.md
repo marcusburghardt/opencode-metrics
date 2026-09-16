@@ -26,11 +26,17 @@ reference format: `org/repo#number` (e.g., `complytime/complyctl#474`).
   artifact_type = "pr-reviewed", reference = "org/repo#10"
 
 #### Scenario: Session references an issue
-- **GIVEN** a session runs `gh issue view 42` or `gh issue list`
-  showing issue #42
+- **GIVEN** a session runs `gh issue view 42`
+  in a project whose remote is `github.com/org/repo`
 - **WHEN** the session metrics are recorded
 - **THEN** a row SHALL be inserted into session_artifacts with
   artifact_type = "issue-referenced", reference = "org/repo#42"
+
+#### Scenario: gh issue list without specific number
+- **GIVEN** a session runs `gh issue list` (no specific issue number)
+- **WHEN** the session metrics are recorded
+- **THEN** no artifact SHALL be recorded (list commands without
+  explicit issue numbers are not tracked)
 
 #### Scenario: Duplicate PR reference in same session
 - **GIVEN** a session runs `gh pr view 10`, `gh pr diff 10`, and
@@ -77,7 +83,11 @@ parts in the message data. The extraction SHALL parse:
 - `gh pr create` commands + output URLs for created PRs
 - `gh pr view/diff/checks/review <number>` for reviewed PRs
 - `git fetch ... pull/<number>/head` for reviewed PRs
-- `gh issue view/list/create <number>` for referenced issues
+- `gh issue view <number>` for referenced issues
+- `gh issue create` commands + output URLs for created issues
+  (classified as issue-referenced since no separate issue-created
+  type exists — the artifact type tracks session interaction, not
+  the specific action)
 - PR URLs in command arguments or output matching
   `github.com/<org>/<repo>/pull/<number>`
 
@@ -95,6 +105,27 @@ parts in the message data. The extraction SHALL parse:
 - **WHEN** the extraction runs
 - **THEN** a pr-reviewed artifact SHALL be recorded with reference
   `org/repo#10`
+
+#### Scenario: PR reference without resolvable repo context
+- **GIVEN** a bash tool call runs `gh pr view 10`
+- **AND** the session's project remote is not a GitHub URL (or is
+  absent, e.g., local-only project or deleted worktree)
+- **WHEN** the extraction runs
+- **THEN** the artifact SHALL be silently skipped (no row inserted)
+- **AND** the prs_reviewed count SHALL NOT include this artifact
+
+#### Scenario: Malformed PR URL in tool output
+- **GIVEN** a bash tool call output contains a URL matching
+  `github.com` but with a non-numeric PR identifier
+  (e.g., `github.com/org/repo/pull/abc`)
+- **WHEN** the extraction runs
+- **THEN** the malformed URL SHALL be silently skipped
+
+#### Scenario: gh command with explicit --repo flag
+- **GIVEN** a bash tool call runs `gh pr view 10 --repo org/other`
+- **WHEN** the extraction runs
+- **THEN** the reference SHALL use the `--repo` value:
+  `org/other#10` (overriding the session's project remote)
 
 ### Requirement: Backfill extraction
 The backfill script SHALL extract PR/issue references from
@@ -121,3 +152,25 @@ The metric_definitions catalog SHALL include 15 metrics: the
 existing 12 plus prs_created, prs_reviewed, and issues_referenced.
 New metrics use INSERT OR IGNORE so existing databases gain the
 new definitions on next startup without affecting existing rows.
+
+### Requirement: Tool call output access
+The PartInfo interface SHALL include an `output` field so that
+extraction functions can access bash tool call outputs (e.g., PR
+URLs from `gh pr create` output). The SDK adapter SHALL map
+`p.state.output` into this field for tool-type parts.
+
+#### Scenario: PartInfo carries tool output
+- **GIVEN** a tool part with `p.state.output` containing text
+- **WHEN** the SDK adapter maps the part to PartInfo
+- **THEN** the PartInfo `output` field SHALL contain the text
+
+### Requirement: Extraction resilience
+Extraction SHALL be best-effort per command. A failure to parse
+one bash tool call (malformed output, unexpected format) SHALL NOT
+invalidate successfully extracted artifacts from other tool calls
+in the same session. The count-equals-detail invariant holds for
+the successfully extracted set.
+
+## REMOVED Requirements
+
+(none)

@@ -133,6 +133,12 @@ export function createSDKAdapter(input: PluginInput): SDKClient {
 											| Record<string, unknown>
 											| undefined)
 									: undefined,
+							output:
+								p.type === "tool"
+									? ((p.state as Record<string, unknown> | undefined)?.output as
+											| string
+											| undefined)
+									: undefined,
 						})),
 					};
 				});

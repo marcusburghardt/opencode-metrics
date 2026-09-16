@@ -102,7 +102,24 @@ ensures the same references are captured regardless of data source.
 Historical data has rich PR activity (105 sessions created PRs,
 127 reviewed PRs).
 
-### Decision 7: Coverage strategy
+### Decision 7: extractRepoContext contract boundary
+
+**Choice**: Split repo context resolution into two functions:
+1. `parseRepoFromRemoteUrl(url: string): string | null` — pure URL
+   parser that extracts `org/repo` from a GitHub remote URL. Handles
+   `https://github.com/org/repo.git`, `git@github.com:org/repo.git`,
+   and similar formats. Returns null for non-GitHub URLs.
+2. `resolveRepoContext(worktree: string): string | null` — filesystem
+   operation that reads the git remote from a worktree path, then
+   delegates to the pure parser. Used in integration layer only.
+
+**Rationale**: Constitution Principle IV (Testability) requires
+isolation. The pure parser is fully unit-testable with string
+fixtures. The filesystem resolver is tested implicitly via backfill
+verification (tasks 9.4-9.5). This separation ensures the core
+parsing logic has no external dependencies.
+
+### Decision 8: Coverage strategy
 
 Tests are classified as:
 - **Unit tests**: PR/issue extraction from bash command strings, URL

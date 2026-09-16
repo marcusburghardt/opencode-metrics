@@ -7,23 +7,30 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { initDatabase } from "./db";
 
-/** Helper tables expected in the v1 schema. */
+/** Helper tables expected in the v2 schema. */
 const EXPECTED_TABLES = [
 	"projects",
 	"sessions",
 	"metric_definitions",
 	"measurements",
 	"measurement_deltas",
+	"session_artifacts",
 ];
 
-/** Helper views expected in the v1 schema. */
-const EXPECTED_VIEWS = ["v_sessions", "v_measurements", "v_measurement_deltas"];
+/** Helper views expected in the v2 schema. */
+const EXPECTED_VIEWS = [
+	"v_sessions",
+	"v_measurements",
+	"v_measurement_deltas",
+	"v_session_artifacts",
+];
 
-/** Helper indexes expected in the v1 schema. */
+/** Helper indexes expected in the v2 schema. */
 const EXPECTED_INDEXES = [
 	"idx_measurements_time",
 	"idx_measurements_metric",
 	"idx_deltas_metric_time",
+	"idx_artifacts_reference",
 ];
 
 describe("initDatabase", () => {
@@ -91,9 +98,9 @@ describe("initDatabase", () => {
 		expect(row.journal_mode).toBe("wal");
 	});
 
-	it("sets user_version to 1", () => {
+	it("sets user_version to 2", () => {
 		const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
-		expect(row.user_version).toBe(1);
+		expect(row.user_version).toBe(2);
 	});
 
 	it("preserves user_version on subsequent calls", () => {
@@ -106,14 +113,14 @@ describe("initDatabase", () => {
 		db = second.db;
 
 		const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
-		expect(row.user_version).toBe(1);
+		expect(row.user_version).toBe(2);
 	});
 
-	it("seeds 12 metric definitions", () => {
+	it("seeds 15 metric definitions", () => {
 		const row = db.prepare("SELECT COUNT(*) AS count FROM metric_definitions").get() as {
 			count: number;
 		};
-		expect(row.count).toBe(12);
+		expect(row.count).toBe(15);
 	});
 
 	it("seeds correct metric names", () => {
@@ -137,6 +144,9 @@ describe("initDatabase", () => {
 		expect(names).toContain("lines_added");
 		expect(names).toContain("lines_deleted");
 		expect(names).toContain("messages_total");
+		expect(names).toContain("prs_created");
+		expect(names).toContain("prs_reviewed");
+		expect(names).toContain("issues_referenced");
 	});
 
 	it("does not duplicate metric definitions on repeated calls", () => {
@@ -151,7 +161,7 @@ describe("initDatabase", () => {
 		const row = db.prepare("SELECT COUNT(*) AS count FROM metric_definitions").get() as {
 			count: number;
 		};
-		expect(row.count).toBe(12);
+		expect(row.count).toBe(15);
 	});
 
 	it("returns the resolved data directory path", () => {
@@ -261,5 +271,38 @@ describe("initDatabase", () => {
 		expect(row.recorded_at_iso).toBe("2023-11-14T23:13:20Z");
 		expect(row.delta).toBe(0.42);
 		expect(row.metric_name).toBe("cost");
+	});
+
+	it("session_artifacts table exists with correct columns", () => {
+		const columns = db.prepare("PRAGMA table_info(session_artifacts)").all() as Array<{
+			name: string;
+			type: string;
+		}>;
+
+		const columnMap = new Map(columns.map((col) => [col.name, col.type]));
+
+		expect(columnMap.get("session_id")).toBe("TEXT");
+		expect(columnMap.get("artifact_type")).toBe("TEXT");
+		expect(columnMap.get("reference")).toBe("TEXT");
+		expect(columnMap.get("recorded_at")).toBe("INTEGER");
+		expect(columns.length).toBe(4);
+	});
+
+	it("v_session_artifacts returns correct epoch and ISO columns", () => {
+		// Insert an artifact with known timestamp: 1700003600000 ms
+		// = 1700003600 epoch seconds = 2023-11-14T23:13:20Z
+		db.run(
+			`INSERT INTO session_artifacts (session_id, artifact_type, reference, recorded_at)
+			 VALUES ('s1', 'pr-created', 'org/repo#1', 1700003600000)`,
+		);
+
+		const row = db
+			.prepare("SELECT * FROM v_session_artifacts WHERE session_id = 's1'")
+			.get() as Record<string, unknown>;
+
+		expect(row.recorded_at_epoch).toBe(1700003600);
+		expect(row.recorded_at_iso).toBe("2023-11-14T23:13:20Z");
+		expect(row.artifact_type).toBe("pr-created");
+		expect(row.reference).toBe("org/repo#1");
 	});
 });

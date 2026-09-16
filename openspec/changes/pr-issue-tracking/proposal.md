@@ -74,10 +74,12 @@ bash tool call commands for `gh pr create/view/diff/checks` and
 ## Impact
 
 - **Files modified**: `src/db.ts` (schema), `src/extractor.ts`
-  (PR/issue extraction), `src/writer.ts` (artifact writes),
-  `src/index.ts` (wire extraction to write path), `scripts/backfill.ts`
-  (historical extraction), `README.md` (queries), test files
-- **Files added**: (none — all changes are in existing files)
+  (PartInfo extension + extraction wiring), `src/writer.ts`
+  (artifact writes), `src/index.ts` (SDK adapter + write path wiring),
+  `scripts/backfill.ts` (historical extraction), `README.md` (queries),
+  `src/db.test.ts` (schema + writer tests)
+- **Files added**: `src/artifacts.ts` (extraction module),
+  `src/artifacts.test.ts` (extraction + integration tests)
 - **Backward compatibility**: Full. New table and metrics are additive.
   Existing queries and views are unchanged.
 - **Dependencies**: None new.
@@ -125,3 +127,13 @@ PR/issue extraction is a pure text-parsing operation on bash command
 strings and tool outputs — testable with fixture data. The extraction
 logic requires no network, no SDK, and no external services. The
 count-equals-detail invariant is testable in isolation.
+
+### V. Security by Default
+
+**Assessment**: PASS
+
+No new external dependencies are introduced. Extraction parses
+existing database content (bash command strings and tool outputs)
+with no new external inputs, no network calls, and no credential
+handling. All data flows are read-only from the source and
+write-only to the local SQLite database.
