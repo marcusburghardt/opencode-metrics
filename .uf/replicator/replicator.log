@@ -1,8 +1,0 @@
-2026/09/16 10:11:14 INFO tool call tool=forge_worktree_list duration=2.040036ms success=true
-2026/09/16 10:15:53 INFO tool call tool=hivemind_find duration=1.122439ms success=true
-2026/09/16 10:15:59 INFO tool call tool=hivemind_find duration=797.337µs success=true
-2026/09/16 10:18:25 INFO tool call tool=hivemind_find duration=721.461µs success=true
-2026/09/16 10:27:10 INFO tool call tool=hivemind_find duration=582.351µs success=true
-2026/09/16 11:37:20 INFO tool call tool=hivemind_store duration=724.488µs success=true
-2026/09/16 11:37:28 INFO tool call tool=hivemind_store duration=529.587µs success=true
-2026/09/16 11:37:33 INFO tool call tool=hivemind_store duration=592.353µs success=true

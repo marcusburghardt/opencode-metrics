@@ -41,6 +41,23 @@ a match.
 - **WHEN** a session with agent "divisor-guard" is classified
 - **THEN** the classification SHALL be "security-review"
 
+### Requirement: Classification Context Fields
+
+ClassificationContext SHALL include the following fields available
+for matching in classification rule conditions: agent, model,
+first_user_message, part_content, bash_commands, message_count,
+and project_name. The project_name field SHALL contain the project
+directory name. Unknown fields SHALL return undefined (no match).
+
+#### Scenario: project_name used in classification rule
+
+- **GIVEN** config.yaml defines a classification rule with condition:
+  field: project_name, values: [infra-scripts]
+- **AND** the session is in the infra-scripts project
+- **WHEN** the session is classified
+- **THEN** the condition SHALL match against the project directory
+  name
+
 ### Requirement: Default Classification Rules
 
 The plugin SHALL ship with default classification rules covering

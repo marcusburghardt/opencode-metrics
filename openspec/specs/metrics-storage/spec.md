@@ -125,6 +125,28 @@ versions before proceeding with normal operation.
 - **AND** SHALL apply the necessary migrations
 - **AND** SHALL update PRAGMA user_version after migration
 
+### Requirement: Sessions Table Schema
+
+The sessions table SHALL include the columns: session_id (TEXT PK),
+project_id (TEXT), agent (TEXT), model (TEXT), classification (TEXT),
+budget_tag (TEXT, nullable), title (TEXT), started_at (INTEGER),
+ended_at (INTEGER), metadata (TEXT). The budget_tag column stores
+the budget identifier or NULL for non-tagged sessions.
+
+#### Scenario: Existing database migrated to version 3
+
+- **GIVEN** a metrics.db at schema version 2
+- **WHEN** the plugin starts
+- **THEN** the sessions table SHALL gain a budget_tag column
+- **AND** existing rows SHALL have budget_tag = NULL
+- **AND** PRAGMA user_version SHALL be set to 3
+
+#### Scenario: Session record includes budget_tag
+
+- **GIVEN** a session has been budget-classified as "Q3-platform"
+- **WHEN** the session record is upserted
+- **THEN** the budget_tag column SHALL contain "Q3-platform"
+
 ### Requirement: Derived Metric Formulas
 
 The following metrics SHALL be computed from SDK session data rather
