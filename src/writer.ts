@@ -20,6 +20,7 @@ export interface SessionRecord {
 	started_at: number;
 	ended_at: number;
 	metadata: string | null;
+	budget_tag: string | null;
 }
 
 /** A single metric measurement to write. */
@@ -52,8 +53,8 @@ export function upsertProject(db: Database, project: ProjectRecord): void {
  */
 export function upsertSession(db: Database, session: SessionRecord): void {
 	db.run(
-		`INSERT INTO sessions (session_id, project_id, agent, model, classification, title, started_at, ended_at, metadata)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO sessions (session_id, project_id, agent, model, classification, title, started_at, ended_at, metadata, budget_tag)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(session_id) DO UPDATE SET
 			project_id     = excluded.project_id,
 			agent          = excluded.agent,
@@ -62,7 +63,8 @@ export function upsertSession(db: Database, session: SessionRecord): void {
 			title          = excluded.title,
 			started_at     = excluded.started_at,
 			ended_at       = excluded.ended_at,
-			metadata       = excluded.metadata`,
+			metadata       = excluded.metadata,
+			budget_tag     = excluded.budget_tag`,
 		[
 			session.session_id,
 			session.project_id,
@@ -73,6 +75,7 @@ export function upsertSession(db: Database, session: SessionRecord): void {
 			session.started_at,
 			session.ended_at,
 			session.metadata,
+			session.budget_tag,
 		],
 	);
 }

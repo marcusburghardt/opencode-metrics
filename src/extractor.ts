@@ -303,6 +303,7 @@ export async function extractSessionData(
 	const agent = session?.agent ?? "unknown";
 	const title = session?.title ?? "unknown";
 	const projectId = project?.id ?? session?.projectID ?? "unknown";
+	const projectName = project?.name ?? "unknown";
 	const timeCreated = session?.timeCreated ?? 0;
 	const timeUpdated = session?.timeUpdated ?? 0;
 	const model = resolveModelString(session?.model);
@@ -368,11 +369,13 @@ export async function extractSessionData(
 			started_at: timeCreated,
 			ended_at: timeUpdated,
 			metadata: null,
+			budget_tag: null,
 		},
 		metrics,
 		classificationContext: {
 			agent,
 			model,
+			project_name: projectName,
 			first_user_message: firstUserMessage,
 			part_content: partContent,
 			bash_commands: bashCommands,

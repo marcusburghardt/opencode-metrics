@@ -330,6 +330,32 @@ describe("extractSessionData", () => {
 		const costMetric = result?.metrics.find((m) => m.metric_name === "cost");
 		expect(costMetric?.value).toBe(0);
 	});
+
+	it("sets project_name in classificationContext from project name", async () => {
+		const client = makeClient({
+			project: { id: "proj-42", name: "my-cool-project", path: "/home/user/my-cool-project" },
+		});
+		const result = await extractSessionData(client, "sess-015");
+
+		expect(result).not.toBeNull();
+		expect(result?.classificationContext.project_name).toBe("my-cool-project");
+	});
+
+	it("defaults project_name to 'unknown' when project is null", async () => {
+		const client = makeClient({ project: null });
+		const result = await extractSessionData(client, "sess-016");
+
+		expect(result).not.toBeNull();
+		expect(result?.classificationContext.project_name).toBe("unknown");
+	});
+
+	it("includes budget_tag as null in session record", async () => {
+		const client = makeClient();
+		const result = await extractSessionData(client, "sess-017");
+
+		expect(result).not.toBeNull();
+		expect(result?.session.budget_tag).toBeNull();
+	});
 });
 
 describe("computeCacheHitRatio", () => {

@@ -2,14 +2,15 @@
 
 import { describe, expect, it } from "bun:test";
 import type { ClassificationContext } from "./classifier";
-import { ClassificationCache, classify } from "./classifier";
-import type { ClassificationRule } from "./config";
+import { ClassificationCache, classify, classifyBudget } from "./classifier";
+import type { BudgetRule, ClassificationRule } from "./config";
 
 /** Factory for a ClassificationContext with sensible defaults. */
 function makeContext(overrides: Partial<ClassificationContext> = {}): ClassificationContext {
 	return {
 		agent: "build",
 		model: "claude-opus-4-20250514",
+		project_name: "opencode-metrics",
 		first_user_message: "implement feature X",
 		part_content: "some content here",
 		bash_commands: [],
@@ -193,6 +194,182 @@ describe("classify", () => {
 		const result = classify(rules, makeContext({ agent: "build" }));
 
 		expect(result).toBe("build-only");
+	});
+});
+
+describe("classify — project_name field", () => {
+	it("matches project_name with exact values", () => {
+		const rules: ClassificationRule[] = [
+			{
+				name: "metrics-work",
+				conditions: [{ field: "project_name", values: ["opencode-metrics", "dashboard"] }],
+			},
+		];
+
+		const result = classify(rules, makeContext({ project_name: "opencode-metrics" }));
+
+		expect(result).toBe("metrics-work");
+	});
+
+	it("does not match when project_name is not in values", () => {
+		const rules: ClassificationRule[] = [
+			{
+				name: "other-project",
+				conditions: [{ field: "project_name", values: ["dashboard"] }],
+			},
+		];
+
+		const result = classify(rules, makeContext({ project_name: "opencode-metrics" }));
+
+		expect(result).toBe("ad-hoc");
+	});
+
+	it("matches project_name with regex pattern", () => {
+		const rules: ClassificationRule[] = [
+			{
+				name: "opencode-family",
+				conditions: [{ field: "project_name", pattern: "^opencode-" }],
+			},
+		];
+
+		const result = classify(rules, makeContext({ project_name: "opencode-metrics" }));
+
+		expect(result).toBe("opencode-family");
+	});
+
+	it("does not match project_name when pattern does not match", () => {
+		const rules: ClassificationRule[] = [
+			{
+				name: "dashboard-only",
+				conditions: [{ field: "project_name", pattern: "^dashboard" }],
+			},
+		];
+
+		const result = classify(rules, makeContext({ project_name: "opencode-metrics" }));
+
+		expect(result).toBe("ad-hoc");
+	});
+});
+
+describe("classifyBudget", () => {
+	it("returns first matching budget_tag when multiple rules match", () => {
+		const rules: BudgetRule[] = [
+			{
+				budget_tag: "team-alpha",
+				conditions: [{ field: "agent", values: ["build"] }],
+			},
+			{
+				budget_tag: "team-beta",
+				conditions: [{ field: "agent", values: ["build"] }],
+			},
+		];
+
+		const result = classifyBudget(rules, makeContext());
+
+		expect(result).toBe("team-alpha");
+	});
+
+	it("returns null when no rules match", () => {
+		const rules: BudgetRule[] = [
+			{
+				budget_tag: "explore-budget",
+				conditions: [{ field: "agent", values: ["explore"] }],
+			},
+		];
+
+		const result = classifyBudget(rules, makeContext());
+
+		expect(result).toBeNull();
+	});
+
+	it("exclude condition prevents match", () => {
+		const rules: BudgetRule[] = [
+			{
+				budget_tag: "excluded-budget",
+				conditions: [{ field: "agent", values: ["build"] }],
+				exclude: [{ field: "model", pattern: "opus" }],
+			},
+		];
+
+		const result = classifyBudget(rules, makeContext());
+
+		expect(result).toBeNull();
+	});
+
+	it("returns null for empty rules array", () => {
+		const result = classifyBudget([], makeContext());
+
+		expect(result).toBeNull();
+	});
+
+	it("matches budget rule with pattern condition", () => {
+		const rules: BudgetRule[] = [
+			{
+				budget_tag: "pr-reviews",
+				conditions: [
+					{
+						field: "first_user_message",
+						pattern: "github\\.com/.+/pull/\\d+",
+					},
+				],
+			},
+		];
+
+		const result = classifyBudget(
+			rules,
+			makeContext({
+				first_user_message: "Review https://github.com/org/repo/pull/42",
+			}),
+		);
+
+		expect(result).toBe("pr-reviews");
+	});
+
+	it("matches budget rule with values condition", () => {
+		const rules: BudgetRule[] = [
+			{
+				budget_tag: "planning-budget",
+				conditions: [{ field: "agent", values: ["explore", "plan"] }],
+			},
+		];
+
+		const result = classifyBudget(rules, makeContext({ agent: "plan" }));
+
+		expect(result).toBe("planning-budget");
+	});
+
+	it("matches budget rule based on project_name", () => {
+		const rules: BudgetRule[] = [
+			{
+				budget_tag: "project-x-budget",
+				conditions: [{ field: "project_name", values: ["project-x"] }],
+			},
+			{
+				budget_tag: "metrics-budget",
+				conditions: [{ field: "project_name", pattern: "^opencode-" }],
+			},
+		];
+
+		const result = classifyBudget(rules, makeContext({ project_name: "opencode-metrics" }));
+
+		expect(result).toBe("metrics-budget");
+	});
+
+	it("falls through to later rules when earlier ones fail", () => {
+		const rules: BudgetRule[] = [
+			{
+				budget_tag: "first",
+				conditions: [{ field: "agent", values: ["explore"] }],
+			},
+			{
+				budget_tag: "second",
+				conditions: [{ field: "agent", values: ["build"] }],
+			},
+		];
+
+		const result = classifyBudget(rules, makeContext({ agent: "build" }));
+
+		expect(result).toBe("second");
 	});
 });
 

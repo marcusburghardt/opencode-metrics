@@ -35,14 +35,14 @@
 
 ## 2. Classification Engine
 
-- [ ] 2.1 Add `project_name: string` field to
+- [x] 2.1 Add `project_name: string` field to
   `ClassificationContext` in `src/classifier.ts`. Update
   `getFieldAsString()` and `getFieldRaw()` to handle the
   "project_name" case. Add tests for project_name field matching
   in `src/classifier.test.ts` (pattern and values).
   **Files**: `src/classifier.ts`, `src/classifier.test.ts`
 
-- [ ] 2.2 Add `classifyBudget()` function to `src/classifier.ts`
+- [x] 2.2 Add `classifyBudget()` function to `src/classifier.ts`
   that takes `BudgetRule[]` and `ClassificationContext`, evaluates
   rules using `evaluateRule()`, and returns `string | null` (null
   when no rule matches). Add tests in `src/classifier.test.ts`
@@ -53,7 +53,7 @@
 
 ## 3. Database Schema
 
-- [ ] 3.1 Bump `SCHEMA_VERSION` from 2 to 3 in `src/db.ts`. Add
+- [x] 3.1 Bump `SCHEMA_VERSION` from 2 to 3 in `src/db.ts`. Add
   a migration block in `initDatabase()` that runs
   `ALTER TABLE sessions ADD COLUMN budget_tag TEXT` when upgrading
   from version < 3. Guard with try/catch for SQLite compatibility.
@@ -64,7 +64,7 @@
 
 ## 4. Data Pipeline
 
-- [ ] 4.1 Add `budget_tag: string | null` to `SessionRecord` in
+- [x] 4.1 Add `budget_tag: string | null` to `SessionRecord` in
   `src/writer.ts`. Update `upsertSession()` to include budget_tag
   in the INSERT and ON CONFLICT DO UPDATE clauses. Add tests in
   `src/writer.test.ts` verifying: session with budget_tag is
@@ -72,7 +72,7 @@
   correctly, budget_tag is updated on re-upsert.
   **Files**: `src/writer.ts`, `src/writer.test.ts`
 
-- [ ] 4.2 [P] Update `extractSessionData()` in `src/extractor.ts`
+- [x] 4.2 [P] Update `extractSessionData()` in `src/extractor.ts`
   to populate `project_name` in `ClassificationContext` from the
   project's name (directory name). Add test in
   `src/extractor.test.ts` verifying project_name is set in the

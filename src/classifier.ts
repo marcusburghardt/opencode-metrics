@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import type { ClassificationCondition, ClassificationRule } from "./config";
+import type { BudgetRule, ClassificationCondition, ClassificationRule } from "./config";
 
 /** Context extracted from a session for classification. */
 export interface ClassificationContext {
 	agent: string;
 	model: string;
+	/** The project name derived from the session's working directory. */
+	project_name: string;
 	/** The first user message in the session. */
 	first_user_message: string;
 	/** Concatenated content from all message parts. */
@@ -27,6 +29,8 @@ function getFieldAsString(context: ClassificationContext, field: string): string
 			return context.agent;
 		case "model":
 			return context.model;
+		case "project_name":
+			return context.project_name;
 		case "first_user_message":
 			return context.first_user_message;
 		case "part_content":
@@ -54,6 +58,8 @@ function getFieldRaw(
 			return context.agent;
 		case "model":
 			return context.model;
+		case "project_name":
+			return context.project_name;
 		case "first_user_message":
 			return context.first_user_message;
 		case "part_content":
@@ -106,13 +112,26 @@ function evaluateCondition(
 }
 
 /**
- * Evaluate a classification rule against the context.
+ * Structural type for any rule that carries conditions and optional excludes.
+ * Both ClassificationRule and BudgetRule satisfy this shape, allowing
+ * evaluateRule to be reused without coupling to either concrete type.
+ */
+type EvaluatableRule = {
+	conditions: ClassificationCondition[];
+	exclude?: ClassificationCondition[];
+};
+
+/**
+ * Evaluate a rule against the context.
  *
  * All conditions must match (AND logic). If any exclude condition
  * matches, the rule is rejected. An empty conditions array always
  * matches (vacuous truth), enabling fallback rules like "ad-hoc".
+ *
+ * Accepts any rule satisfying the EvaluatableRule shape — both
+ * ClassificationRule and BudgetRule are structurally compatible.
  */
-function evaluateRule(rule: ClassificationRule, context: ClassificationContext): boolean {
+function evaluateRule(rule: EvaluatableRule, context: ClassificationContext): boolean {
 	// All conditions must match (AND logic).
 	const conditionsMatch = rule.conditions.every((cond) => evaluateCondition(cond, context));
 	if (!conditionsMatch) {
@@ -141,6 +160,24 @@ export function classify(rules: ClassificationRule[], context: ClassificationCon
 		}
 	}
 	return "ad-hoc";
+}
+
+/**
+ * Classify a session's budget tag by evaluating budget rules in order.
+ * Returns the budget_tag of the first matching rule, or null if no
+ * rules match. Unlike classify(), there is no fallback default —
+ * a null result means no budget tag applies.
+ */
+export function classifyBudget(
+	rules: BudgetRule[],
+	context: ClassificationContext,
+): string | null {
+	for (const rule of rules) {
+		if (evaluateRule(rule, context)) {
+			return rule.budget_tag;
+		}
+	}
+	return null;
 }
 
 /**

@@ -9,7 +9,7 @@ import path from "node:path";
  * Schema version for the metrics database.
  * Increment when altering table definitions or adding required migrations.
  */
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 /**
  * V1 metric catalog — seeded into metric_definitions on first database creation.
@@ -148,7 +148,8 @@ function createSchema(db: Database): void {
 			title          TEXT,
 			started_at     INTEGER,
 			ended_at       INTEGER,
-			metadata       TEXT
+			metadata       TEXT,
+			budget_tag     TEXT
 		)
 	`);
 
@@ -190,7 +191,8 @@ function createSchema(db: Database): void {
 			ended_at / 1000 AS ended_at_epoch,
 			strftime('%Y-%m-%dT%H:%M:%SZ', started_at / 1000, 'unixepoch') AS started_at_iso,
 			strftime('%Y-%m-%dT%H:%M:%SZ', ended_at / 1000, 'unixepoch') AS ended_at_iso,
-			metadata
+			metadata,
+			budget_tag
 		FROM sessions
 	`);
 
@@ -328,6 +330,20 @@ export function initDatabase(dataDirOverride?: string): InitDatabaseResult {
 	// actual schema state after createSchema() runs.
 	const versionRow = db.prepare("PRAGMA user_version").get() as { user_version: number } | null;
 	const currentVersion = versionRow?.user_version ?? 0;
+
+	// V2 → V3 migration: add budget_tag column to sessions table.
+	// Guard with try/catch because ALTER TABLE ADD COLUMN fails if the
+	// column already exists (e.g., fresh v3 database created by
+	// createSchema above). SQLite does not support IF NOT EXISTS for
+	// ALTER TABLE ADD COLUMN.
+	if (currentVersion < 3) {
+		try {
+			db.run("ALTER TABLE sessions ADD COLUMN budget_tag TEXT");
+		} catch (_error: unknown) {
+			// Column already exists — safe to ignore (fresh v3 database
+			// or migration already applied).
+		}
+	}
 
 	if (currentVersion < SCHEMA_VERSION) {
 		db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);
