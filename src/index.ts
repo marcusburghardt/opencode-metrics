@@ -154,6 +154,7 @@ export function createSDKAdapter(input: PluginInput): SDKClient {
 				return project
 					? {
 							id: project.id as string,
+							name: project.name as string | undefined,
 							path: project.worktree as string | undefined,
 						}
 					: null;

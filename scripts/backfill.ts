@@ -444,12 +444,13 @@ async function runBackfill(args: CliArgs): Promise<BackfillStats> {
 				const partContent = getPartContent(sourceDb, session.id);
 
 				// Classify work-type and budget tag.
+				const matchedProject = projects.find((p) => p.id === session.project_id);
 				const classificationContext = {
 					agent,
 					model: modelId,
 					project_name: deriveProjectName(
-						projects.find((p) => p.id === session.project_id)?.name ?? null,
-						projects.find((p) => p.id === session.project_id)?.worktree ?? null,
+						matchedProject?.name ?? null,
+						matchedProject?.worktree ?? null,
 					),
 					first_user_message: firstUserMessage,
 					part_content: partContent,

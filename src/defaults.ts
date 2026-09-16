@@ -87,7 +87,7 @@ classification_rules:
 
 # Budget rules assign cost-tracking tags to sessions.
 # Each rule's conditions work like classification rules (AND logic).
-# Multiple budget rules can match the same session.
+# Rules are evaluated in order; first match wins.
 # budget_rules:
 #   # Tag sessions by message prefix pattern
 #   - budget_tag: project-alpha
