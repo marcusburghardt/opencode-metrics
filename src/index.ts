@@ -2,7 +2,7 @@
 
 import type { Database } from "bun:sqlite";
 import type { Plugin, PluginInput } from "@opencode-ai/plugin";
-import { ClassificationCache, classify } from "./classifier";
+import { ClassificationCache, classify, classifyBudget } from "./classifier";
 import type { MetricsConfig } from "./config";
 import { loadConfig, writeDefaultConfig } from "./config";
 import { initDatabase } from "./db";
@@ -181,6 +181,7 @@ export async function handleSessionIdle(
 	db: Database,
 	config: MetricsConfig,
 	classificationCache: ClassificationCache,
+	budgetCache: ClassificationCache,
 ): Promise<void> {
 	const data = await extractSessionData(sdkClient, sessionId);
 	if (!data) return;
@@ -195,8 +196,20 @@ export async function handleSessionIdle(
 		classificationCache.set(sessionId, classification, data.classificationContext.message_count);
 	}
 
-	// Update session record with the resolved classification.
+	// Budget classification — separate cache from work-type classification
+	// so invalidation of one does not affect the other.
+	let budgetTag = budgetCache.get(sessionId, data.classificationContext.message_count);
+	if (!budgetTag) {
+		const resolved = classifyBudget(config.budget_rules ?? [], data.classificationContext);
+		if (resolved) {
+			budgetCache.set(sessionId, resolved, data.classificationContext.message_count);
+			budgetTag = resolved;
+		}
+	}
+
+	// Update session record with the resolved classification and budget tag.
 	data.session.classification = classification;
+	data.session.budget_tag = budgetTag;
 
 	// Write all data atomically to the database.
 	await writeSessionData(db, data);
@@ -232,6 +245,7 @@ const plugin: Plugin = async (input) => {
 	});
 
 	const classificationCache = new ClassificationCache();
+	const budgetCache = new ClassificationCache();
 	const sdkClient = createSDKAdapter(input);
 
 	return {
@@ -250,7 +264,14 @@ const plugin: Plugin = async (input) => {
 				const sessionId = properties.sessionID;
 				if (!sessionId) return;
 
-				await handleSessionIdle(sdkClient, sessionId, db, config, classificationCache);
+				await handleSessionIdle(
+					sdkClient,
+					sessionId,
+					db,
+					config,
+					classificationCache,
+					budgetCache,
+				);
 			} catch (error) {
 				input.client.app.log({
 					body: {

@@ -81,7 +81,7 @@
 
 ## 5. Plugin Integration
 
-- [ ] 5.1 Update `handleSessionIdle()` in `src/index.ts` to:
+- [x] 5.1 Update `handleSessionIdle()` in `src/index.ts` to:
   (a) create a second `ClassificationCache` instance for budget,
   (b) call `classifyBudget()` with config.budget_rules, (c) set
   `data.session.budget_tag` from the result. Add tests in
@@ -92,7 +92,7 @@
 
 ## 6. Backfill
 
-- [ ] 6.1 Update `scripts/backfill.ts` to apply
+- [x] 6.1 Update `scripts/backfill.ts` to apply
   `classifyBudget()` to each backfilled session using the loaded
   config's budget_rules. Set budget_tag on the session record.
   Add tests verifying: session with matching budget rule receives
@@ -103,7 +103,7 @@
 
 ## 7. Documentation
 
-- [ ] 7.1 Update `README.md` to document the budget_rules config
+- [x] 7.1 Update `README.md` to document the budget_rules config
   section. Include: config field reference, worked examples
   (message prefix pattern, project_name values, combined rules),
   example SQL queries for budget-filtered cost analysis (total cost
@@ -114,11 +114,11 @@
 
 ## 8. Verification
 
-- [ ] 8.1 Run the full test suite (`make test`) and verify all
+- [x] 8.1 Run the full test suite (`make test`) and verify all
   existing tests still pass alongside new tests. Verify lint passes
   (`make lint`). Confirm coverage meets the 80% threshold.
 
-- [ ] 8.2 [P] Verify constitution alignment: classifyBudget() is a
+- [x] 8.2 [P] Verify constitution alignment: classifyBudget() is a
   pure function testable in isolation (Testability), budget_tag is
   stored in the same machine-parseable SQLite schema (Observable
   Quality), budget classification is fully optional with no new
