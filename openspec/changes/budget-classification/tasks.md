@@ -12,7 +12,7 @@
 
 ## 1. Configuration Layer
 
-- [ ] 1.1 Add `BudgetRule` interface to `src/config.ts` with
+- [x] 1.1 Add `BudgetRule` interface to `src/config.ts` with
   `budget_tag: string`, `conditions: ClassificationCondition[]`,
   and optional `exclude: ClassificationCondition[]`. Extend
   `MetricsConfig` with `budget_rules?: BudgetRule[]`. Add
@@ -25,7 +25,7 @@
   absent budget_rules section.
   **Files**: `src/config.ts`, `src/config.test.ts`
 
-- [ ] 1.2 [P] Update `DEFAULT_CONFIG_YAML` in `src/defaults.ts`
+- [x] 1.2 [P] Update `DEFAULT_CONFIG_YAML` in `src/defaults.ts`
   to include an empty `budget_rules: []` section with commented
   examples showing pattern-based (message prefix), values-based
   (project_name), and combined rules. Update `DEFAULT_CONFIG`

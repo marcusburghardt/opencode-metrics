@@ -26,10 +26,25 @@ export interface ClassificationRule {
 	exclude?: ClassificationCondition[];
 }
 
+/**
+ * A budget tagging rule that assigns a cost-tracking tag to sessions.
+ * Uses the same condition semantics as ClassificationRule (AND logic,
+ * regex pre-compilation) but identified by budget_tag instead of name.
+ */
+export interface BudgetRule {
+	/** Tag identifier for budget tracking. Should be ≤128 characters (advisory). */
+	budget_tag: string;
+	/** All conditions must match (AND logic). */
+	conditions: ClassificationCondition[];
+	/** If any exclude condition matches, the rule does not apply. */
+	exclude?: ClassificationCondition[];
+}
+
 /** Top-level metrics configuration schema. */
 export interface MetricsConfig {
 	version: number;
 	classification_rules: ClassificationRule[];
+	budget_rules: BudgetRule[];
 }
 
 /**
@@ -141,6 +156,69 @@ function validateRule(raw: unknown, log?: (msg: string) => void): Classification
 }
 
 /**
+ * Validate a single budget rule from parsed YAML.
+ * Returns a typed BudgetRule or null if the rule is malformed.
+ *
+ * Reuses validateCondition() for condition validation — same semantics as
+ * classification rules (AND logic, invalid regex → skip entire rule).
+ *
+ * Validation checks:
+ * - budget_tag must be a non-empty string
+ * - conditions must be an array
+ * - all regex patterns must compile successfully
+ * - malformed conditions cause the entire rule to be skipped
+ */
+function validateBudgetRule(raw: unknown, log?: (msg: string) => void): BudgetRule | null {
+	if (typeof raw !== "object" || raw === null) {
+		log?.("Skipping malformed budget rule: not an object");
+		return null;
+	}
+
+	const obj = raw as Record<string, unknown>;
+
+	if (typeof obj.budget_tag !== "string" || obj.budget_tag.length === 0) {
+		log?.("Skipping budget rule: missing or invalid 'budget_tag'");
+		return null;
+	}
+
+	if (!Array.isArray(obj.conditions)) {
+		log?.(`Skipping budget rule '${obj.budget_tag}': 'conditions' is not an array`);
+		return null;
+	}
+
+	// Validate all conditions — any invalid condition skips the entire rule.
+	const conditions: ClassificationCondition[] = [];
+	for (const rawCond of obj.conditions) {
+		const validated = validateCondition(rawCond, obj.budget_tag, log);
+		if (validated === null) {
+			return null;
+		}
+		conditions.push(validated);
+	}
+
+	// Validate exclude conditions if present.
+	let exclude: ClassificationCondition[] | undefined;
+	if (Array.isArray(obj.exclude)) {
+		exclude = [];
+		for (const rawCond of obj.exclude) {
+			const validated = validateCondition(rawCond, obj.budget_tag, log);
+			if (validated === null) {
+				return null;
+			}
+			exclude.push(validated);
+		}
+	}
+
+	const rule: BudgetRule = { budget_tag: obj.budget_tag, conditions };
+
+	if (exclude && exclude.length > 0) {
+		rule.exclude = exclude;
+	}
+
+	return rule;
+}
+
+/**
  * Load the metrics configuration from dataDir/config.yaml.
  *
  * Behavior:
@@ -185,19 +263,29 @@ export function loadConfig(dataDir: string, log?: (msg: string) => void): Metric
 	const config: MetricsConfig = {
 		version: typeof raw.version === "number" ? raw.version : DEFAULT_CONFIG.version,
 		classification_rules: [],
+		budget_rules: [],
 	};
 
 	// If classification_rules is not provided, use defaults.
 	if (!Array.isArray(raw.classification_rules)) {
 		config.classification_rules = DEFAULT_CONFIG.classification_rules;
-		return config;
+	} else {
+		// Validate each rule individually — invalid rules are skipped.
+		for (const rawRule of raw.classification_rules) {
+			const rule = validateRule(rawRule, log);
+			if (rule !== null) {
+				config.classification_rules.push(rule);
+			}
+		}
 	}
 
-	// Validate each rule individually — invalid rules are skipped.
-	for (const rawRule of raw.classification_rules) {
-		const rule = validateRule(rawRule, log);
-		if (rule !== null) {
-			config.classification_rules.push(rule);
+	// Parse budget_rules — defaults to empty array when absent.
+	if (Array.isArray(raw.budget_rules)) {
+		for (const rawRule of raw.budget_rules) {
+			const rule = validateBudgetRule(rawRule, log);
+			if (rule !== null) {
+				config.budget_rules.push(rule);
+			}
 		}
 	}
 
