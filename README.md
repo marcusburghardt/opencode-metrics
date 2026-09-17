@@ -62,12 +62,12 @@ Grafana dashboards.
 
 ### From npm
 
-Add `opencode-metrics` to the `plugins` array in your OpenCode configuration
-file (`~/.config/opencode/config.json` or `opencode.json` in your project):
+Add `@mburghardt/opencode-metrics` to the `plugins` array in your OpenCode configuration
+file (`~/.config/opencode/opencode.json` or `opencode.json` in your project):
 
 ```jsonc
 {
-  "plugins": ["opencode-metrics"]
+  "plugins": ["@mburghardt/opencode-metrics"]
 }
 ```
 
@@ -79,7 +79,7 @@ step is required.
 Clone the repository and build:
 
 ```sh
-git clone https://github.com/your-org/opencode-metrics.git
+git clone https://github.com/marcusburghardt/opencode-metrics.git
 cd opencode-metrics
 make build
 ```
@@ -99,12 +99,12 @@ OpenCode resolves local paths relative to the config file location. The
 ### Ansible integration
 
 If you manage OpenCode installations with
-[ansible-role-ai](https://github.com/your-org/ansible-role-ai), add the
+[ansible-role-ai](https://github.com/marcusburghardt/ansible-role-ai), add the
 plugin to the `ai_opencode_plugins` variable:
 
 ```yaml
 ai_opencode_plugins:
-  - opencode-metrics
+  - "@mburghardt/opencode-metrics"
 ```
 
 The role merges this into the generated OpenCode configuration during
@@ -1287,7 +1287,7 @@ regressions:
 Update the plugin to the latest version:
 
 ```sh
-npm update opencode-metrics
+npm update @mburghardt/opencode-metrics
 ```
 
 Or, if installed from a local checkout:
@@ -1316,7 +1316,7 @@ automatically on startup.
    ```jsonc
    {
      "plugins": [
-       // Remove "opencode-metrics" from this array
+       // Remove "@mburghardt/opencode-metrics" from this array
      ]
    }
    ```
@@ -1340,9 +1340,9 @@ automatically on startup.
 
 **Causes and fixes:**
 
-- **Plugin not in config:** Verify `opencode-metrics` appears in the
+- **Plugin not in config:** Verify `@mburghardt/opencode-metrics` appears in the
   `plugins` array of your OpenCode config file.
-- **Wrong config file:** OpenCode reads `~/.config/opencode/config.json`
+- **Wrong config file:** OpenCode reads `~/.config/opencode/opencode.json`
   (global) or `opencode.json` (project-local). Ensure you edited the
   correct one.
 - **npm resolution failure:** If using the npm name, ensure network
@@ -1627,7 +1627,7 @@ LIMIT 10;
 
 ### Quickstart with ansible-role-ai
 
-The [ansible-role-ai](https://github.com/your-org/ansible-role-ai) role
+The [ansible-role-ai](https://github.com/marcusburghardt/ansible-role-ai) role
 deploys an ephemeral Grafana container pre-configured with the
 frser-sqlite-datasource plugin and the metrics database. This is the
 fastest way to get dashboards running:
@@ -1635,7 +1635,7 @@ fastest way to get dashboards running:
 ```yaml
 # In your playbook or host_vars:
 ai_opencode_plugins:
-  - opencode-metrics
+  - "@mburghardt/opencode-metrics"
 
 ai_grafana_enabled: true
 ```
