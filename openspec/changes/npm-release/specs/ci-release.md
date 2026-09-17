@@ -33,7 +33,7 @@ and push to main via a GitHub Actions workflow (`ci_checks.yml`).
 - **AND** each job MUST use `bun install --frozen-lockfile` to install
   dependencies
 
-#### Scenario: CI check failure blocks merge
+#### Scenario: CI check failure visible on PR
 
 - **GIVEN** a pull request where `make test` fails
 - **WHEN** a reviewer checks the PR status
@@ -71,6 +71,15 @@ events.
 - **THEN** it MUST run `make build` and `npm publish --access public`
 - **AND** the package MUST be available at
   `https://registry.npmjs.org/@mburghardt/opencode-metrics`
+
+#### Scenario: Post-publish verification
+
+- **GIVEN** a successful `npm publish` step
+- **WHEN** the publish job runs the verification step
+- **THEN** `npm view @mburghardt/opencode-metrics@<version> version` MUST
+  return the published version
+- **AND** if the verification fails, the workflow MUST exit with a
+  non-zero status to signal a partial release
 
 #### Scenario: Missing NPM_TOKEN
 
@@ -147,7 +156,7 @@ needed.
 
 - **GIVEN** the `ci_checks.yml` workflow
 - **WHEN** any job runs
-- **THEN** it MUST have only `contents: read` permission
+- **THEN** it MUST have only `contents: read` permission at the job level
 
 #### Scenario: ci_release.yml permissions
 
@@ -160,7 +169,7 @@ needed.
 
 - **GIVEN** the `ci_publish.yml` workflow
 - **WHEN** the publish job runs
-- **THEN** it MUST have only `contents: read` permission
+- **THEN** it MUST have only `contents: read` permission at the job level
 
 ## MODIFIED Requirements
 
@@ -176,6 +185,17 @@ placeholder values (`your-org`) and incorrect filenames (`config.json`).
 - **WHEN** a user reads the "From npm" section
 - **THEN** the plugin name MUST be `@mburghardt/opencode-metrics`
 - **AND** the config file MUST be referred to as `opencode.json`
+
+#### Scenario: Package name consistency across documentation
+
+- **GIVEN** README.md after all changes
+- **WHEN** checking all plugin config examples, install commands, ansible
+  `ai_opencode_plugins` lists, uninstall instructions, and troubleshooting
+  references
+- **THEN** every reference to the npm package name MUST use
+  `@mburghardt/opencode-metrics`
+- **AND** filesystem paths (`~/.local/share/opencode-metrics/`), the
+  project title, log messages, and directory names MUST remain unchanged
 
 #### Scenario: Repository URLs
 

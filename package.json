@@ -1,5 +1,5 @@
 {
-	"name": "opencode-metrics",
+	"name": "@mburghardt/opencode-metrics",
 	"version": "0.1.0",
 	"description": "OpenCode plugin for automatic session metrics collection and analytics",
 	"license": "Apache-2.0",

@@ -22,8 +22,9 @@ The design follows patterns from two reference repositories:
 
 ### Non-Goals
 
-- Coverage enforcement in CI (future work; the 80% target remains
-  advisory for now)
+- Coverage enforcement in CI (tracked for follow-up; the 80% target
+  remains advisory until a dedicated change adds threshold gating.
+  Constitution IV notes this gap — see follow-up below)
 - Branch protection rules (GitHub settings, not repo files)
 - Container image builds or supply chain attestations (no container
   artifacts in this project)
@@ -149,10 +150,23 @@ across jobs, which is acceptable for three jobs.
 ### R1: npm token expiration
 
 Granular npm tokens have a maximum TTL. If the token expires without
-renewal, the publish workflow will fail silently (the release is
-created on GitHub but not published to npm). Mitigation: calendar
-reminder set for renewal. Future improvement: use npm OIDC trust
-(requires npm org plan).
+renewal, the publish workflow will fail. Future improvement: use npm
+OIDC trust (requires npm org plan).
+
+**Mitigations**:
+- Calendar reminder for token renewal.
+- The publish workflow includes a post-publish verification step
+  (`npm view @mburghardt/opencode-metrics@<version> version`) that
+  turns a silent failure into a visible workflow failure.
+
+**Recovery procedure** (if publish fails after a GitHub Release is
+created):
+1. Fix the root cause (renew token, fix build).
+2. Re-trigger manually: delete the GitHub Release, then re-create
+   it to fire the `release: published` event again. Alternatively,
+   add `workflow_dispatch` as a secondary trigger to
+   `ci_publish.yml` for manual re-runs.
+3. Manual fallback: `git checkout <tag> && bun install --frozen-lockfile && make build && npm publish --access public`.
 
 ### R2: Bun version drift
 
@@ -162,7 +176,17 @@ inputs, only the action SHA itself. Mitigation: Bun has strong
 backward compatibility; the maintainer updates the pinned version
 when bumping `devDependencies`.
 
-### R3: No branch protection
+### R3: Coverage enforcement deferred
+
+Constitution IV requires coverage ratchets enforced by automated
+tests. This change introduces CI that runs `make test` (which
+includes `bun test --coverage`) but does not enforce a threshold.
+The 80% target in the Makefile is advisory. A follow-up change
+should add threshold gating (e.g., parse coverage output and fail
+if below target). This is an acknowledged partial compliance with
+Constitution IV.
+
+### R4: No branch protection
 
 This change adds CI checks but does not configure GitHub branch
 protection rules (those are repo settings, not files). Without
