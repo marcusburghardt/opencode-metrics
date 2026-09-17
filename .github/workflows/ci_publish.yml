@@ -32,4 +32,12 @@ jobs:
           TAG: ${{ github.event.release.tag_name }}
         run: |
           VERSION="${TAG#v}"
-          npm view "@mburghardt/opencode-metrics@${VERSION}" version
+          for i in 1 2 3; do
+            sleep 15
+            if npm view "@mburghardt/opencode-metrics@${VERSION}" version; then
+              exit 0
+            fi
+            echo "Attempt $i: registry not yet propagated, retrying..."
+          done
+          echo "Package not visible after 3 attempts"
+          exit 1
