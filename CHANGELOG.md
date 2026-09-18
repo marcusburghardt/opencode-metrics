@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.3.1](https://github.com/marcusburghardt/opencode-metrics/compare/v0.3.0...v0.3.1) (2026-09-18)
+
+
+### Bug Fixes
+
+* add include-component-in-tag to release-please config ([b874e45](https://github.com/marcusburghardt/opencode-metrics/commit/b874e45967ff9fb249a6f2069f53d5bdf76c1173))
+* increase npm publish verification to 5 minutes ([be4f7a4](https://github.com/marcusburghardt/opencode-metrics/commit/be4f7a45c5474a00bd4fd7aa6ca1b2ae1f8295eb))
+
+
+### Miscellaneous
+
+* default make target to help with available commands ([51f851f](https://github.com/marcusburghardt/opencode-metrics/commit/51f851fc37991a0f024cf1bd95affa53804feaff))
+
+
+### Documentation
+
+* add quick reference section to README ([cf981dd](https://github.com/marcusburghardt/opencode-metrics/commit/cf981ddec23a86dfc8a66e6a61c1cdd577b3d216))
+
 ## [0.3.0](https://github.com/marcusburghardt/opencode-metrics/compare/opencode-metrics-v0.2.0...opencode-metrics-v0.3.0) (2026-09-18)
 
 
