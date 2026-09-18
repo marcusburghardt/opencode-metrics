@@ -32,12 +32,15 @@ jobs:
           TAG: ${{ github.event.release.tag_name }}
         run: |
           VERSION="${TAG#v}"
-          for i in 1 2 3; do
-            sleep 15
-            if npm view "@mburghardt/opencode-metrics@${VERSION}" version; then
+          MAX_ATTEMPTS=20
+          INTERVAL=15
+          for i in $(seq 1 "$MAX_ATTEMPTS"); do
+            sleep "$INTERVAL"
+            if npm view "@mburghardt/opencode-metrics@${VERSION}" version 2>/dev/null; then
+              echo "Package @mburghardt/opencode-metrics@${VERSION} verified on registry"
               exit 0
             fi
-            echo "Attempt $i: registry not yet propagated, retrying..."
+            echo "Attempt ${i}/${MAX_ATTEMPTS}: registry not yet propagated, retrying in ${INTERVAL}s..."
           done
-          echo "Package not visible after 3 attempts"
+          echo "Package not visible after ${MAX_ATTEMPTS} attempts ($((MAX_ATTEMPTS * INTERVAL))s)"
           exit 1
