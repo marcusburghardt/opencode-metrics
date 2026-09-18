@@ -6,7 +6,10 @@ The plugin SHALL subscribe to session.status events and capture session
 metrics on every transition to idle state. The plugin SHALL query the
 OpenCode SDK client for session details and write them to the metrics
 database. The plugin SHALL NOT require any user interaction after
-initial installation for metrics to be collected.
+initial installation for metrics to be collected. The extraction
+pipeline SHALL propagate the SDK session's `parentID` field into the
+stored session record as `parent_session_id`. When `parentID` is
+undefined or null, `parent_session_id` SHALL be stored as NULL.
 
 #### Scenario: First session idle after plugin installation
 
@@ -25,6 +28,20 @@ initial installation for metrics to be collected.
 - **THEN** the session record SHALL be updated with the latest
   cumulative values (cost, tokens, duration, timestamps)
 - **AND** measurement rows SHALL be updated with the latest values
+
+#### Scenario: Sub-agent session captures parent_session_id
+
+- **GIVEN** the SDK returns a session with parentID = "sess-abc-123"
+- **WHEN** the plugin processes the session idle event
+- **THEN** the session record written to the database SHALL have
+  parent_session_id = "sess-abc-123"
+
+#### Scenario: Root session has NULL parent_session_id
+
+- **GIVEN** the SDK returns a session with parentID = undefined
+- **WHEN** the plugin processes the session idle event
+- **THEN** the session record written to the database SHALL have
+  parent_session_id = NULL
 
 #### Scenario: Session resumed after days
 
