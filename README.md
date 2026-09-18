@@ -5,8 +5,90 @@ Captures cost, token usage, session duration, diff stats, and classification
 data into a local SQLite database — queryable with standard SQL tools or
 Grafana dashboards.
 
+## Quick Reference
+
+### Install
+
+Add to your OpenCode config (`~/.config/opencode/opencode.json` or
+project-level `opencode.json`):
+
+```jsonc
+{
+  "plugins": ["@mburghardt/opencode-metrics"]
+}
+```
+
+No separate `npm install` required — OpenCode resolves the plugin on
+startup.
+
+### What it collects
+
+| Category       | Metrics                                                          |
+|----------------|------------------------------------------------------------------|
+| Cost           | `cost` (USD)                                                     |
+| Tokens         | `tokens_input`, `tokens_output`, `tokens_reasoning`, `tokens_cache_read`, `tokens_cache_write` |
+| Derived        | `cache_hit_ratio`, `duration_seconds`                            |
+| Code impact    | `files_changed`, `lines_added`, `lines_deleted`                  |
+| Activity       | `messages_total`                                                 |
+| Artifacts      | `prs_created`, `prs_reviewed`, `issues_referenced`               |
+
+All 15 metrics are recorded per session into a local SQLite database at
+`~/.local/share/opencode-metrics/metrics.db`.
+
+### Key commands
+
+```sh
+make backfill   # Import historical sessions from OpenCode's database
+make test       # Run test suite with coverage
+make lint       # Check code with Biome linter
+make build      # Compile plugin to dist/index.js
+```
+
+### Configuration
+
+Config file: `~/.local/share/opencode-metrics/config.yaml`
+(auto-created on first run with sensible defaults).
+
+```yaml
+version: 1
+classification_rules: [...]   # Session work-type classification
+budget_rules: [...]           # Cost allocation tags
+cost_pricing: [...]           # Custom per-token pricing for adjusted cost
+```
+
+### Quick queries
+
+```sh
+# Total sessions and cost
+sqlite3 ~/.local/share/opencode-metrics/metrics.db \
+  "SELECT COUNT(DISTINCT session_id) AS sessions,
+          ROUND(SUM(value), 2) AS total_cost_usd
+   FROM measurements WHERE metric_name = 'cost';"
+
+# Cost by classification
+sqlite3 ~/.local/share/opencode-metrics/metrics.db \
+  "SELECT s.classification, ROUND(SUM(m.value), 2) AS cost
+   FROM sessions s JOIN measurements m ON s.session_id = m.session_id
+   WHERE m.metric_name = 'cost' GROUP BY s.classification ORDER BY cost DESC;"
+
+# Today's cost (delta-based, accurate for multi-day sessions)
+sqlite3 ~/.local/share/opencode-metrics/metrics.db \
+  "SELECT ROUND(SUM(delta), 2) AS today FROM measurement_deltas
+   WHERE metric_name = 'cost'
+     AND date(recorded_at / 1000, 'unixepoch') = date('now');"
+```
+
+### Grafana
+
+Works with the
+[frser-sqlite-datasource](https://github.com/fr-ser/grafana-sqlite-datasource)
+plugin. Mount `~/.local/share/opencode-metrics/` into the Grafana
+container and point the datasource at `metrics.db`. See
+[Grafana Integration](#grafana-integration) for details.
+
 ## Table of Contents
 
+- [Quick Reference](#quick-reference)
 - [Installation](#installation)
   - [From npm](#from-npm)
   - [From local checkout](#from-local-checkout)
