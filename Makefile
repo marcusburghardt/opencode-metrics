@@ -2,34 +2,30 @@
 #
 # opencode-metrics — build, test, lint, clean, install, backfill, grafana
 
-.PHONY: build test lint clean install backfill grafana grafana-provision grafana-stop
+.DEFAULT_GOAL := help
 
-# ---------------------------------------------------------------------------
-# Core targets
-# ---------------------------------------------------------------------------
+.PHONY: build test lint clean install backfill grafana grafana-provision grafana-stop help
 
-build:
+##@ Core
+
+build: ## compile the plugin bundle
 	bun build src/index.ts --outdir dist --target bun
 
 # Coverage target: 80%. Bun's built-in coverage reports percentages but
 # does not enforce thresholds via CLI. Review output manually or add a
 # CI script to parse and gate on the 80% minimum.
-test:
+test: ## run tests with coverage
 	bun test --coverage
 
-lint:
+lint: ## run linters (biome)
 	bunx biome check .
 
-clean:
+clean: ## remove build artifacts
 	rm -rf dist
 
-# ---------------------------------------------------------------------------
-# Plugin installation
-# ---------------------------------------------------------------------------
+##@ Plugin Installation
 
-# Install the plugin globally for all OpenCode projects.
-# Creates a loader in ~/.config/opencode/plugins/ that imports the built bundle.
-install: build
+install: build ## install plugin globally for all OpenCode projects
 	@mkdir -p ~/.config/opencode/plugins
 	@printf '%s\n' \
 		'// SPDX-License-Identifier: Apache-2.0' \
@@ -43,18 +39,12 @@ install: build
 	@echo "Restart OpenCode to activate."
 	@echo ""
 
-# ---------------------------------------------------------------------------
-# Historical backfill
-# ---------------------------------------------------------------------------
+##@ Historical Backfill
 
-# Import historical sessions from OpenCode's internal database into
-# the opencode-metrics database. Safe to run multiple times (idempotent).
-backfill:
+backfill: ## import historical sessions into the metrics database
 	bun run scripts/backfill.ts
 
-# ---------------------------------------------------------------------------
-# Grafana dashboard
-# ---------------------------------------------------------------------------
+##@ Grafana Dashboard
 
 GRAFANA_DIR        = $(HOME)/.config/opencode/grafana
 GRAFANA_REPO_URL   = https://raw.githubusercontent.com/marcusburghardt/ansible-role-ai/main
@@ -64,8 +54,7 @@ GRAFANA_VOLUME     = opencode-grafana-data
 GRAFANA_DATA_DIR   = $(HOME)/.local/share/opencode-metrics
 GRAFANA_IMAGE      = docker.io/grafana/grafana:latest
 
-# Download provisioning files and dashboard from ansible-role-ai.
-grafana-provision:
+grafana-provision: ## download provisioning files from ansible-role-ai
 	@mkdir -p $(GRAFANA_DIR)/provisioning/datasources
 	@mkdir -p $(GRAFANA_DIR)/provisioning/dashboards
 	@mkdir -p $(GRAFANA_DIR)/dashboards
@@ -78,9 +67,7 @@ grafana-provision:
 		-o $(GRAFANA_DIR)/dashboards/opencode-metrics.json
 	@echo "Provisioning files downloaded to $(GRAFANA_DIR)"
 
-# Start an ephemeral Grafana container with the opencode-metrics dashboard.
-# Downloads provisioning files on every run to stay current with upstream.
-grafana: grafana-provision
+grafana: grafana-provision ## start Grafana container with the metrics dashboard
 	@command -v podman >/dev/null 2>&1 || { \
 		echo "Error: podman is not installed."; \
 		echo "Install: https://podman.io/docs/installation"; \
@@ -115,8 +102,18 @@ grafana: grafana-provision
 		echo ""; \
 	fi
 
-# Stop the Grafana container. The named volume is preserved.
-grafana-stop:
+grafana-stop: ## stop the Grafana container (data volume preserved)
 	@podman stop $(GRAFANA_CONTAINER) 2>/dev/null || true
 	@podman rm $(GRAFANA_CONTAINER) 2>/dev/null || true
 	@echo "Grafana stopped. Data volume '$(GRAFANA_VOLUME)' preserved."
+
+##@ Help
+
+GREEN := \033[0;32m
+TEAL := \033[0;36m
+CLEAR := \033[0m
+
+help: ## show this help
+	@printf "Usage: make $(GREEN)<target>$(CLEAR)\n"
+	@awk -v "green=${GREEN}" -v "teal=${TEAL}" -v "clear=${CLEAR}" -F ":.*## *" \
+			'/^[a-zA-Z0-9_-]+:/{sub(/:.*/,"",$$1);printf "  %s%-20s%s %s\n", green, $$1, clear, $$2} /^##@/{printf "%s%s%s\n", teal, substr($$1,5), clear}' $(MAKEFILE_LIST)
