@@ -334,6 +334,294 @@ describe("config", () => {
 		});
 	});
 
+	describe("cost_pricing", () => {
+		it("valid rule with all fields", () => {
+			const yaml = [
+				"version: 1",
+				"classification_rules: []",
+				"cost_pricing:",
+				"  - model: claude-sonnet-4-20250514",
+				"    input_price: 3.00",
+				"    output_price: 15.00",
+				"    cache_read_price: 0.30",
+				"    cache_write_price: 3.75",
+				"    reasoning_price: 15.00",
+				"    description: Claude Sonnet 4",
+			].join("\n");
+			writeFileSync(path.join(tempDir, "config.yaml"), yaml);
+
+			const config = loadConfig(tempDir);
+
+			expect(config.cost_pricing.length).toBe(1);
+			expect(config.cost_pricing[0].model).toBe("claude-sonnet-4-20250514");
+			expect(config.cost_pricing[0].input_price).toBe(3.0);
+			expect(config.cost_pricing[0].output_price).toBe(15.0);
+			expect(config.cost_pricing[0].cache_read_price).toBe(0.3);
+			expect(config.cost_pricing[0].cache_write_price).toBe(3.75);
+			expect(config.cost_pricing[0].reasoning_price).toBe(15.0);
+			expect(config.cost_pricing[0].description).toBe("Claude Sonnet 4");
+		});
+
+		it("valid rule with only required fields", () => {
+			const yaml = [
+				"version: 1",
+				"classification_rules: []",
+				"cost_pricing:",
+				"  - model: gpt-4o",
+				"    input_price: 2.50",
+				"    output_price: 10.00",
+			].join("\n");
+			writeFileSync(path.join(tempDir, "config.yaml"), yaml);
+
+			const config = loadConfig(tempDir);
+
+			expect(config.cost_pricing.length).toBe(1);
+			expect(config.cost_pricing[0].model).toBe("gpt-4o");
+			expect(config.cost_pricing[0].input_price).toBe(2.5);
+			expect(config.cost_pricing[0].output_price).toBe(10.0);
+			expect(config.cost_pricing[0].cache_read_price).toBeUndefined();
+			expect(config.cost_pricing[0].cache_write_price).toBeUndefined();
+			expect(config.cost_pricing[0].reasoning_price).toBeUndefined();
+			expect(config.cost_pricing[0].description).toBeUndefined();
+		});
+
+		it("skips rule with missing model", () => {
+			const yaml = [
+				"version: 1",
+				"classification_rules: []",
+				"cost_pricing:",
+				"  - input_price: 3.00",
+				"    output_price: 15.00",
+			].join("\n");
+			writeFileSync(path.join(tempDir, "config.yaml"), yaml);
+			const warnings: string[] = [];
+
+			const config = loadConfig(tempDir, (msg) => warnings.push(msg));
+
+			expect(config.cost_pricing.length).toBe(0);
+			expect(warnings.some((w) => w.includes("model"))).toBe(true);
+		});
+
+		it("skips rule with missing input_price", () => {
+			const yaml = [
+				"version: 1",
+				"classification_rules: []",
+				"cost_pricing:",
+				"  - model: test-model",
+				"    output_price: 15.00",
+			].join("\n");
+			writeFileSync(path.join(tempDir, "config.yaml"), yaml);
+			const warnings: string[] = [];
+
+			const config = loadConfig(tempDir, (msg) => warnings.push(msg));
+
+			expect(config.cost_pricing.length).toBe(0);
+			expect(warnings.some((w) => w.includes("input_price"))).toBe(true);
+		});
+
+		it("skips rule with missing output_price", () => {
+			const yaml = [
+				"version: 1",
+				"classification_rules: []",
+				"cost_pricing:",
+				"  - model: test-model",
+				"    input_price: 3.00",
+			].join("\n");
+			writeFileSync(path.join(tempDir, "config.yaml"), yaml);
+			const warnings: string[] = [];
+
+			const config = loadConfig(tempDir, (msg) => warnings.push(msg));
+
+			expect(config.cost_pricing.length).toBe(0);
+			expect(warnings.some((w) => w.includes("output_price"))).toBe(true);
+		});
+
+		it("skips rule with negative price", () => {
+			const yaml = [
+				"version: 1",
+				"classification_rules: []",
+				"cost_pricing:",
+				"  - model: test-model",
+				"    input_price: -1.00",
+				"    output_price: 15.00",
+			].join("\n");
+			writeFileSync(path.join(tempDir, "config.yaml"), yaml);
+			const warnings: string[] = [];
+
+			const config = loadConfig(tempDir, (msg) => warnings.push(msg));
+
+			expect(config.cost_pricing.length).toBe(0);
+			expect(warnings.some((w) => w.includes("input_price"))).toBe(true);
+		});
+
+		it("skips rule with non-numeric price", () => {
+			const yaml = [
+				"version: 1",
+				"classification_rules: []",
+				"cost_pricing:",
+				"  - model: test-model",
+				'    input_price: "not-a-number"',
+				"    output_price: 15.00",
+			].join("\n");
+			writeFileSync(path.join(tempDir, "config.yaml"), yaml);
+			const warnings: string[] = [];
+
+			const config = loadConfig(tempDir, (msg) => warnings.push(msg));
+
+			expect(config.cost_pricing.length).toBe(0);
+			expect(warnings.some((w) => w.includes("input_price"))).toBe(true);
+		});
+
+		it("optional fields present and absent", () => {
+			const yaml = [
+				"version: 1",
+				"classification_rules: []",
+				"cost_pricing:",
+				"  - model: with-cache",
+				"    input_price: 3.00",
+				"    output_price: 15.00",
+				"    cache_read_price: 0.30",
+				"  - model: without-cache",
+				"    input_price: 2.50",
+				"    output_price: 10.00",
+			].join("\n");
+			writeFileSync(path.join(tempDir, "config.yaml"), yaml);
+
+			const config = loadConfig(tempDir);
+
+			expect(config.cost_pricing.length).toBe(2);
+			expect(config.cost_pricing[0].cache_read_price).toBe(0.3);
+			expect(config.cost_pricing[0].cache_write_price).toBeUndefined();
+			expect(config.cost_pricing[1].cache_read_price).toBeUndefined();
+		});
+
+		it("unrecognized fields are ignored", () => {
+			const yaml = [
+				"version: 1",
+				"classification_rules: []",
+				"cost_pricing:",
+				"  - model: test-model",
+				"    input_price: 3.00",
+				"    output_price: 15.00",
+				"    unknown_field: whatever",
+				"    extra_price: 99.99",
+			].join("\n");
+			writeFileSync(path.join(tempDir, "config.yaml"), yaml);
+
+			const config = loadConfig(tempDir);
+
+			expect(config.cost_pricing.length).toBe(1);
+			expect(config.cost_pricing[0].model).toBe("test-model");
+			expect((config.cost_pricing[0] as Record<string, unknown>).unknown_field).toBeUndefined();
+		});
+
+		it("skips duplicate model patterns (second is skipped with warning)", () => {
+			const yaml = [
+				"version: 1",
+				"classification_rules: []",
+				"cost_pricing:",
+				"  - model: claude-sonnet-4-20250514",
+				"    input_price: 3.00",
+				"    output_price: 15.00",
+				"  - model: claude-sonnet-4-20250514",
+				"    input_price: 5.00",
+				"    output_price: 20.00",
+			].join("\n");
+			writeFileSync(path.join(tempDir, "config.yaml"), yaml);
+			const warnings: string[] = [];
+
+			const config = loadConfig(tempDir, (msg) => warnings.push(msg));
+
+			expect(config.cost_pricing.length).toBe(1);
+			expect(config.cost_pricing[0].input_price).toBe(3.0);
+			expect(
+				warnings.some((w) => w.includes("duplicate") && w.includes("claude-sonnet-4-20250514")),
+			).toBe(true);
+		});
+
+		it("defaults to empty array when absent", () => {
+			const yaml = [
+				"version: 1",
+				"classification_rules:",
+				"  - name: rule",
+				"    conditions: []",
+			].join("\n");
+			writeFileSync(path.join(tempDir, "config.yaml"), yaml);
+
+			const config = loadConfig(tempDir);
+
+			expect(config.cost_pricing).toEqual([]);
+		});
+
+		it("loads valid cost pricing rules", () => {
+			const yaml = [
+				"version: 1",
+				"classification_rules: []",
+				"cost_pricing:",
+				"  - model: claude-sonnet-4-20250514",
+				"    input_price: 3.00",
+				"    output_price: 15.00",
+				"    cache_read_price: 0.30",
+				"    cache_write_price: 3.75",
+				"    description: Claude Sonnet 4",
+				"  - model: gpt-4o-2024-08-06",
+				"    input_price: 2.50",
+				"    output_price: 10.00",
+			].join("\n");
+			writeFileSync(path.join(tempDir, "config.yaml"), yaml);
+
+			const config = loadConfig(tempDir);
+
+			expect(config.cost_pricing.length).toBe(2);
+			expect(config.cost_pricing[0].model).toBe("claude-sonnet-4-20250514");
+			expect(config.cost_pricing[0].input_price).toBe(3.0);
+			expect(config.cost_pricing[0].output_price).toBe(15.0);
+			expect(config.cost_pricing[0].cache_read_price).toBe(0.3);
+			expect(config.cost_pricing[0].cache_write_price).toBe(3.75);
+			expect(config.cost_pricing[0].description).toBe("Claude Sonnet 4");
+			expect(config.cost_pricing[1].model).toBe("gpt-4o-2024-08-06");
+			expect(config.cost_pricing[1].input_price).toBe(2.5);
+			expect(config.cost_pricing[1].output_price).toBe(10.0);
+		});
+
+		it("skips rule with negative optional price field", () => {
+			const yaml = [
+				"version: 1",
+				"classification_rules: []",
+				"cost_pricing:",
+				"  - model: test-model",
+				"    input_price: 3.00",
+				"    output_price: 15.00",
+				"    cache_read_price: -0.50",
+			].join("\n");
+			writeFileSync(path.join(tempDir, "config.yaml"), yaml);
+			const warnings: string[] = [];
+
+			const config = loadConfig(tempDir, (msg) => warnings.push(msg));
+
+			expect(config.cost_pricing.length).toBe(0);
+			expect(warnings.some((w) => w.includes("cache_read_price"))).toBe(true);
+		});
+
+		it("allows zero for optional price fields", () => {
+			const yaml = [
+				"version: 1",
+				"classification_rules: []",
+				"cost_pricing:",
+				"  - model: test-model",
+				"    input_price: 3.00",
+				"    output_price: 15.00",
+				"    cache_read_price: 0",
+			].join("\n");
+			writeFileSync(path.join(tempDir, "config.yaml"), yaml);
+
+			const config = loadConfig(tempDir);
+
+			expect(config.cost_pricing.length).toBe(1);
+			expect(config.cost_pricing[0].cache_read_price).toBe(0);
+		});
+	});
+
 	describe("writeDefaultConfig", () => {
 		it("creates config.yaml when it does not exist", () => {
 			writeDefaultConfig(tempDir);
@@ -378,6 +666,12 @@ describe("config", () => {
 			expect(DEFAULT_CONFIG.budget_rules).toBeDefined();
 			expect(Array.isArray(DEFAULT_CONFIG.budget_rules)).toBe(true);
 			expect(DEFAULT_CONFIG.budget_rules.length).toBe(0);
+		});
+
+		it("default config parses with an empty cost_pricing array", () => {
+			expect(DEFAULT_CONFIG.cost_pricing).toBeDefined();
+			expect(Array.isArray(DEFAULT_CONFIG.cost_pricing)).toBe(true);
+			expect(DEFAULT_CONFIG.cost_pricing.length).toBe(0);
 		});
 	});
 });

@@ -9,7 +9,7 @@ import path from "node:path";
  * Schema version for the metrics database.
  * Increment when altering table definitions or adding required migrations.
  */
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 /**
  * V1 metric catalog — seeded into metric_definitions on first database creation.
@@ -264,6 +264,157 @@ function createSchema(db: Database): void {
 			strftime('%Y-%m-%dT%H:%M:%SZ', recorded_at / 1000, 'unixepoch') AS recorded_at_iso
 		FROM measurement_deltas
 	`);
+
+	// Task 2.1: Cost pricing table — stores user-supplied per-token prices
+	// for model patterns. Prices are in USD per million tokens. The
+	// priority column reflects config array order (0 = highest priority)
+	// for first-match-wins semantics in the adjusted cost views.
+	db.run(`
+		CREATE TABLE IF NOT EXISTS cost_pricing (
+			model_pattern    TEXT PRIMARY KEY,
+			priority         INTEGER NOT NULL,
+			input_price      REAL NOT NULL,
+			output_price     REAL NOT NULL,
+			cache_read_price REAL,
+			cache_write_price REAL,
+			reasoning_price  REAL,
+			description      TEXT,
+			updated_at       INTEGER
+		)
+	`);
+
+	// Task 2.2: Adjusted costs view — computes per-session adjusted cost
+	// using user-supplied pricing rules matched via LIKE patterns.
+	// Design decisions (see design.md D4, D5, D6):
+	// - CTE-based pivoting: single pass over measurements EAV table
+	// - First-match-wins: ROW_NUMBER() OVER (PARTITION BY ... ORDER BY priority)
+	// - Reasoning price fallback: COALESCE(reasoning_price, output_price)
+	// - No pricing match fallback: original cost passthrough via COALESCE
+	db.run(`
+		CREATE VIEW IF NOT EXISTS v_adjusted_costs AS
+		WITH session_metrics AS (
+			SELECT
+				session_id,
+				SUM(CASE WHEN metric_name = 'cost' THEN value END) AS cost,
+				SUM(CASE WHEN metric_name = 'tokens_input' THEN value END) AS tokens_input,
+				SUM(CASE WHEN metric_name = 'tokens_output' THEN value END) AS tokens_output,
+				SUM(CASE WHEN metric_name = 'tokens_reasoning' THEN value END) AS tokens_reasoning,
+				SUM(CASE WHEN metric_name = 'tokens_cache_read' THEN value END) AS tokens_cache_read,
+				SUM(CASE WHEN metric_name = 'tokens_cache_write' THEN value END) AS tokens_cache_write,
+				MAX(recorded_at) AS recorded_at
+			FROM measurements
+			GROUP BY session_id
+		),
+		matched_pricing AS (
+			SELECT
+				sm.session_id,
+				cp.input_price,
+				cp.output_price,
+				cp.cache_read_price,
+				cp.cache_write_price,
+				cp.reasoning_price,
+				ROW_NUMBER() OVER (
+					PARTITION BY sm.session_id
+					ORDER BY cp.priority
+				) AS rn
+			FROM session_metrics sm
+			JOIN sessions s ON s.session_id = sm.session_id
+			JOIN cost_pricing cp ON s.model LIKE cp.model_pattern
+		)
+		SELECT
+			s.session_id,
+			s.model,
+			s.classification,
+			s.budget_tag,
+			s.project_id,
+			sm.cost AS original_cost,
+			COALESCE(
+				(COALESCE(sm.tokens_input, 0) * mp.input_price / 1000000.0) +
+				(COALESCE(sm.tokens_output, 0) * mp.output_price / 1000000.0) +
+				(COALESCE(sm.tokens_cache_read, 0) * COALESCE(mp.cache_read_price, 0) / 1000000.0) +
+				(COALESCE(sm.tokens_cache_write, 0) * COALESCE(mp.cache_write_price, 0) / 1000000.0) +
+				(COALESCE(sm.tokens_reasoning, 0) * COALESCE(mp.reasoning_price, mp.output_price) / 1000000.0),
+				sm.cost
+			) AS adjusted_cost,
+			COALESCE(
+				(COALESCE(sm.tokens_input, 0) * mp.input_price / 1000000.0) +
+				(COALESCE(sm.tokens_output, 0) * mp.output_price / 1000000.0) +
+				(COALESCE(sm.tokens_cache_read, 0) * COALESCE(mp.cache_read_price, 0) / 1000000.0) +
+				(COALESCE(sm.tokens_cache_write, 0) * COALESCE(mp.cache_write_price, 0) / 1000000.0) +
+				(COALESCE(sm.tokens_reasoning, 0) * COALESCE(mp.reasoning_price, mp.output_price) / 1000000.0),
+				sm.cost
+			) - sm.cost AS cost_difference,
+			sm.recorded_at / 1000 AS recorded_at_epoch,
+			strftime('%Y-%m-%dT%H:%M:%SZ', sm.recorded_at / 1000, 'unixepoch') AS recorded_at_iso
+		FROM session_metrics sm
+		JOIN sessions s ON s.session_id = sm.session_id
+		LEFT JOIN matched_pricing mp ON mp.session_id = sm.session_id AND mp.rn = 1
+	`);
+
+	// Task 2.3: Adjusted cost deltas view — same CTE pattern as
+	// v_adjusted_costs but reading from measurement_deltas. Enables
+	// accurate time-sliced adjusted cost aggregation for Grafana.
+	db.run(`
+		CREATE VIEW IF NOT EXISTS v_adjusted_cost_deltas AS
+		WITH delta_metrics AS (
+			SELECT
+				session_id,
+				SUM(CASE WHEN metric_name = 'cost' THEN delta END) AS cost_delta,
+				SUM(CASE WHEN metric_name = 'tokens_input' THEN delta END) AS tokens_input,
+				SUM(CASE WHEN metric_name = 'tokens_output' THEN delta END) AS tokens_output,
+				SUM(CASE WHEN metric_name = 'tokens_reasoning' THEN delta END) AS tokens_reasoning,
+				SUM(CASE WHEN metric_name = 'tokens_cache_read' THEN delta END) AS tokens_cache_read,
+				SUM(CASE WHEN metric_name = 'tokens_cache_write' THEN delta END) AS tokens_cache_write,
+				recorded_at
+			FROM measurement_deltas
+			GROUP BY session_id, recorded_at
+		),
+		matched_pricing AS (
+			SELECT
+				dm.session_id,
+				dm.recorded_at,
+				cp.input_price,
+				cp.output_price,
+				cp.cache_read_price,
+				cp.cache_write_price,
+				cp.reasoning_price,
+				ROW_NUMBER() OVER (
+					PARTITION BY dm.session_id, dm.recorded_at
+					ORDER BY cp.priority
+				) AS rn
+			FROM delta_metrics dm
+			JOIN sessions s ON s.session_id = dm.session_id
+			JOIN cost_pricing cp ON s.model LIKE cp.model_pattern
+		)
+		SELECT
+			s.session_id,
+			s.model,
+			s.classification,
+			s.budget_tag,
+			s.project_id,
+			dm.cost_delta AS original_cost_delta,
+			COALESCE(
+				(COALESCE(dm.tokens_input, 0) * mp.input_price / 1000000.0) +
+				(COALESCE(dm.tokens_output, 0) * mp.output_price / 1000000.0) +
+				(COALESCE(dm.tokens_cache_read, 0) * COALESCE(mp.cache_read_price, 0) / 1000000.0) +
+				(COALESCE(dm.tokens_cache_write, 0) * COALESCE(mp.cache_write_price, 0) / 1000000.0) +
+				(COALESCE(dm.tokens_reasoning, 0) * COALESCE(mp.reasoning_price, mp.output_price) / 1000000.0),
+				dm.cost_delta
+			) AS adjusted_cost_delta,
+			COALESCE(
+				(COALESCE(dm.tokens_input, 0) * mp.input_price / 1000000.0) +
+				(COALESCE(dm.tokens_output, 0) * mp.output_price / 1000000.0) +
+				(COALESCE(dm.tokens_cache_read, 0) * COALESCE(mp.cache_read_price, 0) / 1000000.0) +
+				(COALESCE(dm.tokens_cache_write, 0) * COALESCE(mp.cache_write_price, 0) / 1000000.0) +
+				(COALESCE(dm.tokens_reasoning, 0) * COALESCE(mp.reasoning_price, mp.output_price) / 1000000.0),
+				dm.cost_delta
+			) - dm.cost_delta AS cost_delta_difference,
+			dm.recorded_at / 1000 AS recorded_at_epoch,
+			strftime('%Y-%m-%dT%H:%M:%SZ', dm.recorded_at / 1000, 'unixepoch') AS recorded_at_iso
+		FROM delta_metrics dm
+		JOIN sessions s ON s.session_id = dm.session_id
+		LEFT JOIN matched_pricing mp ON mp.session_id = dm.session_id AND mp.recorded_at = dm.recorded_at AND mp.rn = 1
+	`);
 }
 
 /**
@@ -344,6 +495,13 @@ export function initDatabase(dataDirOverride?: string): InitDatabaseResult {
 			// or migration already applied).
 		}
 	}
+
+	// V3 → V4 migration: add cost_pricing table and adjusted cost views.
+	// No ALTER TABLE needed — the new table and views are created by
+	// createSchema() above with IF NOT EXISTS. The version bump below
+	// reflects the actual schema state after createSchema() runs.
+	// (Guard is implicit: currentVersion < 4 falls through to the
+	// generic version bump below.)
 
 	if (currentVersion < SCHEMA_VERSION) {
 		db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);

@@ -6,11 +6,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { ClassificationCache } from "./classifier";
-import type { MetricsConfig } from "./config";
+import type { CostPricingRule, MetricsConfig } from "./config";
 import { initDatabase } from "./db";
 import { DEFAULT_CONFIG } from "./defaults";
 import type { MessageInfo, ProjectInfo, SDKClient, SessionInfo } from "./extractor";
 import { createSDKAdapter, handleSessionIdle } from "./index";
+import { syncCostPricing } from "./pricing";
 
 /** Factory for a mock SDKClient with configurable overrides. */
 function makeClient(
@@ -374,6 +375,69 @@ describe("handleSessionIdle", () => {
 			.get("sess-no-budget") as { budget_tag: string | null } | null;
 
 		expect(session?.budget_tag).toBeNull();
+	});
+
+	it("works correctly when cost_pricing is configured", async () => {
+		const { client } = makeClient();
+
+		const configWithPricing: MetricsConfig = {
+			...config,
+			cost_pricing: [
+				{
+					model: "claude-opus-4-20250514",
+					input_price: 15.0,
+					output_price: 75.0,
+					cache_read_price: 1.5,
+					cache_write_price: 18.75,
+					reasoning_price: 75.0,
+					description: "Opus 4",
+				},
+			],
+		};
+
+		// Sync pricing rules to the database before handling the session,
+		// mirroring what the plugin startup does in index.ts.
+		syncCostPricing(db, configWithPricing.cost_pricing);
+
+		// Core metrics collection should work without regression.
+		await handleSessionIdle(client, "sess-pricing", db, configWithPricing, cache, budgetCache);
+
+		// Verify session was written — proves cost_pricing in config does not
+		// interfere with the extract → classify → write pipeline.
+		const session = db
+			.prepare("SELECT * FROM sessions WHERE session_id = ?")
+			.get("sess-pricing") as { session_id: string; classification: string } | null;
+
+		expect(session).not.toBeNull();
+		expect(session?.classification).toBe("implementation");
+
+		// Verify metrics were written (cost, tokens, etc.).
+		const metrics = db
+			.prepare("SELECT COUNT(*) AS count FROM measurements WHERE session_id = ?")
+			.get("sess-pricing") as { count: number };
+
+		expect(metrics.count).toBeGreaterThan(0);
+
+		// Verify pricing rules are in the database.
+		const pricingRows = db.prepare("SELECT COUNT(*) AS count FROM cost_pricing").get() as {
+			count: number;
+		};
+		expect(pricingRows.count).toBe(1);
+	});
+
+	it("syncCostPricing throws on a closed database", () => {
+		// The try/catch in the plugin startup (index.ts) handles database
+		// errors gracefully — logging the error and continuing without
+		// adjusted cost data. This test verifies the underlying failure
+		// mode by calling syncCostPricing directly with a closed database.
+		const closedDb = initDatabase(tempDir).db;
+		closedDb.close();
+
+		const rules: CostPricingRule[] = [
+			{ model: "test-model", input_price: 1.0, output_price: 2.0 },
+		];
+
+		expect(() => syncCostPricing(closedDb, rules)).toThrow();
 	});
 
 	it("budget cache is independent of classification cache", async () => {

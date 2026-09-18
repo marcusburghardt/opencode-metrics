@@ -8,6 +8,7 @@ import { loadConfig, writeDefaultConfig } from "./config";
 import { initDatabase } from "./db";
 import type { SDKClient } from "./extractor";
 import { extractSessionData } from "./extractor";
+import { syncCostPricing } from "./pricing";
 import { writeSessionData } from "./writer";
 
 /**
@@ -236,6 +237,32 @@ const plugin: Plugin = async (input) => {
 	);
 
 	writeDefaultConfig(dataDir);
+
+	// Sync cost pricing rules from config to the database so the
+	// v_adjusted_costs view can compute adjusted costs. A failure here
+	// is non-fatal — the plugin continues without adjusted cost data.
+	try {
+		syncCostPricing(db, config.cost_pricing);
+		if (config.cost_pricing.length > 0) {
+			input.client.app.log({
+				body: {
+					service: "opencode-metrics",
+					level: "info",
+					message: `[opencode-metrics] synced ${config.cost_pricing.length} cost pricing rule(s)`,
+				},
+			});
+		}
+	} catch (error) {
+		input.client.app.log({
+			body: {
+				service: "opencode-metrics",
+				level: "error",
+				message: `[opencode-metrics] failed to sync cost pricing: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			},
+		});
+	}
 
 	input.client.app.log({
 		body: {

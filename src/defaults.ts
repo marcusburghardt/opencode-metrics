@@ -112,6 +112,32 @@ classification_rules:
 #       - field: first_user_message
 #         pattern: 'test|dry-run'
 budget_rules: []
+
+# Cost pricing rules map model names to token prices for cost calculation.
+# All price fields are in USD per million tokens.
+# Rules are matched by SQL LIKE pattern against the session model; first match wins.
+# Use % as a wildcard (e.g., "%claude-opus-4%" matches any model containing "claude-opus-4").
+# cost_pricing:
+#   # Full pricing with all optional fields
+#   - model: claude-sonnet-4-20250514
+#     input_price: 3.00
+#     output_price: 15.00
+#     cache_read_price: 0.30
+#     cache_write_price: 3.75
+#     reasoning_price: 15.00
+#     description: Claude Sonnet 4 (May 2025)
+#
+#   # Minimal pricing with only required fields
+#   - model: gpt-4o-2024-08-06
+#     input_price: 2.50
+#     output_price: 10.00
+#
+#   # With description for documentation
+#   - model: claude-haiku-3.5
+#     input_price: 0.80
+#     output_price: 4.00
+#     description: Claude 3.5 Haiku — fast and affordable
+cost_pricing: []
 `;
 
 /**
@@ -154,6 +180,11 @@ export const DEFAULT_CONFIG: MetricsConfig = (() => {
 				compileConditionPattern(cond);
 			}
 		}
+	}
+
+	// Ensure cost_pricing exists as an empty array when not provided.
+	if (!Array.isArray(config.cost_pricing)) {
+		config.cost_pricing = [];
 	}
 
 	return config;

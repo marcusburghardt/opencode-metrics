@@ -40,11 +40,33 @@ export interface BudgetRule {
 	exclude?: ClassificationCondition[];
 }
 
+/**
+ * A cost pricing rule that maps a model pattern to its token pricing.
+ * All price fields are in USD per million tokens.
+ */
+export interface CostPricingRule {
+	/** Model name or pattern to match (e.g., "claude-sonnet-4-20250514"). */
+	model: string;
+	/** Input token price in USD per million tokens. */
+	input_price: number;
+	/** Output token price in USD per million tokens. */
+	output_price: number;
+	/** Cache read token price in USD per million tokens. */
+	cache_read_price?: number;
+	/** Cache write token price in USD per million tokens. */
+	cache_write_price?: number;
+	/** Reasoning token price in USD per million tokens. */
+	reasoning_price?: number;
+	/** Human-readable description of the pricing rule. */
+	description?: string;
+}
+
 /** Top-level metrics configuration schema. */
 export interface MetricsConfig {
 	version: number;
 	classification_rules: ClassificationRule[];
 	budget_rules: BudgetRule[];
+	cost_pricing: CostPricingRule[];
 }
 
 /**
@@ -219,6 +241,86 @@ function validateBudgetRule(raw: unknown, log?: (msg: string) => void): BudgetRu
 }
 
 /**
+ * Validate a single cost pricing rule from parsed YAML.
+ * Returns a typed CostPricingRule or null if the rule is malformed.
+ *
+ * Validation checks:
+ * - model must be a non-empty string
+ * - input_price must be a finite positive number
+ * - output_price must be a finite positive number
+ * - optional price fields, when present, must be finite non-negative numbers
+ * - malformed rules are skipped with a logged warning
+ */
+function validateCostPricingRule(
+	raw: unknown,
+	log?: (msg: string) => void,
+): CostPricingRule | null {
+	if (typeof raw !== "object" || raw === null) {
+		log?.("Skipping malformed cost pricing rule: not an object");
+		return null;
+	}
+
+	const obj = raw as Record<string, unknown>;
+
+	if (typeof obj.model !== "string" || obj.model.length === 0) {
+		log?.("Skipping cost pricing rule: missing or invalid 'model'");
+		return null;
+	}
+
+	if (
+		typeof obj.input_price !== "number" ||
+		!Number.isFinite(obj.input_price) ||
+		obj.input_price <= 0
+	) {
+		log?.(
+			`Skipping cost pricing rule '${obj.model}': 'input_price' must be a finite positive number`,
+		);
+		return null;
+	}
+
+	if (
+		typeof obj.output_price !== "number" ||
+		!Number.isFinite(obj.output_price) ||
+		obj.output_price <= 0
+	) {
+		log?.(
+			`Skipping cost pricing rule '${obj.model}': 'output_price' must be a finite positive number`,
+		);
+		return null;
+	}
+
+	const rule: CostPricingRule = {
+		model: obj.model,
+		input_price: obj.input_price,
+		output_price: obj.output_price,
+	};
+
+	// Validate optional price fields — must be finite non-negative when present.
+	const optionalFields = ["cache_read_price", "cache_write_price", "reasoning_price"] as const;
+	for (const field of optionalFields) {
+		if (field in obj && obj[field] !== undefined) {
+			if (
+				typeof obj[field] !== "number" ||
+				!Number.isFinite(obj[field] as number) ||
+				(obj[field] as number) < 0
+			) {
+				log?.(
+					`Skipping cost pricing rule '${obj.model}': '${field}' must be a finite non-negative number`,
+				);
+				return null;
+			}
+			rule[field] = obj[field] as number;
+		}
+	}
+
+	if (typeof obj.description === "string") {
+		rule.description = obj.description;
+	}
+
+	return rule;
+}
+
+/**
  * Load the metrics configuration from dataDir/config.yaml.
  *
  * Behavior:
@@ -264,6 +366,7 @@ export function loadConfig(dataDir: string, log?: (msg: string) => void): Metric
 		version: typeof raw.version === "number" ? raw.version : DEFAULT_CONFIG.version,
 		classification_rules: [],
 		budget_rules: [],
+		cost_pricing: [],
 	};
 
 	// If classification_rules is not provided, use defaults.
@@ -285,6 +388,23 @@ export function loadConfig(dataDir: string, log?: (msg: string) => void): Metric
 			const rule = validateBudgetRule(rawRule, log);
 			if (rule !== null) {
 				config.budget_rules.push(rule);
+			}
+		}
+	}
+
+	// Parse cost_pricing — defaults to empty array when absent.
+	// Duplicate model values are detected and skipped (first occurrence wins).
+	if (Array.isArray(raw.cost_pricing)) {
+		const seenModels = new Set<string>();
+		for (const rawRule of raw.cost_pricing) {
+			const rule = validateCostPricingRule(rawRule, log);
+			if (rule !== null) {
+				if (seenModels.has(rule.model)) {
+					log?.(`Skipping duplicate cost pricing rule for model '${rule.model}'`);
+					continue;
+				}
+				seenModels.add(rule.model);
+				config.cost_pricing.push(rule);
 			}
 		}
 	}

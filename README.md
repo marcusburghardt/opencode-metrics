@@ -39,6 +39,11 @@ Grafana dashboards.
   - [Running the test suite](#running-the-test-suite)
 - [Metric Reference](#metric-reference)
 - [Insights](#insights)
+- [Cost Adjustment](#cost-adjustment)
+  - [Why adjusted costs?](#why-adjusted-costs)
+  - [Configuring cost pricing](#configuring-cost-pricing)
+  - [Adjusted cost views](#adjusted-cost-views)
+  - [Adjusted cost queries](#adjusted-cost-queries)
 - [Upgrade and Uninstall](#upgrade-and-uninstall)
   - [Upgrading](#upgrading)
   - [Uninstalling](#uninstalling)
@@ -1280,6 +1285,157 @@ regressions:
 - PR creation by classification (workflow evolution)
 - Issue-to-PR ratio (planning overhead)
 
+## Cost Adjustment
+
+### Why adjusted costs?
+
+The `cost` metric reported by OpenCode reflects the provider's billed
+amount. When you access models through a reseller or proxy API (e.g.,
+Google Vertex AI for Anthropic models, or an internal API gateway),
+the per-token pricing may differ from the direct provider's rates.
+
+Cost adjustment lets you define your actual per-token prices in
+`config.yaml`. The plugin creates SQL views that recompute session costs
+using your prices — giving you side-by-side visibility into billed cost
+vs. adjusted cost without modifying the raw data.
+
+### Configuring cost pricing
+
+Add a `cost_pricing` array to your `config.yaml`:
+
+```yaml
+cost_pricing:
+  # Rules are matched in order — first match wins (SQL LIKE pattern).
+  - model: "%claude-opus-4%"
+    input_price: 15.0        # USD per million input tokens
+    output_price: 75.0       # USD per million output tokens
+    cache_read_price: 1.5    # USD per million cache-read tokens
+    cache_write_price: 3.75  # USD per million cache-write tokens
+    reasoning_price: 75.0    # USD per million reasoning tokens
+    description: "Vertex AI Anthropic pricing"
+
+  - model: "%claude-sonnet%"
+    input_price: 3.0
+    output_price: 15.0
+    description: "Vertex AI Sonnet pricing"
+```
+
+| Field              | Type   | Required | Description                                             |
+|--------------------|--------|----------|---------------------------------------------------------|
+| `model`            | string | yes      | SQL LIKE pattern matched against the session model.     |
+| `input_price`      | number | yes      | USD per million input tokens.                           |
+| `output_price`     | number | yes      | USD per million output tokens.                          |
+| `cache_read_price` | number | no       | USD per million cache-read tokens. Defaults to 0.       |
+| `cache_write_price`| number | no       | USD per million cache-write tokens. Defaults to 0.      |
+| `reasoning_price`  | number | no       | USD per million reasoning tokens. Defaults to `output_price`. |
+| `description`      | string | no       | Human-readable label for documentation.                 |
+
+When `cost_pricing` is absent or empty, the plugin behaves identically
+to versions without this feature — no adjusted cost computation occurs
+and the views return `original_cost` for all sessions.
+
+Rules are synced to the `cost_pricing` database table on every startup
+using a full-replace strategy. The table is created by the V4 schema
+migration.
+
+### Adjusted cost views
+
+Two SQL views provide adjusted cost data:
+
+**`v_adjusted_costs`** — cumulative adjusted cost per session.
+
+| Column             | Description                                             |
+|--------------------|---------------------------------------------------------|
+| `session_id`       | Session identifier.                                     |
+| `model`            | Model string from the session.                          |
+| `classification`   | Session classification label.                           |
+| `budget_tag`       | Budget tag (NULL if untagged).                           |
+| `project_id`       | Project identifier.                                     |
+| `original_cost`    | The `cost` metric value reported by the provider.       |
+| `adjusted_cost`    | Recomputed cost using your pricing rules, or `original_cost` if no rule matches. |
+| `cost_difference`  | `adjusted_cost - original_cost`.                        |
+| `recorded_at_epoch`| Epoch seconds.                                          |
+| `recorded_at_iso`  | ISO-8601 timestamp string.                              |
+
+**`v_adjusted_cost_deltas`** — time-sliced adjusted cost per delta
+(for accurate daily aggregation of multi-day sessions).
+
+| Column                | Description                                          |
+|-----------------------|------------------------------------------------------|
+| `session_id`          | Session identifier.                                  |
+| `model`               | Model string from the session.                       |
+| `classification`      | Session classification label.                        |
+| `budget_tag`          | Budget tag (NULL if untagged).                        |
+| `project_id`          | Project identifier.                                  |
+| `original_cost_delta` | The `cost` delta reported by the provider.           |
+| `adjusted_cost_delta` | Recomputed cost delta using your pricing rules.      |
+| `cost_delta_difference`| `adjusted_cost_delta - original_cost_delta`.        |
+| `recorded_at_epoch`   | Epoch seconds.                                       |
+| `recorded_at_iso`     | ISO-8601 timestamp string.                           |
+
+The adjusted cost formula applied by both views:
+
+```
+(tokens_input × input_price / 1,000,000) +
+(tokens_output × output_price / 1,000,000) +
+(tokens_cache_read × COALESCE(cache_read_price, 0) / 1,000,000) +
+(tokens_cache_write × COALESCE(cache_write_price, 0) / 1,000,000) +
+(tokens_reasoning × COALESCE(reasoning_price, output_price) / 1,000,000)
+```
+
+### Adjusted cost queries
+
+**Daily adjusted cost:**
+
+```sql
+SELECT date(recorded_at_epoch, 'unixepoch', 'localtime') AS day,
+       ROUND(SUM(adjusted_cost), 2) AS adjusted_usd,
+       ROUND(SUM(original_cost), 2) AS original_usd,
+       ROUND(SUM(cost_difference), 2) AS difference
+FROM v_adjusted_costs
+GROUP BY day
+ORDER BY day DESC
+LIMIT 14;
+```
+
+**Cost difference by model:**
+
+```sql
+SELECT model,
+       COUNT(*) AS sessions,
+       ROUND(SUM(original_cost), 2) AS original_usd,
+       ROUND(SUM(adjusted_cost), 2) AS adjusted_usd,
+       ROUND(SUM(cost_difference), 2) AS difference
+FROM v_adjusted_costs
+GROUP BY model
+ORDER BY difference;
+```
+
+**Grafana time-series — daily adjusted cost (delta-based):**
+
+```sql
+SELECT date(recorded_at_epoch, 'unixepoch') AS time,
+       ROUND(SUM(adjusted_cost_delta), 4) AS adjusted_cost,
+       ROUND(SUM(original_cost_delta), 4) AS original_cost
+FROM v_adjusted_cost_deltas
+GROUP BY time
+ORDER BY time;
+```
+
+**Adjusted cost by budget tag:**
+
+```sql
+SELECT s.budget_tag,
+       ROUND(SUM(a.original_cost), 2) AS original_usd,
+       ROUND(SUM(a.adjusted_cost), 2) AS adjusted_usd,
+       ROUND(SUM(a.cost_difference), 2) AS difference
+FROM v_adjusted_costs a
+JOIN v_sessions s ON a.session_id = s.session_id
+WHERE s.budget_tag IS NOT NULL
+GROUP BY s.budget_tag
+ORDER BY difference;
+```
+
 ## Upgrade and Uninstall
 
 ### Upgrading
@@ -1434,7 +1590,7 @@ Expected output: `wal`
 sqlite3 ~/.local/share/opencode-metrics/metrics.db "PRAGMA user_version;"
 ```
 
-Expected output: `2`
+Expected output: `4`
 
 **Run an integrity check:**
 

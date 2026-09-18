@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased] (2026-09-18)
+
+
+### Features
+
+* add `cost_pricing` configuration section for per-model token pricing rules
+* add `cost_pricing` table via V4 schema migration
+* add `v_adjusted_costs` view for cumulative adjusted cost per session
+* add `v_adjusted_cost_deltas` view for time-sliced adjusted cost deltas
+* sync cost pricing rules from config.yaml to database on startup (full-replace strategy)
+* support optional `cache_read_price`, `cache_write_price`, and `reasoning_price` fields in pricing rules
+* validate cost pricing rules during config loading (skip malformed with warning)
+
+
 ## [0.2.0](https://github.com/marcusburghardt/opencode-metrics/compare/opencode-metrics-v0.1.0...opencode-metrics-v0.2.0) (2026-09-17)
 
 
