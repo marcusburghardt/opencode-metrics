@@ -4,7 +4,7 @@
 
 .DEFAULT_GOAL := help
 
-.PHONY: build test lint clean install backfill grafana grafana-provision grafana-stop help
+.PHONY: build test lint check clean install backfill grafana grafana-provision grafana-stop help
 
 ##@ Core
 
@@ -19,6 +19,9 @@ test: ## run tests with coverage
 
 lint: ## run linters (biome)
 	bunx biome check .
+
+check: ## run diagnostic checks (plugin loaded? sessions recording?)
+	@bash scripts/check.sh
 
 clean: ## remove build artifacts
 	rm -rf dist
