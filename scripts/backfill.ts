@@ -45,7 +45,24 @@ interface CliArgs {
 	source: string;
 	dest: string;
 	dryRun: boolean;
+	withDeltas: boolean;
+	since: number | null; // epoch-ms threshold, null = no filter
 	help: boolean;
+}
+
+/**
+ * Parse a date string into epoch milliseconds.
+ * Accepts YYYY-MM-DD (interpreted as local midnight) or ISO-8601.
+ * Returns null if the string is not a valid date.
+ */
+export function parseDateToEpochMs(value: string): number | null {
+	// YYYY-MM-DD → local midnight
+	if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+		const ms = new Date(`${value}T00:00:00`).getTime();
+		return Number.isNaN(ms) ? null : ms;
+	}
+	const ms = new Date(value).getTime();
+	return Number.isNaN(ms) ? null : ms;
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -53,6 +70,8 @@ function parseArgs(argv: string[]): CliArgs {
 	let source = "";
 	let dest = "";
 	let dryRun = false;
+	let withDeltas = false;
+	let since: number | null = null;
 	let help = false;
 
 	for (let i = 0; i < args.length; i++) {
@@ -74,6 +93,22 @@ function parseArgs(argv: string[]): CliArgs {
 			case "--dry-run":
 				dryRun = true;
 				break;
+			case "--with-deltas":
+				withDeltas = true;
+				break;
+			case "--since": {
+				if (i + 1 >= args.length) {
+					console.error("Error: --since requires a date argument (YYYY-MM-DD or ISO-8601)");
+					process.exit(1);
+				}
+				const parsed = parseDateToEpochMs(args[++i]);
+				if (parsed === null) {
+					console.error(`Error: invalid date '${args[i]}' — use YYYY-MM-DD or ISO-8601`);
+					process.exit(1);
+				}
+				since = parsed;
+				break;
+			}
 			case "--help":
 				help = true;
 				break;
@@ -93,7 +128,7 @@ function parseArgs(argv: string[]): CliArgs {
 		dest = getDataDir();
 	}
 
-	return { source, dest, dryRun, help };
+	return { source, dest, dryRun, withDeltas, since, help };
 }
 
 function printUsage(): void {
@@ -109,6 +144,13 @@ Options:
                    (default: ~/.local/share/opencode/opencode.db)
   --dest <path>    Path to metrics data directory
                    (default: ~/.local/share/opencode-metrics/)
+  --since <date>   Only backfill sessions created on or after this date
+                   (YYYY-MM-DD or ISO-8601, e.g. 2026-09-22)
+  --with-deltas    Write measurement deltas (time-series data) alongside
+                   cumulative values. Use with --since for recent sessions
+                   so Grafana daily/weekly panels show correct totals.
+                   Without this flag, only cumulative values are written
+                   and time-sliced panels will not reflect backfilled data.
   --dry-run        Analyze source database without writing
   --help           Show this help message
 
@@ -117,6 +159,11 @@ session metrics into the opencode-metrics database using the same
 schema and classification logic as the live plugin.
 
 Safe to run multiple times — uses INSERT ON CONFLICT DO UPDATE.
+
+Examples:
+  make backfill                                   # full historical import
+  make backfill ARGS="--since 2026-09-22 --with-deltas"  # today's missed sessions
+  make backfill ARGS="--dry-run"                  # preview without writing
 `);
 }
 
@@ -299,6 +346,58 @@ export function deriveProjectName(name: string | null, worktree: string | null):
 }
 
 // ---------------------------------------------------------------------------
+// Delta catch-up
+// ---------------------------------------------------------------------------
+
+/**
+ * Insert catch-up deltas for metrics where the sum of existing deltas
+ * is less than the cumulative value. This handles two cases:
+ *
+ * 1. No deltas exist at all (previous backfill wrote cumulative only).
+ * 2. Partial deltas exist (live plugin captured some idle events, but
+ *    they don't cover the full cumulative value).
+ *
+ * In both cases, inserts a top-up delta for the difference. Uses INSERT
+ * OR IGNORE for idempotency (the PK constraint on session_id +
+ * metric_name + recorded_at prevents duplicates on repeated runs).
+ */
+export function backfillMissingDeltas(
+	db: Database,
+	sessionId: string,
+	metrics: ReadonlyArray<{ metric_name: string; value: number; recorded_at: number }>,
+): void {
+	const sumStmt = db.prepare(
+		"SELECT COALESCE(SUM(delta), 0) AS total FROM measurement_deltas WHERE session_id = ? AND metric_name = ?",
+	);
+	const insertStmt = db.prepare(
+		`INSERT OR IGNORE INTO measurement_deltas (session_id, metric_name, delta, recorded_at)
+		 VALUES (?, ?, ?, ?)`,
+	);
+
+	// Find the latest existing delta timestamp so the top-up delta
+	// gets a distinct recorded_at (avoids PK collision with INSERT OR IGNORE).
+	const maxTsStmt = db.prepare(
+		"SELECT MAX(recorded_at) AS max_ts FROM measurement_deltas WHERE session_id = ? AND metric_name = ?",
+	);
+
+	for (const metric of metrics) {
+		if (metric.value === 0) continue;
+		const row = sumStmt.get(sessionId, metric.metric_name) as { total: number };
+		const gap = metric.value - row.total;
+		if (gap > 0.0001) {
+			// Use a timestamp 1ms after the latest existing delta (or the
+			// metric's own recorded_at if no deltas exist) to avoid PK
+			// collisions while keeping the top-up near the right time.
+			const maxRow = maxTsStmt.get(sessionId, metric.metric_name) as { max_ts: number | null };
+			const topUpTs = maxRow.max_ts !== null
+				? Math.max(maxRow.max_ts + 1, metric.recorded_at)
+				: metric.recorded_at;
+			insertStmt.run(sessionId, metric.metric_name, gap, topUpTs);
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Main backfill logic
 // ---------------------------------------------------------------------------
 
@@ -356,9 +455,23 @@ async function runBackfill(args: CliArgs): Promise<BackfillStats> {
 	}
 
 	// --- Count sessions ---
-	const countRow = sourceDb.prepare("SELECT COUNT(*) as cnt FROM session").get() as { cnt: number };
+	const sinceClause = args.since !== null ? " WHERE time_created >= ?" : "";
+	const sinceParams: number[] = args.since !== null ? [args.since] : [];
+
+	const countRow = sourceDb
+		.prepare(`SELECT COUNT(*) as cnt FROM session${sinceClause}`)
+		.get(...sinceParams) as { cnt: number };
 	const totalCount = countRow.cnt;
+
+	if (args.since !== null) {
+		const d = new Date(args.since);
+		const sinceDate = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+		console.log(`Filter: sessions created on or after ${sinceDate}`);
+	}
 	console.log(`Found ${totalCount} sessions to process`);
+	if (args.withDeltas) {
+		console.log("Deltas: enabled — time-series data will be written");
+	}
 
 	if (totalCount === 0) {
 		console.log("No sessions to backfill.");
@@ -411,9 +524,10 @@ async function runBackfill(args: CliArgs): Promise<BackfillStats> {
 			       agent, model, title, time_created, time_updated,
 			       summary_files, summary_additions, summary_deletions
 			FROM session
+			${sinceClause}
 			ORDER BY time_created ASC
 			LIMIT ? OFFSET ?
-		`).all(batchSize, offset) as SourceSession[];
+		`).all(...sinceParams, batchSize, offset) as SourceSession[];
 
 		if (destDb) {
 			destDb.run("BEGIN TRANSACTION");
@@ -501,12 +615,7 @@ async function runBackfill(args: CliArgs): Promise<BackfillStats> {
 						budget_tag: budgetTag,
 					});
 
-					// Skip delta writes: backfilled sessions only have cumulative
-					// totals. Recording delta = cumulative would distort
-					// time-sliced aggregations (e.g., attributing a multi-day
-					// session's entire cost to one day). Deltas accumulate
-					// organically from live idle events going forward.
-					writeMetrics(destDb, session.id, [
+					const metricRows = [
 						{ metric_name: "cost", value: session.cost ?? 0, recorded_at: recordedAt },
 						{ metric_name: "tokens_input", value: session.tokens_input ?? 0, recorded_at: recordedAt },
 						{ metric_name: "tokens_output", value: session.tokens_output ?? 0, recorded_at: recordedAt },
@@ -522,7 +631,25 @@ async function runBackfill(args: CliArgs): Promise<BackfillStats> {
 						{ metric_name: "prs_created", value: prsCreated.length, recorded_at: recordedAt },
 						{ metric_name: "prs_reviewed", value: prsReviewed.length, recorded_at: recordedAt },
 						{ metric_name: "issues_referenced", value: issuesReferenced.length, recorded_at: recordedAt },
-					], { skipDeltas: true });
+					];
+
+					// By default, skip delta writes: backfilled sessions only
+					// have cumulative totals. Recording delta = cumulative can
+					// distort time-sliced aggregations for multi-day sessions.
+					// Use --with-deltas for recent sessions where the cost
+					// belongs to the session's end date.
+					writeMetrics(destDb, session.id, metricRows, {
+						skipDeltas: !args.withDeltas,
+					});
+
+					// Catch-up: if --with-deltas is set but a previous backfill
+					// already wrote cumulative values (without deltas), the delta
+					// computation yields 0 and no deltas are written. Insert
+					// catch-up deltas for metrics that have cumulative values
+					// but no corresponding delta rows.
+					if (args.withDeltas) {
+						backfillMissingDeltas(destDb, session.id, metricRows);
+					}
 
 					// Write artifact detail rows (INSERT OR IGNORE for PK dedup).
 					if (allArtifacts.length > 0) {

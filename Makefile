@@ -45,7 +45,7 @@ install: build ## install plugin globally for all OpenCode projects
 ##@ Historical Backfill
 
 backfill: ## import historical sessions into the metrics database
-	bun run scripts/backfill.ts
+	bun run scripts/backfill.ts $(ARGS)
 
 ##@ Grafana Dashboard
 

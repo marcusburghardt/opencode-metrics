@@ -11,7 +11,13 @@ import { loadConfig } from "../src/config";
 import { initDatabase } from "../src/db";
 import { computeCacheHitRatio, computeDurationSeconds } from "../src/extractor";
 import { upsertProject, upsertSession, writeMetrics } from "../src/writer";
-import { deriveProjectName, extractModelId, validateSourceSchema } from "./backfill";
+import {
+	backfillMissingDeltas,
+	deriveProjectName,
+	extractModelId,
+	parseDateToEpochMs,
+	validateSourceSchema,
+} from "./backfill";
 
 // ---------------------------------------------------------------------------
 // Source database helper — builds a minimal OpenCode schema with test data.
@@ -193,6 +199,9 @@ function insertSessionWithData(
  * Perform the core backfill logic for a single session from source to dest DB.
  * Mirrors the inner loop of runBackfill() using the same exported functions
  * the production script uses.
+ *
+ * @param withDeltas - When true, write measurement deltas alongside
+ *   cumulative values. Mirrors the --with-deltas CLI flag.
  */
 function backfillSession(
 	sourceDb: Database,
@@ -216,6 +225,7 @@ function backfillSession(
 		summary_deletions: number | null;
 	},
 	config: ReturnType<typeof loadConfig>,
+	withDeltas = false,
 ): void {
 	const modelId = extractModelId(session.model);
 
@@ -349,7 +359,7 @@ function backfillSession(
 			recorded_at: recordedAt,
 		},
 		{ metric_name: "messages_total", value: messageCount, recorded_at: recordedAt },
-	]);
+	], { skipDeltas: !withDeltas });
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +420,36 @@ describe("deriveProjectName", () => {
 	it("handles worktree with trailing slash", () => {
 		// path.basename handles trailing slashes in some environments
 		expect(deriveProjectName(null, "/path/to/project")).toBe("project");
+	});
+});
+
+describe("parseDateToEpochMs", () => {
+	it("parses YYYY-MM-DD as local midnight", () => {
+		const ms = parseDateToEpochMs("2026-09-22");
+		expect(ms).not.toBeNull();
+		const d = new Date(ms as number);
+		expect(d.getFullYear()).toBe(2026);
+		expect(d.getMonth()).toBe(8); // 0-indexed
+		expect(d.getDate()).toBe(22);
+		expect(d.getHours()).toBe(0);
+	});
+
+	it("parses ISO-8601 datetime", () => {
+		const ms = parseDateToEpochMs("2026-09-22T14:30:00Z");
+		expect(ms).not.toBeNull();
+		expect(ms).toBe(new Date("2026-09-22T14:30:00Z").getTime());
+	});
+
+	it("returns null for invalid date", () => {
+		expect(parseDateToEpochMs("not-a-date")).toBeNull();
+	});
+
+	it("returns null for empty string", () => {
+		expect(parseDateToEpochMs("")).toBeNull();
+	});
+
+	it("returns null for invalid YYYY-MM-DD format", () => {
+		expect(parseDateToEpochMs("2026-13-45")).toBeNull();
 	});
 });
 
@@ -875,5 +915,240 @@ describe("idempotency", () => {
 			)
 			.get("sess-1", "cost") as { value: number };
 		expect(costRow.value).toBeCloseTo(0.15);
+	});
+});
+
+describe("--with-deltas behavior", () => {
+	let tempDir: string;
+	let sourceDb: Database;
+	let destDb: Database;
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(path.join(tmpdir(), "ocm-backfill-deltas-"));
+
+		const sourcePath = path.join(tempDir, "source.db");
+		sourceDb = createSourceDb(sourcePath);
+
+		insertProject(sourceDb, "proj-1", "test-project", "/home/user/test-project");
+		insertSessionWithData(sourceDb, {
+			sessionId: "sess-1",
+			projectId: "proj-1",
+			cost: 0.50,
+			tokensInput: 2000,
+			tokensOutput: 1000,
+			agent: "build",
+			model: '{"id":"claude-opus-4-6"}',
+			title: "Implement feature",
+			timeCreated: 1700000000000,
+			timeUpdated: 1700003600000,
+		});
+
+		const destDir = path.join(tempDir, "dest");
+		const result = initDatabase(destDir);
+		destDb = result.db;
+
+		upsertProject(destDb, {
+			project_id: "proj-1",
+			name: "test-project",
+			worktree: "/home/user/test-project",
+		});
+	});
+
+	afterEach(() => {
+		sourceDb.close();
+		destDb.close();
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("skips deltas by default (withDeltas=false)", () => {
+		const config = loadConfig(path.join(tempDir, "dest"));
+
+		const session = sourceDb.prepare("SELECT * FROM session WHERE id = ?").get("sess-1") as {
+			id: string; project_id: string; cost: number;
+			tokens_input: number; tokens_output: number;
+			tokens_reasoning: number; tokens_cache_read: number;
+			tokens_cache_write: number; agent: string | null;
+			model: string | null; title: string | null;
+			time_created: number; time_updated: number;
+			summary_files: number | null; summary_additions: number | null;
+			summary_deletions: number | null;
+		};
+
+		backfillSession(sourceDb, destDb, session, config, false);
+
+		// Cumulative measurements must exist.
+		const measurements = destDb
+			.prepare("SELECT COUNT(*) AS cnt FROM measurements WHERE session_id = ?")
+			.get("sess-1") as { cnt: number };
+		expect(measurements.cnt).toBe(12);
+
+		// No deltas should be written.
+		const deltas = destDb
+			.prepare("SELECT COUNT(*) AS cnt FROM measurement_deltas WHERE session_id = ?")
+			.get("sess-1") as { cnt: number };
+		expect(deltas.cnt).toBe(0);
+	});
+
+	it("writes deltas when withDeltas=true", () => {
+		const config = loadConfig(path.join(tempDir, "dest"));
+
+		const session = sourceDb.prepare("SELECT * FROM session WHERE id = ?").get("sess-1") as {
+			id: string; project_id: string; cost: number;
+			tokens_input: number; tokens_output: number;
+			tokens_reasoning: number; tokens_cache_read: number;
+			tokens_cache_write: number; agent: string | null;
+			model: string | null; title: string | null;
+			time_created: number; time_updated: number;
+			summary_files: number | null; summary_additions: number | null;
+			summary_deletions: number | null;
+		};
+
+		backfillSession(sourceDb, destDb, session, config, true);
+
+		// Cumulative measurements must exist.
+		const measurements = destDb
+			.prepare("SELECT COUNT(*) AS cnt FROM measurements WHERE session_id = ?")
+			.get("sess-1") as { cnt: number };
+		expect(measurements.cnt).toBe(12);
+
+		// Deltas should be written for non-zero metrics.
+		const deltas = destDb
+			.prepare("SELECT COUNT(*) AS cnt FROM measurement_deltas WHERE session_id = ?")
+			.get("sess-1") as { cnt: number };
+		expect(deltas.cnt).toBeGreaterThan(0);
+
+		// Cost delta should equal the cumulative cost (first write, no previous value).
+		const costDelta = destDb
+			.prepare(
+				"SELECT delta FROM measurement_deltas WHERE session_id = ? AND metric_name = ?",
+			)
+			.get("sess-1", "cost") as { delta: number };
+		expect(costDelta.delta).toBeCloseTo(0.50);
+	});
+
+	it("writes catch-up deltas on re-run after initial backfill without deltas", () => {
+		const config = loadConfig(path.join(tempDir, "dest"));
+
+		const session = sourceDb.prepare("SELECT * FROM session WHERE id = ?").get("sess-1") as {
+			id: string; project_id: string; cost: number;
+			tokens_input: number; tokens_output: number;
+			tokens_reasoning: number; tokens_cache_read: number;
+			tokens_cache_write: number; agent: string | null;
+			model: string | null; title: string | null;
+			time_created: number; time_updated: number;
+			summary_files: number | null; summary_additions: number | null;
+			summary_deletions: number | null;
+		};
+
+		// First run without deltas (simulates initial backfill).
+		backfillSession(sourceDb, destDb, session, config, false);
+
+		// Confirm no deltas exist after first run.
+		const beforeDeltas = destDb
+			.prepare("SELECT COUNT(*) AS cnt FROM measurement_deltas WHERE session_id = ?")
+			.get("sess-1") as { cnt: number };
+		expect(beforeDeltas.cnt).toBe(0);
+
+		// Second run with deltas — catch-up mechanism should detect the
+		// missing deltas and write them using the cumulative values.
+		const recordedAt = session.time_updated || session.time_created || Date.now();
+		const metrics = [
+			{ metric_name: "cost", value: session.cost ?? 0, recorded_at: recordedAt },
+			{ metric_name: "tokens_input", value: session.tokens_input ?? 0, recorded_at: recordedAt },
+			{ metric_name: "tokens_output", value: session.tokens_output ?? 0, recorded_at: recordedAt },
+		];
+		backfillMissingDeltas(destDb, session.id, metrics);
+
+		const afterDeltas = destDb
+			.prepare("SELECT COUNT(*) AS cnt FROM measurement_deltas WHERE session_id = ?")
+			.get("sess-1") as { cnt: number };
+		expect(afterDeltas.cnt).toBeGreaterThan(0);
+
+		// Cost delta should equal cumulative (catch-up from zero).
+		const costDelta = destDb
+			.prepare(
+				"SELECT delta FROM measurement_deltas WHERE session_id = ? AND metric_name = ?",
+			)
+			.get("sess-1", "cost") as { delta: number };
+		expect(costDelta.delta).toBeCloseTo(0.50);
+	});
+
+	it("does not duplicate deltas on repeated catch-up runs", () => {
+		const config = loadConfig(path.join(tempDir, "dest"));
+
+		const session = sourceDb.prepare("SELECT * FROM session WHERE id = ?").get("sess-1") as {
+			id: string; project_id: string; cost: number;
+			tokens_input: number; tokens_output: number;
+			tokens_reasoning: number; tokens_cache_read: number;
+			tokens_cache_write: number; agent: string | null;
+			model: string | null; title: string | null;
+			time_created: number; time_updated: number;
+			summary_files: number | null; summary_additions: number | null;
+			summary_deletions: number | null;
+		};
+
+		// First backfill without deltas, then catch-up twice.
+		backfillSession(sourceDb, destDb, session, config, false);
+
+		const recordedAt = session.time_updated || session.time_created || Date.now();
+		const metrics = [
+			{ metric_name: "cost", value: session.cost ?? 0, recorded_at: recordedAt },
+		];
+		backfillMissingDeltas(destDb, session.id, metrics);
+		backfillMissingDeltas(destDb, session.id, metrics);
+
+		// Should still be exactly 1 delta row for cost (INSERT OR IGNORE on same PK).
+		const deltaCount = destDb
+			.prepare(
+				"SELECT COUNT(*) AS cnt FROM measurement_deltas WHERE session_id = ? AND metric_name = ?",
+			)
+			.get("sess-1", "cost") as { cnt: number };
+		expect(deltaCount.cnt).toBe(1);
+
+		// SUM(deltas) should equal the cumulative value.
+		const sumRow = destDb
+			.prepare(
+				"SELECT SUM(delta) AS total FROM measurement_deltas WHERE session_id = ? AND metric_name = ?",
+			)
+			.get("sess-1", "cost") as { total: number };
+		expect(sumRow.total).toBeCloseTo(0.50);
+	});
+
+	it("tops up partial deltas when live deltas cover less than cumulative", () => {
+		const config = loadConfig(path.join(tempDir, "dest"));
+
+		const session = sourceDb.prepare("SELECT * FROM session WHERE id = ?").get("sess-1") as {
+			id: string; project_id: string; cost: number;
+			tokens_input: number; tokens_output: number;
+			tokens_reasoning: number; tokens_cache_read: number;
+			tokens_cache_write: number; agent: string | null;
+			model: string | null; title: string | null;
+			time_created: number; time_updated: number;
+			summary_files: number | null; summary_additions: number | null;
+			summary_deletions: number | null;
+		};
+
+		// First backfill without deltas.
+		backfillSession(sourceDb, destDb, session, config, false);
+
+		// Simulate a live delta that covers only part of the cost.
+		destDb.run(
+			"INSERT INTO measurement_deltas (session_id, metric_name, delta, recorded_at) VALUES (?, ?, ?, ?)",
+			["sess-1", "cost", 0.20, session.time_updated - 1000],
+		);
+
+		// Catch-up should insert a top-up delta for the remaining gap.
+		const recordedAt = session.time_updated || session.time_created || Date.now();
+		backfillMissingDeltas(destDb, session.id, [
+			{ metric_name: "cost", value: session.cost ?? 0, recorded_at: recordedAt },
+		]);
+
+		// SUM(deltas) should now equal cumulative (0.20 + 0.30 = 0.50).
+		const sumRow = destDb
+			.prepare(
+				"SELECT SUM(delta) AS total FROM measurement_deltas WHERE session_id = ? AND metric_name = ?",
+			)
+			.get("sess-1", "cost") as { total: number };
+		expect(sumRow.total).toBeCloseTo(0.50);
 	});
 });
