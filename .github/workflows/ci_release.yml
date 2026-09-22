@@ -1,4 +1,8 @@
 # CI Release — Automated version management via release-please.
+# When a release is created, publishes the package to npm.
+# Events from the default GITHUB_TOKEN do not cascade to other
+# workflows, so publish runs as a dependent job here instead of
+# relying on a separate release-triggered workflow.
 name: CI Release
 
 on:
@@ -14,5 +18,50 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    outputs:
+      releases_created: ${{ steps.release.outputs.releases_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
-      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7  # v5.0.0
+      - id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7  # v5.0.0
+
+  publish:
+    name: Publish to npm
+    needs: release-please
+    if: needs.release-please.outputs.releases_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2.2.0
+        with:
+          bun-version: "1.4.2"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - run: bun install --frozen-lockfile
+      - run: make build
+      - run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Verify publish
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          VERSION="${TAG#v}"
+          MAX_ATTEMPTS=20
+          INTERVAL=15
+          for i in $(seq 1 "$MAX_ATTEMPTS"); do
+            sleep "$INTERVAL"
+            if npm view "@mburghardt/opencode-metrics@${VERSION}" version 2>/dev/null; then
+              echo "Package @mburghardt/opencode-metrics@${VERSION} verified on registry"
+              exit 0
+            fi
+            echo "Attempt ${i}/${MAX_ATTEMPTS}: registry not yet propagated, retrying in ${INTERVAL}s..."
+          done
+          echo "Package not visible after ${MAX_ATTEMPTS} attempts ($((MAX_ATTEMPTS * INTERVAL))s)"
+          exit 1
