@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.4.0](https://github.com/marcusburghardt/opencode-metrics/compare/v0.3.0...v0.4.0) (2026-09-22)
+
+
+### Features
+
+* add --with-deltas and --since flags to backfill script ([dea15b2](https://github.com/marcusburghardt/opencode-metrics/commit/dea15b2ea45e5d3e3f018ab18e226c6f62d3eed1))
+* add make check diagnostic command ([45f712b](https://github.com/marcusburghardt/opencode-metrics/commit/45f712bc7e2028ca81a9e1b7e00b74a0e941df40))
+
+
+### Bug Fixes
+
+* add include-component-in-tag to release-please config ([b874e45](https://github.com/marcusburghardt/opencode-metrics/commit/b874e45967ff9fb249a6f2069f53d5bdf76c1173))
+* guard monotonic metrics against compaction-induced negative deltas ([1d44c1c](https://github.com/marcusburghardt/opencode-metrics/commit/1d44c1cf2974fabc2342caf7d7d133baecb7170c))
+* increase npm publish verification to 5 minutes ([be4f7a4](https://github.com/marcusburghardt/opencode-metrics/commit/be4f7a45c5474a00bd4fd7aa6ca1b2ae1f8295eb))
+* validate loader file exports in check.sh ([b452c13](https://github.com/marcusburghardt/opencode-metrics/commit/b452c13ddcfed094876f50b7ef0153e731b52a29))
+
+
+### Miscellaneous
+
+* default make target to help with available commands ([51f851f](https://github.com/marcusburghardt/opencode-metrics/commit/51f851fc37991a0f024cf1bd95affa53804feaff))
+
+
+### Documentation
+
+* add quick reference section to README ([cf981dd](https://github.com/marcusburghardt/opencode-metrics/commit/cf981ddec23a86dfc8a66e6a61c1cdd577b3d216))
+
 ## [0.3.0](https://github.com/marcusburghardt/opencode-metrics/compare/opencode-metrics-v0.2.0...opencode-metrics-v0.3.0) (2026-09-18)
 
 
