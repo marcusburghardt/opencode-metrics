@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2](https://github.com/marcusburghardt/opencode-metrics/compare/v0.4.1...v0.4.2) (2026-09-22)
+
+
+### Bug Fixes
+
+* publish to npm from release workflow to bypass GITHUB_TOKEN event limits ([7f31588](https://github.com/marcusburghardt/opencode-metrics/commit/7f31588e195f42b72a0954d9f4f24e971590ffb0))
+
 ## [0.4.1](https://github.com/marcusburghardt/opencode-metrics/compare/v0.4.0...v0.4.1) (2026-09-22)
 
 
