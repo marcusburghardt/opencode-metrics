@@ -73,13 +73,23 @@ else
 fi
 
 if [ -f "${GLOBAL_LOADER}" ]; then
-	pass "Global loader: ${GLOBAL_LOADER}"
+	if grep -q 'export.*plugin' "${GLOBAL_LOADER}" 2>/dev/null; then
+		pass "Global loader: ${GLOBAL_LOADER}"
+	else
+		fail "Global loader exists but has no named export — plugin will not register"
+		dim "Expected: import plugin from \"...\"; export const OpenCodeMetrics = plugin;"
+		dim "Run 'make install' or re-run the Ansible playbook with the fixed template."
+	fi
 else
 	dim "Global loader: not found (OK if using npm or project-local loader)"
 fi
 
 if [ -f "${LOCAL_LOADER}" ]; then
-	pass "Local loader: ${LOCAL_LOADER}"
+	if grep -q 'export.*plugin' "${LOCAL_LOADER}" 2>/dev/null; then
+		pass "Local loader: ${LOCAL_LOADER}"
+	else
+		fail "Local loader exists but has no named export — plugin will not register"
+	fi
 else
 	dim "Local loader: not found (OK if using npm or global loader)"
 fi
