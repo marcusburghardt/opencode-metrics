@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.1](https://github.com/marcusburghardt/opencode-metrics/compare/v0.4.0...v0.4.1) (2026-09-22)
+
+
+### Bug Fixes
+
+* derive project name from worktree path when SDK name is missing ([b9bf228](https://github.com/marcusburghardt/opencode-metrics/commit/b9bf228c7a34b1424c43a548946b6ab01a63f425))
+* resolve release-please automation failures ([7de79ec](https://github.com/marcusburghardt/opencode-metrics/commit/7de79ec62e4618013446cff55fe2b12916cb4344))
+
 ## [0.4.0](https://github.com/marcusburghardt/opencode-metrics/compare/v0.3.0...v0.4.0) (2026-09-22)
 
 
