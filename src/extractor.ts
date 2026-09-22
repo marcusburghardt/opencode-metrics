@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import path from "node:path";
 import {
 	type BashToolCall,
 	type ExtractedArtifact,
@@ -187,6 +188,22 @@ function resolveModelString(model: string | Record<string, unknown> | undefined)
 }
 
 /**
+ * Derive a human-readable project name from the SDK-provided name and
+ * worktree path. When the SDK returns a name, it is used directly.
+ * Otherwise, the basename of the worktree path is used (e.g.,
+ * "/home/user/repos/my-project" → "my-project"). Falls back to
+ * "unknown" only when neither name nor path is available.
+ */
+export function deriveProjectName(
+	name: string | undefined | null,
+	worktreePath: string | undefined | null,
+): string {
+	if (name) return name;
+	if (worktreePath) return path.basename(worktreePath);
+	return "unknown";
+}
+
+/**
  * Compute cache hit ratio: tokensCacheRead / (tokensCacheRead + tokensInput).
  * Returns 0 when the denominator is 0 (no tokens processed).
  */
@@ -303,7 +320,7 @@ export async function extractSessionData(
 	const agent = session?.agent ?? "unknown";
 	const title = session?.title ?? "unknown";
 	const projectId = project?.id ?? session?.projectID ?? "unknown";
-	const projectName = project?.name ?? "unknown";
+	const projectName = deriveProjectName(project?.name, project?.path);
 	const timeCreated = session?.timeCreated ?? 0;
 	const timeUpdated = session?.timeUpdated ?? 0;
 	const model = resolveModelString(session?.model);
@@ -356,7 +373,7 @@ export async function extractSessionData(
 	return {
 		project: {
 			project_id: projectId,
-			name: project?.name ?? "unknown",
+			name: projectName,
 			worktree: project?.path ?? "unknown",
 		},
 		session: {

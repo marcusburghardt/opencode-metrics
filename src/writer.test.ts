@@ -108,6 +108,41 @@ describe("writer", () => {
 			};
 			expect(count.count).toBe(1);
 		});
+
+		it("does not overwrite a valid name with 'unknown'", () => {
+			upsertProject(db, makeProject({ name: "real-project" }));
+			upsertProject(db, makeProject({ name: "unknown", worktree: "/updated/path" }));
+
+			const row = db.prepare("SELECT * FROM projects WHERE project_id = ?").get("proj-001") as {
+				name: string;
+				worktree: string;
+			};
+
+			expect(row.name).toBe("real-project");
+			expect(row.worktree).toBe("/updated/path");
+		});
+
+		it("allows overwriting 'unknown' with a valid name", () => {
+			upsertProject(db, makeProject({ name: "unknown" }));
+			upsertProject(db, makeProject({ name: "resolved-project" }));
+
+			const row = db.prepare("SELECT * FROM projects WHERE project_id = ?").get("proj-001") as {
+				name: string;
+			};
+
+			expect(row.name).toBe("resolved-project");
+		});
+
+		it("allows overwriting 'unknown' with 'unknown' (no-op)", () => {
+			upsertProject(db, makeProject({ name: "unknown" }));
+			upsertProject(db, makeProject({ name: "unknown" }));
+
+			const row = db.prepare("SELECT * FROM projects WHERE project_id = ?").get("proj-001") as {
+				name: string;
+			};
+
+			expect(row.name).toBe("unknown");
+		});
 	});
 
 	describe("upsertSession", () => {

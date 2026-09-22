@@ -2,7 +2,12 @@
 
 import { describe, expect, it } from "bun:test";
 import type { MessageInfo, ProjectInfo, SDKClient, SessionInfo } from "./extractor";
-import { computeCacheHitRatio, computeDurationSeconds, extractSessionData } from "./extractor";
+import {
+	computeCacheHitRatio,
+	computeDurationSeconds,
+	deriveProjectName,
+	extractSessionData,
+} from "./extractor";
 
 /** Factory for a mock SDKClient with configurable overrides. */
 function makeClient(
@@ -254,6 +259,18 @@ describe("extractSessionData", () => {
 		expect(result?.project.worktree).toBe("unknown");
 	});
 
+	it("derives project name from worktree path when name is missing", async () => {
+		const client = makeClient({
+			project: { id: "proj-derived", name: undefined, path: "/home/user/repos/my-project" },
+		});
+		const result = await extractSessionData(client, "sess-derive");
+
+		expect(result?.project.project_id).toBe("proj-derived");
+		expect(result?.project.name).toBe("my-project");
+		expect(result?.project.worktree).toBe("/home/user/repos/my-project");
+		expect(result?.classificationContext.project_name).toBe("my-project");
+	});
+
 	it("extracts part_content from all text parts", async () => {
 		const client = makeClient({
 			messages: [
@@ -395,5 +412,35 @@ describe("computeDurationSeconds", () => {
 
 	it("returns 0 when both timestamps are 0", () => {
 		expect(computeDurationSeconds(0, 0)).toBe(0);
+	});
+});
+
+describe("deriveProjectName", () => {
+	it("returns the SDK-provided name when available", () => {
+		expect(deriveProjectName("my-project", "/home/user/repos/my-project")).toBe("my-project");
+	});
+
+	it("derives name from worktree path when name is undefined", () => {
+		expect(deriveProjectName(undefined, "/home/user/repos/my-project")).toBe("my-project");
+	});
+
+	it("derives name from worktree path when name is null", () => {
+		expect(deriveProjectName(null, "/home/user/GIT/ProdSec/complyctl")).toBe("complyctl");
+	});
+
+	it("derives name from worktree path when name is empty string", () => {
+		expect(deriveProjectName("", "/home/user/repos/ansible-role-ai")).toBe("ansible-role-ai");
+	});
+
+	it("falls back to 'unknown' when both name and path are missing", () => {
+		expect(deriveProjectName(undefined, undefined)).toBe("unknown");
+	});
+
+	it("falls back to 'unknown' when name is undefined and path is null", () => {
+		expect(deriveProjectName(undefined, null)).toBe("unknown");
+	});
+
+	it("handles root path correctly", () => {
+		expect(deriveProjectName(undefined, "/")).toBe("");
 	});
 });
