@@ -94,6 +94,35 @@ export interface WriteMetricsOptions {
 }
 
 /**
+ * Metrics whose cumulative value should only increase within a session.
+ * When OpenCode's session compaction prunes old messages, the SDK adapter
+ * re-aggregates cost/tokens from the remaining messages, producing a
+ * lower total. Without this guard, writeMetrics() would record a
+ * negative delta and overwrite the cumulative with the lower value.
+ *
+ * For these metrics, if the new value is lower than the stored value:
+ *   - The negative delta is NOT written (it's a compaction artifact).
+ *   - The cumulative value is NOT lowered (high-water mark preserved).
+ *
+ * Non-monotonic metrics (files_changed, lines_added, lines_deleted,
+ * cache_hit_ratio) are excluded because their values can legitimately
+ * decrease within a session (e.g., agent reverts a change).
+ */
+export const MONOTONIC_METRICS: ReadonlySet<string> = new Set([
+	"cost",
+	"tokens_input",
+	"tokens_output",
+	"tokens_reasoning",
+	"tokens_cache_read",
+	"tokens_cache_write",
+	"duration_seconds",
+	"messages_total",
+	"prs_created",
+	"prs_reviewed",
+	"issues_referenced",
+]);
+
+/**
  * Batch-upsert measurement rows for a session, optionally computing
  * and storing incremental deltas before each upsert.
  *
@@ -144,6 +173,14 @@ export function writeMetrics(
 		const existing = readStmt.get(sessionId, metric.metric_name) as { value: number } | undefined;
 		const previousValue = existing?.value ?? 0;
 		const delta = metric.value - previousValue;
+
+		// For monotonic metrics (cost, tokens, etc.), a negative delta
+		// means session compaction pruned messages and the SDK now reports
+		// lower totals. Skip both the delta write and the cumulative
+		// update to preserve the high-water mark.
+		if (delta < 0 && MONOTONIC_METRICS.has(metric.metric_name)) {
+			continue;
+		}
 
 		if (delta !== 0) {
 			deltaStmt.run(sessionId, metric.metric_name, delta, metric.recorded_at);

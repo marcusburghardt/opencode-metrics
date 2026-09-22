@@ -8,6 +8,7 @@ import path from "node:path";
 import { initDatabase } from "./db";
 import type { MetricRecord, ProjectRecord, SessionRecord } from "./writer";
 import {
+	MONOTONIC_METRICS,
 	upsertArtifacts,
 	upsertProject,
 	upsertSession,
@@ -470,7 +471,7 @@ describe("writer", () => {
 			expect(measurementRow.value).toBeCloseTo(1.0);
 		});
 
-		it("negative delta is recorded correctly (value decreases)", () => {
+		it("negative delta is recorded correctly for non-monotonic metrics (value decreases)", () => {
 			writeMetrics(db, "sess-001", [
 				{ metric_name: "files_changed", value: 5, recorded_at: 1700000000000 },
 			]);
@@ -487,6 +488,89 @@ describe("writer", () => {
 			expect(deltas.length).toBe(2);
 			expect(deltas[0].delta).toBe(5);
 			expect(deltas[1].delta).toBe(-2);
+
+			// Cumulative should reflect the lower value for non-monotonic metrics.
+			const cumulative = db
+				.prepare("SELECT value FROM measurements WHERE session_id = ? AND metric_name = ?")
+				.get("sess-001", "files_changed") as { value: number };
+			expect(cumulative.value).toBe(3);
+		});
+
+		it("monotonic metric skips negative delta and preserves high-water mark", () => {
+			// Simulate: cost goes up to 5.0, then compaction drops it to 3.0.
+			writeMetrics(db, "sess-001", [
+				{ metric_name: "cost", value: 5.0, recorded_at: 1700000000000 },
+			]);
+			writeMetrics(db, "sess-001", [
+				{ metric_name: "cost", value: 3.0, recorded_at: 1700001000000 },
+			]);
+
+			// No negative delta should be recorded.
+			const deltas = db
+				.prepare(
+					"SELECT delta FROM measurement_deltas WHERE session_id = ? AND metric_name = ? ORDER BY recorded_at",
+				)
+				.all("sess-001", "cost") as Array<{ delta: number }>;
+
+			expect(deltas.length).toBe(1);
+			expect(deltas[0].delta).toBeCloseTo(5.0);
+
+			// Cumulative should retain the high-water mark, NOT the lower value.
+			const cumulative = db
+				.prepare("SELECT value FROM measurements WHERE session_id = ? AND metric_name = ?")
+				.get("sess-001", "cost") as { value: number };
+			expect(cumulative.value).toBeCloseTo(5.0);
+		});
+
+		it("monotonic metric recovers correctly after compaction", () => {
+			// Simulate: cost 5.0 → compaction drops to 3.0 → real growth to 7.0
+			writeMetrics(db, "sess-001", [
+				{ metric_name: "cost", value: 5.0, recorded_at: 1700000000000 },
+			]);
+			writeMetrics(db, "sess-001", [
+				{ metric_name: "cost", value: 3.0, recorded_at: 1700001000000 },
+			]);
+			writeMetrics(db, "sess-001", [
+				{ metric_name: "cost", value: 7.0, recorded_at: 1700002000000 },
+			]);
+
+			const deltas = db
+				.prepare(
+					"SELECT delta FROM measurement_deltas WHERE session_id = ? AND metric_name = ? ORDER BY recorded_at",
+				)
+				.all("sess-001", "cost") as Array<{ delta: number }>;
+
+			// First delta: 5.0 (initial). Second: skipped (negative).
+			// Third: 7.0 - 5.0 = 2.0 (delta from high-water mark, not from 3.0).
+			expect(deltas.length).toBe(2);
+			expect(deltas[0].delta).toBeCloseTo(5.0);
+			expect(deltas[1].delta).toBeCloseTo(2.0);
+
+			// SUM(deltas) should equal the final cumulative value.
+			const sumRow = db
+				.prepare(
+					"SELECT SUM(delta) AS total FROM measurement_deltas WHERE session_id = ? AND metric_name = ?",
+				)
+				.get("sess-001", "cost") as { total: number };
+			expect(sumRow.total).toBeCloseTo(7.0);
+
+			const cumulative = db
+				.prepare("SELECT value FROM measurements WHERE session_id = ? AND metric_name = ?")
+				.get("sess-001", "cost") as { value: number };
+			expect(cumulative.value).toBeCloseTo(7.0);
+		});
+
+		it("files_changed is NOT in the monotonic set", () => {
+			expect(MONOTONIC_METRICS.has("files_changed")).toBe(false);
+			expect(MONOTONIC_METRICS.has("lines_added")).toBe(false);
+			expect(MONOTONIC_METRICS.has("lines_deleted")).toBe(false);
+			expect(MONOTONIC_METRICS.has("cache_hit_ratio")).toBe(false);
+		});
+
+		it("cost IS in the monotonic set", () => {
+			expect(MONOTONIC_METRICS.has("cost")).toBe(true);
+			expect(MONOTONIC_METRICS.has("tokens_input")).toBe(true);
+			expect(MONOTONIC_METRICS.has("messages_total")).toBe(true);
 		});
 
 		it("multiple metrics in a single writeMetrics() call each get their own delta rows", () => {
