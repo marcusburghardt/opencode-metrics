@@ -199,7 +199,10 @@ export function deriveProjectName(
 	worktreePath: string | undefined | null,
 ): string {
 	if (name) return name;
-	if (worktreePath) return path.basename(worktreePath);
+	if (worktreePath) {
+		const base = path.basename(worktreePath);
+		if (base) return base;
+	}
 	return "unknown";
 }
 

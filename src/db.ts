@@ -9,7 +9,7 @@ import path from "node:path";
  * Schema version for the metrics database.
  * Increment when altering table definitions or adding required migrations.
  */
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 /**
  * V1 metric catalog — seeded into metric_definitions on first database creation.
@@ -502,6 +502,14 @@ export function initDatabase(dataDirOverride?: string): InitDatabaseResult {
 	// reflects the actual schema state after createSchema() runs.
 	// (Guard is implicit: currentVersion < 4 falls through to the
 	// generic version bump below.)
+
+	// V4 → V5 migration: fix projects with empty or sentinel names.
+	// Non-git projects were recorded with name = '' (from path.basename("/"))
+	// and worktree = "/". Set name to "unknown" so the upsert guard can
+	// later overwrite it when better data arrives.
+	if (currentVersion < 5) {
+		db.run("UPDATE projects SET name = 'unknown' WHERE name = '' OR name IS NULL");
+	}
 
 	if (currentVersion < SCHEMA_VERSION) {
 		db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);

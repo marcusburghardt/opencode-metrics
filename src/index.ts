@@ -25,6 +25,14 @@ import { writeSessionData } from "./writer";
 export function createSDKAdapter(input: PluginInput): SDKClient {
 	const { client } = input;
 
+	// Capture init-time project context from PluginInput. OpenCode sets
+	// worktree to "/" for non-git projects (the "global" sentinel), but
+	// `directory` always holds the actual directory where OpenCode was
+	// launched. Use directory as the reliable fallback path when the
+	// project API returns the global sentinel.
+	const initProjectId = (input.project as Record<string, unknown>)?.id as string | undefined;
+	const initDirectory = input.directory;
+
 	// Cache raw messages per session to avoid double-fetching when both
 	// session.get (for token aggregation) and session.messages are called.
 	const messagesCache = new Map<string, unknown[]>();
@@ -152,13 +160,26 @@ export function createSDKAdapter(input: PluginInput): SDKClient {
 				const project = (result as Record<string, unknown>)?.data as
 					| Record<string, unknown>
 					| undefined;
-				return project
-					? {
-							id: project.id as string,
+				if (project) {
+					const id = project.id as string;
+					const worktree = project.worktree as string | undefined;
+					// When the API returns a real project (not the global
+					// sentinel), use it directly.
+					if (worktree && worktree !== "/") {
+						return {
+							id,
 							name: project.name as string | undefined,
-							path: project.worktree as string | undefined,
-						}
-					: null;
+							path: worktree,
+						};
+					}
+				}
+				// Fall back to the init-time directory captured from
+				// PluginInput. This is always the real launch directory,
+				// even for non-git projects where worktree is "/".
+				return {
+					id: initProjectId ?? "unknown",
+					path: initDirectory,
+				};
 			},
 		},
 

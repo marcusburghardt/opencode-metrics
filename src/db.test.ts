@@ -103,9 +103,9 @@ describe("initDatabase", () => {
 		expect(row.journal_mode).toBe("wal");
 	});
 
-	it("sets user_version to 4", () => {
+	it("sets user_version to 5", () => {
 		const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
-		expect(row.user_version).toBe(4);
+		expect(row.user_version).toBe(5);
 	});
 
 	it("preserves user_version on subsequent calls", () => {
@@ -118,7 +118,7 @@ describe("initDatabase", () => {
 		db = second.db;
 
 		const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
-		expect(row.user_version).toBe(4);
+		expect(row.user_version).toBe(5);
 	});
 
 	it("fresh database has budget_tag column on sessions table", () => {
@@ -167,15 +167,16 @@ describe("initDatabase", () => {
 		v2Db.run("PRAGMA user_version = 2");
 		v2Db.close();
 
-		// Now run initDatabase on this v2 directory — should migrate to v4
+		// Now run initDatabase on this v2 directory — should migrate to v5
 		// (applying all pending migrations: v2→v3 adds budget_tag, v3→v4
-		// adds cost_pricing table and adjusted cost views).
+		// adds cost_pricing table and adjusted cost views, v4→v5 fixes
+		// empty project names).
 		const migrated = initDatabase(v2Dir);
 		db = migrated.db;
 
-		// Schema version should be 4 (latest).
+		// Schema version should be 5 (latest).
 		const versionRow = db.prepare("PRAGMA user_version").get() as { user_version: number };
-		expect(versionRow.user_version).toBe(4);
+		expect(versionRow.user_version).toBe(5);
 
 		// budget_tag column should exist.
 		const columns = db.prepare("PRAGMA table_info(sessions)").all() as Array<{
@@ -483,13 +484,13 @@ describe("initDatabase", () => {
 		v3Db.run("PRAGMA user_version = 3");
 		v3Db.close();
 
-		// Run initDatabase — should migrate to v4.
+		// Run initDatabase — should migrate to v5.
 		const migrated = initDatabase(v3Dir);
 		db = migrated.db;
 
-		// Schema version should be 4.
+		// Schema version should be 5.
 		const versionRow = db.prepare("PRAGMA user_version").get() as { user_version: number };
-		expect(versionRow.user_version).toBe(4);
+		expect(versionRow.user_version).toBe(5);
 
 		// cost_pricing table should exist.
 		const tables = db

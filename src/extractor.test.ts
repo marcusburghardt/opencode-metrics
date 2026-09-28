@@ -440,7 +440,7 @@ describe("deriveProjectName", () => {
 		expect(deriveProjectName(undefined, null)).toBe("unknown");
 	});
 
-	it("handles root path correctly", () => {
-		expect(deriveProjectName(undefined, "/")).toBe("");
+	it("falls back to 'unknown' for root path where basename is empty", () => {
+		expect(deriveProjectName(undefined, "/")).toBe("unknown");
 	});
 });

@@ -34,9 +34,9 @@ export interface MetricRecord {
  * Insert or update a project record.
  * On conflict (same project_id), update name and worktree to keep
  * the dimension table current with the latest project metadata.
- * Guards against overwriting a previously resolved name with "unknown":
- * if the incoming name is "unknown" but the existing record has a
- * real name, the real name is preserved.
+ * Guards against overwriting a previously resolved name with a sentinel
+ * value: if the incoming name is "unknown" or empty but the existing
+ * record has a real name, the real name is preserved.
  */
 export function upsertProject(db: Database, project: ProjectRecord): void {
 	db.run(
@@ -44,11 +44,16 @@ export function upsertProject(db: Database, project: ProjectRecord): void {
 		 VALUES (?, ?, ?)
 		 ON CONFLICT(project_id) DO UPDATE SET
 			name     = CASE
-				WHEN excluded.name = 'unknown' AND projects.name != 'unknown'
+				WHEN (excluded.name = 'unknown' OR excluded.name = '')
+				 AND projects.name != 'unknown' AND projects.name != ''
 				THEN projects.name
 				ELSE excluded.name
 			END,
-			worktree = excluded.worktree`,
+			worktree = CASE
+				WHEN excluded.worktree = '/' AND projects.worktree != '/'
+				THEN projects.worktree
+				ELSE excluded.worktree
+			END`,
 		[project.project_id, project.name, project.worktree],
 	);
 }

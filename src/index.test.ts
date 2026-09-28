@@ -92,9 +92,9 @@ function makeClient(
 
 /**
  * Factory for a mock PluginInput-like object that createSDKAdapter accepts.
- * Mirrors the shape of PluginInput.client from @opencode-ai/plugin: the SDK
- * returns { data, error } from session.get/messages and project.current,
- * and app.log takes { body: { service, level, message } }.
+ * Mirrors the shape of PluginInput from @opencode-ai/plugin: includes
+ * client (session/project/app), plus the init-time project and directory
+ * fields used as fallback for non-git project detection.
  */
 function makePluginInput(
 	overrides: {
@@ -102,9 +102,13 @@ function makePluginInput(
 		messagesData?: unknown[];
 		projectData?: Record<string, unknown> | null;
 		logCapture?: string[];
+		/** Init-time project object from PluginInput.project. */
+		initProject?: Record<string, unknown>;
+		/** Init-time directory from PluginInput.directory. */
+		initDirectory?: string;
 	} = {},
 	// biome-ignore lint/suspicious/noExplicitAny: test mock requires flexible typing
-): { client: Record<string, any> } {
+): { client: Record<string, any>; project: Record<string, unknown>; directory: string } {
 	const logCapture = overrides.logCapture ?? [];
 
 	return {
@@ -128,6 +132,8 @@ function makePluginInput(
 				},
 			},
 		},
+		project: overrides.initProject ?? { id: "proj-init", worktree: "/home/user/default" },
+		directory: overrides.initDirectory ?? "/home/user/default",
 	};
 }
 
@@ -629,16 +635,53 @@ describe("createSDKAdapter", () => {
 		expect(project?.path).toBe("/home/user/project");
 	});
 
-	it("handles null project data", async () => {
+	it("falls back to init-time directory when API returns null project", async () => {
 		const input = makePluginInput({
 			projectData: null,
+			initProject: { id: "proj-fallback", worktree: "/" },
+			initDirectory: "/home/user/my-project",
 		});
 
 		// biome-ignore lint/suspicious/noExplicitAny: test mock
 		const adapter = createSDKAdapter(input as any);
 		const project = await adapter.project.current();
 
-		expect(project).toBeNull();
+		expect(project).not.toBeNull();
+		expect(project?.id).toBe("proj-fallback");
+		expect(project?.path).toBe("/home/user/my-project");
+	});
+
+	it("falls back to init-time directory when API returns global sentinel", async () => {
+		const input = makePluginInput({
+			projectData: { id: "global", worktree: "/" },
+			initProject: { id: "global", worktree: "/" },
+			initDirectory: "/home/user/my-project",
+		});
+
+		// biome-ignore lint/suspicious/noExplicitAny: test mock
+		const adapter = createSDKAdapter(input as any);
+		const project = await adapter.project.current();
+
+		// Should use the init-time directory, not the "/" sentinel.
+		expect(project?.id).toBe("global");
+		expect(project?.path).toBe("/home/user/my-project");
+	});
+
+	it("uses API project data when worktree is a real path", async () => {
+		const input = makePluginInput({
+			projectData: { id: "proj-real", worktree: "/home/user/real-project", name: "real" },
+			initProject: { id: "proj-init", worktree: "/home/user/default" },
+			initDirectory: "/home/user/default",
+		});
+
+		// biome-ignore lint/suspicious/noExplicitAny: test mock
+		const adapter = createSDKAdapter(input as any);
+		const project = await adapter.project.current();
+
+		// Real worktree path — should use the API data, not the fallback.
+		expect(project?.id).toBe("proj-real");
+		expect(project?.path).toBe("/home/user/real-project");
+		expect(project?.name).toBe("real");
 	});
 
 	it("caches messages per session to avoid double-fetching", async () => {
@@ -668,6 +711,8 @@ describe("createSDKAdapter", () => {
 				project: { current: async () => ({ data: null }) },
 				app: { log: () => {} },
 			},
+			project: { id: "proj-cache" },
+			directory: "/tmp/cache-test",
 		};
 
 		// biome-ignore lint/suspicious/noExplicitAny: test mock
@@ -815,6 +860,8 @@ describe("plugin default export", () => {
 					},
 				},
 			},
+			project: { id: "proj-err" },
+			directory: "/tmp/error-test",
 		};
 
 		// biome-ignore lint/suspicious/noExplicitAny: test mock
