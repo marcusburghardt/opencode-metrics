@@ -336,10 +336,11 @@ deprecation notice directs V1 hosts to pin.
 
 ## Risks / Trade-offs
 
-- **Upstream diff statistics.** V2 does not populate the session diff summary
-  for new sessions, and the plugin context does not expose `session.diff`.
-  Accepted: `files_changed` comes from snapshots and line counts stay 0 until
-  upstream restores the data. Measurements are recorded in `evidence.md`.
+- **Upstream diff statistics.** OpenCode stores a diff summary, but the
+  plugin context does not expose `session.diff`, and `Session.Info` carries no
+  summary. Accepted: `files_changed` comes from snapshots and line counts stay
+  0 until the diff is reachable from the plugin context. Measurements are
+  recorded in `evidence.md` §1.
 - **Message shape drift.** V2 message content is a typed union that may gain
   variants. The adapter ignores unknown content types rather than failing, and
   a scenario covers it.

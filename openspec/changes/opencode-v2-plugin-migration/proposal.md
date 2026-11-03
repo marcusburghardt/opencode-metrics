@@ -63,14 +63,15 @@ _None._
   maintained. The release is a breaking change. The `0.4.x` line remains
   installable for OpenCode V1 hosts; no further releases are planned on that
   line.
-- **Session diff statistics.** V2's `Session.Info` no longer carries the diff
-  summary, and the plugin context does not expose `session.diff` (verified
-  against `@opencode/plugin` 2.2.5: `SessionDomain` is a `Pick` of
-  `SessionApi` that excludes `diff`). `files_changed` is derived from the
+- **Session diff statistics.** OpenCode 2.2.5 stores a diff summary
+  (`summary_files`, `summary_additions`, `summary_deletions`), but the plugin
+  API does not expose it: `Session.Info` carries no summary and `SessionDomain`
+  is a `Pick` of `SessionApi` that excludes `diff` (verified against
+  `@opencode/plugin` 2.2.5). `files_changed` is therefore derived from the
   distinct union of assistant `snapshot.files`; `lines_added` and
-  `lines_deleted` are recorded as 0 until upstream restores session diff data.
-  This is a known limitation, not a regression to work around. Measurements
-  and the provenance for these claims are recorded in `evidence.md`.
+  `lines_deleted` are recorded as 0 until the diff is reachable from the plugin
+  context. This is a known limitation, not a regression to work around.
+  Measurements and provenance are recorded in `evidence.md` §1.
 - **Historical backfill for OpenCode V2.** OpenCode's legacy `session`,
   `message`, and `part` tables stop at 2026-10-30; sessions created since then
   exist only in `session_v2`, `session_message`, and `session_part`.

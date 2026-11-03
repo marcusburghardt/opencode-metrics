@@ -158,21 +158,21 @@ with only the README-only wording normalization parallelized.
 
 - [x] 11.1 Run `make build`, `make test`, and `make lint` (CI parity)
 - [x] 11.2 Run `make check` against a local install and confirm it reports PASS for the V2 loader layout
-- [ ] 11.3 Confirm the `console.*` line shape emitted by the plugin matches the `scripts/check.sh` pattern; record the observed shape in `evidence.md` §3
+- [x] 11.3 Confirm the `console.*` line shape emitted by the plugin matches the `scripts/check.sh` pattern; record the observed shape in `evidence.md` §3
 
 ### Evidence recording (human-gated, reproducible artifacts required)
 
-- [ ] 11.4 Record `evidence.md` §1, §2, and §6: the V2 session-diff query (against `session_v2`), the legacy/V2 table cutoff check, and proof that the resolved plugin-API package version is readable from the location the runtime guard reads it (with dates and OpenCode version)
-- [ ] 11.5 Record `evidence.md` §5: compare `Session.Info.cost`/`tokens` for a parent session with and without a sub-agent; if the values include children, re-scope the `Automatic Metrics Capture` cost requirement before release
+- [x] 11.4 Record `evidence.md` §1, §2, and §6: the V2 session-diff query (against `session_v2`), the legacy/V2 table cutoff check, and proof that the resolved plugin-API package version is readable from the location the runtime guard reads it (with dates and OpenCode version)
+- [x] 11.5 Record `evidence.md` §5: compare `Session.Info.cost`/`tokens` for a parent session with and without a sub-agent; if the values include children, re-scope the `Automatic Metrics Capture` cost requirement before release
 
 ### Human-gated (change is not Done until a human records the evidence)
 
-- [ ] 11.6 Start OpenCode 2.2.5 in this repository and confirm the plugin appears in the active plugin list and logs initialization; record the log file/stream in `evidence.md` §3
-- [ ] 11.7 Complete a prompt/response cycle and confirm a new session row with cost and tokens (paste the row into `evidence.md`)
-- [ ] 11.8 Confirm a sub-agent session records `parent_session_id`
-- [ ] 11.9 Confirm `files_changed` is populated and line counts are 0
+- [x] 11.6 Start OpenCode 2.2.5 in this repository and confirm the plugin appears in the active plugin list and logs initialization; record the log file/stream in `evidence.md` §3
+- [x] 11.7 Complete a prompt/response cycle and confirm a new session row with cost and tokens (paste the row into `evidence.md`)
+- [x] 11.8 Confirm a sub-agent session records `parent_session_id`
+- [x] 11.9 Confirm `files_changed` is populated and line counts are 0
 - [ ] 11.10 Confirm a session in another project is attributed to that project
-- [ ] 11.11 Reload or remove the plugin and confirm the subscription aborts without an error log line
+- [x] 11.11 Reload or remove the plugin and confirm the subscription aborts without an error log line
 - [ ] 11.12 Confirm a V1 host attempting to load `0.5.0` fails to load while OpenCode still starts
 - [ ] 11.13 Human merges the release PR and publishes the release; this is outside agent scope and is the boundary between the automated pipeline and release
 

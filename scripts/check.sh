@@ -261,7 +261,7 @@ if [ -d "${LOG_DIR}" ]; then
 	# Match only the plugin's own log messages (message="[opencode-metrics] ..."),
 	# not log lines that incidentally contain the string in bash command output.
 	# Fatal startup conditions are failures, not just informational lines.
-	PLUGIN_FAILURES=$(grep -h '\[opencode-metrics\]' "${LOG_DIR}"/*.log 2>/dev/null \
+	PLUGIN_FAILURES=$(grep -hE '(message|msg)="\[opencode-metrics\]' "${LOG_DIR}"/*.log 2>/dev/null \
 		| grep -E 'initialization failed|unsupported @opencode/plugin' | tail -5 || true)
 	if [ -n "${PLUGIN_FAILURES}" ]; then
 		fail "Plugin reported a fatal startup condition (metrics collection disabled):"
@@ -270,15 +270,33 @@ if [ -d "${LOG_DIR}" ]; then
 		done
 	fi
 
-	LOG_LINES=$(grep -h '\[opencode-metrics\]' "${LOG_DIR}"/*.log 2>/dev/null \
+	LOG_LINES=$(grep -hE '(message|msg)="\[opencode-metrics\]' "${LOG_DIR}"/*.log 2>/dev/null \
 		| tail -5 || true)
 	if [ -n "${LOG_LINES}" ]; then
 		echo "${LOG_LINES}" | while IFS= read -r line; do
 			dim "${line}"
 		done
+
+		# OpenCode 2.x does not route plugin console.* output into this log
+		# directory, so stale V1 lines can look healthy. Compare the newest
+		# matching line with the newest recorded session and say so.
+		if [ -f "${DB_PATH}" ] && command -v sqlite3 >/dev/null 2>&1; then
+			NEWEST_SESSION=$(sqlite3 "${DB_PATH}" \
+				"SELECT date(MAX(ended_at)/1000,'unixepoch','localtime') FROM sessions;" \
+				2>/dev/null || echo "")
+			NEWEST_LOG=$(grep -hE '(message|msg)="\[opencode-metrics\]' "${LOG_DIR}"/*.log 2>/dev/null \
+				| tail -1 | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1 || echo "")
+			if [ -n "${NEWEST_SESSION}" ] && [ -n "${NEWEST_LOG}" ] \
+				&& [ "${NEWEST_LOG}" \< "${NEWEST_SESSION}" ]; then
+				warn "Newest plugin log line is ${NEWEST_LOG}; newest session is ${NEWEST_SESSION}"
+				dim "OpenCode 2.x sends plugin console output to the process stdout/TUI, not to ${LOG_DIR}/."
+				dim "The database checks above are authoritative; treat this section as V1-only history."
+			fi
+		fi
 	else
 		warn "No [opencode-metrics] messages found in ${LOG_DIR}/"
-		dim "The plugin may not have been loaded, or logs may have rotated."
+		dim "On OpenCode 2.x this is expected: plugin console output goes to stdout/TUI."
+		dim "Use the database checks above to confirm collection."
 	fi
 else
 	warn "OpenCode log directory not found: ${LOG_DIR}"

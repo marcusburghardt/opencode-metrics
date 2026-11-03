@@ -66,10 +66,12 @@ from previous releases.
 ### Line counts are recorded as 0
 
 `lines_added` and `lines_deleted` are recorded as 0 for sessions captured
-through the OpenCode V2 plugin API, because V2 does not expose session diff
-data to plugins. `files_changed` is still populated, from the distinct files
-reported in assistant session snapshots. Code-impact charts will show a flat
-zero line for V2-era sessions; this is expected, not data loss.
+through the OpenCode V2 plugin API: OpenCode stores a diff summary, but the
+plugin API does not expose it (`Session.Info` carries none, and the plugin
+context omits `session.diff`). `files_changed` is still populated, from the
+distinct files reported in assistant session snapshots. Code-impact charts
+will show a flat zero line for V2-era sessions; this is expected, not data
+loss.
 
 ### Backfill does not cover OpenCode V2 sessions
 

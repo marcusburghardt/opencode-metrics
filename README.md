@@ -297,17 +297,18 @@ provisioning.
    `measurement_deltas` and `cost_pricing` are part of the current schema,
    and the `v_` prefixes are SQL views over the base tables.
 
-3. **Check the plugin log line** (secondary) — OpenCode forwards the
-   plugin's `console.*` output to its log directory. A healthy start logs:
+3. **Check the plugin log line** (secondary) — some host versions forward the
+   plugin's `console.*` output to their log directory; OpenCode 2.2.5 sends it
+   to the process stdout/TUI instead. A healthy start logs:
 
    ```
    [opencode-metrics] initialized
    ```
 
    Look in `~/.local/share/opencode/log/` (or
-   `$XDG_DATA_HOME/opencode/log/` when `$XDG_DATA_HOME` is set). Log
-   capture location varies by host version and logs rotate, so a missing
-   line is not by itself evidence of failure — rely on step 1.
+   `$XDG_DATA_HOME/opencode/log/` when `$XDG_DATA_HOME` is set) if your host
+   captures it there. Capture location varies by host version and logs rotate,
+   so a missing line is not by itself evidence of failure — rely on step 1.
 
 ## Historical Data Backfill
 
@@ -1797,7 +1798,7 @@ sqlite3 ~/.local/share/opencode-metrics/metrics.db "PRAGMA user_version;"
 ```
 
 The session count must increase after a new session, and `user_version`
-must report `5`. The `[opencode-metrics] initialized` log line is a
+must report `6`. The `[opencode-metrics] initialized` log line is a
 secondary signal only; see
 [Verifying the installation](#verifying-the-installation).
 
