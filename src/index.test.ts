@@ -11,7 +11,14 @@ import type { CostPricingRule, MetricsConfig } from "./config";
 import { initDatabase } from "./db";
 import { DEFAULT_CONFIG } from "./defaults";
 import type { MessageInfo, ProjectInfo, SDKClient, SessionInfo } from "./extractor";
-import { createSDKAdapter, handleSessionIdle, runSubscriptionLoop, setupPlugin } from "./index";
+import {
+	CaptureDebouncer,
+	createSDKAdapter,
+	handleSessionEvent,
+	handleSessionIdle,
+	runSubscriptionLoop,
+	setupPlugin,
+} from "./index";
 import { syncCostPricing } from "./pricing";
 import { isVersionSupported, resolvePluginVersion } from "./version";
 
@@ -91,6 +98,47 @@ function makeClient(
 
 	return { client, logs };
 }
+
+describe("CaptureDebouncer", () => {
+	it("evicts stale sessions so the map stays bounded", () => {
+		let now = 0;
+		const debouncer = new CaptureDebouncer(100, () => now);
+
+		expect(debouncer.tryAcquire("a")).toBe(true);
+		now = 50;
+		expect(debouncer.tryAcquire("b")).toBe(true);
+		expect(debouncer.size).toBe(2);
+
+		now = 101;
+		expect(debouncer.tryAcquire("c")).toBe(true);
+		// "a" is 101ms old and is evicted; "b" is still within the window.
+		expect(debouncer.size).toBe(2);
+	});
+
+	it("evicts entries older than the window", () => {
+		let now = 0;
+		const debouncer = new CaptureDebouncer(100, () => now);
+
+		debouncer.tryAcquire("a");
+		now = 150;
+		debouncer.tryAcquire("b");
+		expect(debouncer.size).toBe(1);
+	});
+
+	it("counts a skipped event only when no capture is recorded", () => {
+		let now = 0;
+		const debouncer = new CaptureDebouncer(100, () => now);
+
+		expect(debouncer.tryAcquire("a")).toBe(true);
+		now = 50;
+		expect(debouncer.tryAcquire("a")).toBe(false);
+		now = 99;
+		// Still within the window measured from the first capture at t=0.
+		expect(debouncer.tryAcquire("a")).toBe(false);
+		now = 100;
+		expect(debouncer.tryAcquire("a")).toBe(true);
+	});
+});
 
 describe("handleSessionIdle", () => {
 	let tempDir: string;
@@ -731,6 +779,18 @@ function idleEvent(sessionID: string): unknown {
 	return { type: "session.status", data: { sessionID, status: { type: "idle" } } };
 }
 
+function statusEvent(sessionID: string, statusType: string): unknown {
+	return { type: "session.status", data: { sessionID, status: { type: statusType } } };
+}
+
+function sessionIdleEvent(sessionID: string): unknown {
+	return { type: "session.idle", data: { sessionID } };
+}
+
+function executionEvent(kind: string, sessionID: string): unknown {
+	return { type: `session.execution.${kind}`, data: { sessionID } };
+}
+
 function emptyStream(): AsyncIterable<unknown> {
 	return {
 		[Symbol.asyncIterator]() {
@@ -962,7 +1022,12 @@ describe("event subscription loop", () => {
 		const runtime = await makeRuntime(client);
 		const controller = new AbortController();
 
-		await runSubscriptionLoop(ctx, runtime, { sleep: async () => {} }, controller.signal);
+		await runSubscriptionLoop(
+			ctx,
+			runtime,
+			{ sleep: async () => {}, captureDebounceMs: 0 },
+			controller.signal,
+		);
 
 		expect(violation).toBe(false);
 
@@ -1002,6 +1067,245 @@ describe("event subscription loop", () => {
 			};
 			expect(count.count).toBe(0);
 			expect(capture.error).toEqual([]);
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("captures for every terminal event family", async () => {
+		const { ctx } = makeEventContext(() =>
+			finiteStream([
+				statusEvent("sess-status-idle", "idle"),
+				sessionIdleEvent("sess-session-idle"),
+				executionEvent("succeeded", "sess-exec-ok"),
+				executionEvent("failed", "sess-exec-fail"),
+				executionEvent("interrupted", "sess-exec-int"),
+			]),
+		);
+		const runtime = await makeRuntime();
+		await runSubscriptionLoop(
+			ctx,
+			runtime,
+			{ sleep: async () => {}, captureDebounceMs: 0 },
+			new AbortController().signal,
+		);
+
+		const rows = runtime.db
+			.prepare("SELECT session_id FROM sessions ORDER BY session_id")
+			.all() as Array<{ session_id: string }>;
+		expect(rows.map((row) => row.session_id)).toEqual([
+			"sess-exec-fail",
+			"sess-exec-int",
+			"sess-exec-ok",
+			"sess-session-idle",
+			"sess-status-idle",
+		]);
+	});
+
+	it("subscribes to every lifecycle event family", async () => {
+		const { ctx, subscribeCalls } = makeEventContext(() => emptyStream());
+		const runtime = await makeRuntime();
+		await runSubscriptionLoop(
+			ctx,
+			runtime,
+			{ sleep: async () => {} },
+			new AbortController().signal,
+		);
+
+		expect(subscribeCalls[0]?.types).toEqual([
+			"session.status",
+			"session.idle",
+			"session.execution.succeeded",
+			"session.execution.failed",
+			"session.execution.interrupted",
+		]);
+	});
+
+	it("collapses duplicate terminal events within the window into one capture", async () => {
+		const capture = captureConsole();
+		try {
+			const { ctx } = makeEventContext(() =>
+				finiteStream([
+					idleEvent("sess-dupe"),
+					sessionIdleEvent("sess-dupe"),
+					executionEvent("succeeded", "sess-dupe"),
+				]),
+			);
+			const runtime = await makeRuntime();
+			await runSubscriptionLoop(
+				ctx,
+				runtime,
+				{ sleep: async () => {}, captureDebounceMs: 750, now: () => 1000 },
+				new AbortController().signal,
+			);
+
+			const count = runtime.db.prepare("SELECT COUNT(*) AS count FROM sessions").get() as {
+				count: number;
+			};
+			expect(count.count).toBe(1);
+			const skips = capture.info.filter((line) => line.includes("skipping duplicate capture"));
+			expect(skips.length).toBe(2);
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("captures again once the debounce window has elapsed", async () => {
+		const times = [1000, 2000];
+		let index = 0;
+		let getCalls = 0;
+		const base = makeClient();
+		const client: SDKClient = {
+			...base.client,
+			session: {
+				...base.client.session,
+				get: async (id) => {
+					getCalls += 1;
+					return base.client.session.get(id);
+				},
+			},
+		};
+		const { ctx } = makeEventContext(() =>
+			finiteStream([idleEvent("sess-window"), sessionIdleEvent("sess-window")]),
+		);
+		const runtime = await makeRuntime(client);
+		await runSubscriptionLoop(
+			ctx,
+			runtime,
+			{ sleep: async () => {}, captureDebounceMs: 750, now: () => times[index++] ?? 2000 },
+			new AbortController().signal,
+		);
+
+		expect(getCalls).toBe(2);
+	});
+
+	it("does not move the timestamp when an event is debounced", async () => {
+		// 1000 captures; 1100 is skipped; 1800 is 800ms after the last real
+		// capture and must still capture. If the skip bumped the timestamp to
+		// 1100, 1800 would fall inside the window and be dropped.
+		const times = [1000, 1100, 1800];
+		let index = 0;
+		let getCalls = 0;
+		const base = makeClient();
+		const client: SDKClient = {
+			...base.client,
+			session: {
+				...base.client.session,
+				get: async (id) => {
+					getCalls += 1;
+					return base.client.session.get(id);
+				},
+			},
+		};
+		const { ctx } = makeEventContext(() =>
+			finiteStream([
+				idleEvent("sess-skip"),
+				sessionIdleEvent("sess-skip"),
+				executionEvent("succeeded", "sess-skip"),
+			]),
+		);
+		const runtime = await makeRuntime(client);
+		await runSubscriptionLoop(
+			ctx,
+			runtime,
+			{ sleep: async () => {}, captureDebounceMs: 750, now: () => times[index++] ?? 1800 },
+			new AbortController().signal,
+		);
+
+		expect(getCalls).toBe(2);
+	});
+
+	it("warns and skips malformed payloads for every family", async () => {
+		const capture = captureConsole();
+		try {
+			const families = [
+				"session.status",
+				"session.idle",
+				"session.execution.succeeded",
+				"session.execution.failed",
+				"session.execution.interrupted",
+			];
+			const events: unknown[] = [];
+			for (const type of families) {
+				events.push({ type, data: null });
+				events.push({ type, data: { sessionID: "" } });
+			}
+			const { ctx } = makeEventContext(() => finiteStream(events));
+			const runtime = await makeRuntime();
+			await runSubscriptionLoop(
+				ctx,
+				runtime,
+				{ sleep: async () => {}, captureDebounceMs: 0 },
+				new AbortController().signal,
+			);
+
+			const count = runtime.db.prepare("SELECT COUNT(*) AS count FROM sessions").get() as {
+				count: number;
+			};
+			expect(count.count).toBe(0);
+			const warnings = capture.warn.filter((line) => line.includes("skipping"));
+			expect(warnings.length).toBe(10);
+			for (const type of families) {
+				expect(warnings.some((line) => line.includes(`${type} event with missing data`))).toBe(
+					true,
+				);
+				expect(
+					warnings.some((line) => line.includes(`${type} event with missing session id`)),
+				).toBe(true);
+			}
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("treats a capture that throws as an attempt (no retry storm)", async () => {
+		const capture = captureConsole();
+		let getCalls = 0;
+		const base = makeClient();
+		const failingOnce: SDKClient = {
+			...base.client,
+			session: {
+				...base.client.session,
+				get: async (id) => {
+					getCalls += 1;
+					if (getCalls === 1) throw new Error("sdk boom");
+					return base.client.session.get(id);
+				},
+			},
+		};
+		try {
+			const { ctx } = makeEventContext(() =>
+				finiteStream([idleEvent("sess-throw"), sessionIdleEvent("sess-throw")]),
+			);
+			const runtime = await makeRuntime(failingOnce);
+			await runSubscriptionLoop(
+				ctx,
+				runtime,
+				{ sleep: async () => {}, captureDebounceMs: 750, now: () => 1000 },
+				new AbortController().signal,
+			);
+
+			// The second event is debounced even though the first attempt threw.
+			expect(getCalls).toBe(1);
+			expect(capture.error.some((line) => line.includes("sdk boom"))).toBe(true);
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("ignores unknown event types silently", async () => {
+		const capture = captureConsole();
+		try {
+			const runtime = await makeRuntime();
+			await handleSessionEvent({ type: "lsp.updated", data: { sessionID: "sess-x" } }, runtime);
+			await handleSessionEvent({ type: "message.updated" }, runtime);
+
+			expect(capture.warn).toEqual([]);
+			expect(capture.error).toEqual([]);
+			const count = runtime.db.prepare("SELECT COUNT(*) AS count FROM sessions").get() as {
+				count: number;
+			};
+			expect(count.count).toBe(0);
 		} finally {
 			capture.restore();
 		}

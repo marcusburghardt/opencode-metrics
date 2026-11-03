@@ -57,13 +57,13 @@ buildable at every step.
 - [x] 4.1 Replace the default plugin function with `Plugin.define({ id: "opencode-metrics", setup(ctx) })`
 - [x] 4.2 Extract shared initialization (database, config, pricing sync, caches) into a helper used by `setup` (see `design.md` §7)
 - [x] 4.3 Wrap initialization in a try/catch that logs via `console.error`, does not start the subscription, and returns a no-op cleanup
-- [x] 4.4 Replace the `Hooks.event` callback with a background `ctx.event.subscribe({ types: ["session.status"], signal })` loop that awaits each event before consuming the next
+- [x] 4.4 Replace the `Hooks.event` callback with a background `ctx.event.subscribe({ types: ["session.status", "session.idle", "session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"], signal })` loop that awaits each event before consuming the next, and debounce duplicate terminal events per session
 - [x] 4.5 Read `event.data.sessionID` and `event.data.status.type`; keep the idle filter and validate the payload shape before use
 - [x] 4.6 Wrap the subscription loop in a try/catch that logs stream errors, makes at most three subscribe attempts (two resubscriptions) with a doubling backoff, and logs a terminal-stop line distinguishable from normal completion
 - [x] 4.7 Return `() => controller.abort()` from `setup` as the cleanup function
 - [x] 4.8 Replace every `client.app.log` call with `console.info` / `console.warn` / `console.error`, keeping the `[opencode-metrics]` prefix and logging metadata only
 - [x] 4.9 Keep `handleSessionIdle` and its classification caches unchanged
-- [x] 4.10 Accept optional injected `{ sleep, retryBaseDelayMs, maxSubscribeAttempts, pluginVersion }` in `setup`, and implement the `>=2.2.5 <3.0.0` version check (log + no-op cleanup + no subscription on mismatch). Read the runtime version from a single helper used by both `setup` and `scripts/check.sh`; the helper MUST accept an injectable resolution root (default: the module's own directory) so tests and `check.sh` can point it at a fixture tree. Prereleases outside the range count as out-of-range
+- [x] 4.10 Accept optional injected `{ sleep, retryBaseDelayMs, maxSubscribeAttempts, captureDebounceMs, now, pluginVersion }` in `setup`, and implement the `>=2.2.5 <3.0.0` version check (log + no-op cleanup + no subscription on mismatch). Read the runtime version from a single helper used by both `setup` and `scripts/check.sh`; the helper MUST accept an injectable resolution root (default: the module's own directory) so tests and `check.sh` can point it at a fixture tree. Prereleases outside the range count as out-of-range
 
 ## 5. Remove the V1 Dependency
 
@@ -78,11 +78,11 @@ Sequential by definition — this is the point where the tree stops importing
 
 ## 6. Loaders, Install, and Diagnostics
 
-- [x] 6.1 Move the local loader to `.opencode/plugins/opencode-metrics/index.ts` with a default export (matching the install layout)
-- [x] 6.2 Update the `make install` target to emit a directory (`~/.config/opencode/plugins/opencode-metrics/index.ts`) with a default export, removing any legacy `opencode-metrics.ts` first
-- [x] 6.3 Make `make install` idempotent and set permissions explicitly (directory `0o755`, file `0o644`)
-- [x] 6.4 Add a `make uninstall` target that removes both the legacy file and the directory loader
-- [x] 6.5 Update the install target's printed instructions to reference adding the directory to the `plugins` array and to mention `make uninstall`
+- [x] 6.1 Move the local loader to `.opencode/plugins/opencode-metrics.ts` as a flat file with a default export (the proven form; a directory is not required)
+- [x] 6.2 Update the `make install` target to emit a flat loader file (`~/.config/opencode/plugins/opencode-metrics.ts`) with a default export, removing any legacy `opencode-metrics/` directory first
+- [x] 6.3 Make `make install` idempotent and set permissions explicitly (file `0o644`)
+- [x] 6.4 Add a `make uninstall` target that removes both the flat loader file and any legacy directory loader
+- [x] 6.5 Update the install target's printed instructions to state that the file is auto-discovered from the plugins directory (or can be listed in the `plugins` array) and to mention `make uninstall`
 - [x] 6.6 Update `scripts/check.sh` loader detection: accept default-export files and directories, report a legacy named-export file as a migration warning, and surface the resolved `@opencode/plugin` version (flag a guard-rejected version as FAIL)
 - [x] 6.7 Update `scripts/check.sh` log matching to the `console.*` output shape produced by OpenCode 2.2.5 (validated in task 11.3), and derive `LOG_DIR` from the same XDG logic as `DATA_DIR`
 - [x] 6.8 Add a `scripts/check.sh` check that the plugin is present in the project's `opencode.json` `plugins` list
@@ -122,7 +122,7 @@ README tasks are ordered; the `QUICK_START.md` rewrite (9.11) follows them,
 with only the README-only wording normalization parallelized.
 
 - [x] 9.1 Update the README prerequisite from V1 to OpenCode V2 (2.2+)
-- [x] 9.2 Update the README install examples for the published package and local-directory loading, including that a local checkout needs runtime dependencies installed
+- [x] 9.2 Update the README install examples for the published package and local flat-file loading, including that a local checkout needs runtime dependencies installed
 - [x] 9.3 Document the session diff limitation inline at the metric reference rows (`lines_added`/`lines_deleted`), the "Lines changed over time" query, and the code-impact guidance
 - [x] 9.4 Document that V1 users must pin the previous line, naming `0.4.x` explicitly, with the pin command
 - [x] 9.5 Rewrite the README upgrade section: host requirement first, pin/rollback, three behavior changes, what stops being populated, and that historical rows are not re-attributed
@@ -131,9 +131,9 @@ with only the README-only wording normalization parallelized.
 - [x] 9.8 Update the README verification section to lead with a database query and treat the log line as secondary
 - [x] 9.9 Add the backfill coverage caveat to README and state that `make backfill` does not close the V2-era gap
 - [x] 9.10 Refresh the README verification output expectations (table list, `PRAGMA user_version`) while the section is open
-- [x] 9.11 Update `QUICK_START.md`: host prerequisite, directory loader path, remove the "restart to activate" guidance, add the code-impact zero-baseline caveat, add the backfill coverage caveat, and correct the expected backfill output
+- [x] 9.11 Update `QUICK_START.md`: host prerequisite, flat loader file path, remove the "restart to activate" guidance, add the code-impact zero-baseline caveat, add the backfill coverage caveat, and correct the expected backfill output
 - [x] 9.12 [P] Normalize `plugins` (not `plugin`) in `README.md` only (`QUICK_START.md` is covered by 9.11)
-- [x] 9.13 Update the README Uninstalling section: remove the loader entry, remove a locally installed loader directory, and reference `make uninstall`
+- [x] 9.13 Update the README Uninstalling section: remove the loader entry, remove a locally installed loader file or directory, and reference `make uninstall`
 - [x] 9.14 Refresh the README metric reference table from the updated `METRIC_DEFINITIONS` so it matches the catalog, including `cost` (own session only), `files_changed` (assistant snapshots), `messages_total` (conversation messages), and the line-count limitation
 
 ## 10. Release

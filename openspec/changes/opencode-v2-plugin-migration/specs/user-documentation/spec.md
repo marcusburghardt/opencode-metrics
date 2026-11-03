@@ -40,7 +40,8 @@ prerequisites, ordered steps, verification, and rollback.
 - **GIVEN** a user has the V1 plugin line installed
 - **WHEN** they follow the migration guide
 - **THEN** it SHALL tell them to upgrade OpenCode first
-- **AND** SHALL explain the loader change (default export; directory layout)
+- **AND** SHALL explain the loader change (default export; a loader file, or a
+  directory containing `index.ts`)
 - **AND** SHALL tell them how to verify collection after migrating
 - **AND** SHALL tell them how to roll back
 
@@ -53,12 +54,13 @@ version prerequisite and no local-directory loading model. -->
 
 The README.md SHALL include a complete installation guide covering the npm
 plugin installation method, verification steps, and alternative installation
-via a local directory. The guide SHALL state the minimum supported OpenCode
-version for the current release line. The guide SHALL be actionable by a user
-who has never used an OpenCode plugin before. A local-directory installation
-SHALL explain that runtime dependencies must be resolvable (a `bun install`
-or equivalent), because the plugin's OpenCode API package is a runtime
-dependency.
+via a local default-export loader **file**. A directory containing `index.ts`
+with a default export SHALL also be accepted. The guide SHALL state the
+minimum supported OpenCode version for the current release line. The guide
+SHALL be actionable by a user who has never used an OpenCode plugin before. A
+local installation SHALL explain that runtime dependencies must be resolvable
+(a `bun install` or equivalent), because the plugin's OpenCode API package is
+a runtime dependency.
 
 #### Scenario: New user installs the plugin
 
@@ -69,13 +71,15 @@ dependency.
 - **AND** verify the plugin loaded
 - **AND** verify metrics.db was created in the data directory
 
-#### Scenario: Local-directory install
+#### Scenario: Local loader install
 
 - **GIVEN** a user installs from a local checkout
 - **WHEN** they follow the documented steps
 - **THEN** the guide SHALL require installing runtime dependencies before
   building
-- **AND** SHALL show the directory layout the loader expects
+- **AND** SHALL show the default-export loader file the install writes
+  (`~/.config/opencode/plugins/opencode-metrics.ts`)
+- **AND** MAY note that a directory containing `index.ts` is also accepted
 
 ### Requirement: Verification Documentation
 

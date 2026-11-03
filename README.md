@@ -27,19 +27,19 @@ No separate `npm install` required — OpenCode resolves the plugin on
 startup.
 
 Install from a local checkout by installing runtime dependencies, building,
-and writing the directory loader:
+and writing the loader file:
 
 ```sh
 git clone https://github.com/marcusburghardt/opencode-metrics.git
 cd opencode-metrics
 bun install   # required: @opencode/plugin is a runtime dependency
 make build
-make install  # writes ~/.config/opencode/plugins/opencode-metrics/index.ts
+make install  # writes ~/.config/opencode/plugins/opencode-metrics.ts
 ```
 
 ```jsonc
 {
-  "plugins": ["~/.config/opencode/plugins/opencode-metrics"]
+  "plugins": ["~/.config/opencode/plugins/opencode-metrics.ts"]
 }
 ```
 
@@ -212,26 +212,30 @@ bun install
 make build
 ```
 
-OpenCode V2 loads a **directory** whose `index.ts` has a default export.
-`make install` writes that layout for you, globally:
+OpenCode V2 loads a plugin **file** with a default export (a directory
+containing `index.ts` is also accepted). `make install` writes the flat form
+for you, globally:
 
 ```
-~/.config/opencode/plugins/opencode-metrics/
-└── index.ts          # export default plugin;
+~/.config/opencode/plugins/
+└── opencode-metrics.ts   # export default plugin;
 ```
 
 ```sh
-make install   # build + write the global loader directory
+make install   # build + write the global loader file
 make uninstall # remove it again
 ```
 
-Reference the loader directory in your OpenCode config:
+Reference the loader file in your OpenCode config:
 
 ```jsonc
 {
-  "plugins": ["~/.config/opencode/plugins/opencode-metrics"]
+  "plugins": ["~/.config/opencode/plugins/opencode-metrics.ts"]
 }
 ```
+
+The plugin is also auto-discovered from the plugins directory, so listing it
+explicitly is optional.
 
 Alternatively, skip the loader and point the `plugins` array straight at the
 built entry point (configured via `"main"` in `package.json`):
@@ -1759,10 +1763,11 @@ to move to the `0.5.x` line.
    make build
    ```
 
-3. **Replace a V1 loader.** OpenCode V2 expects a directory whose `index.ts`
-   has a **default export**. `make install` writes the V2 layout
-   (`~/.config/opencode/plugins/opencode-metrics/index.ts`) and removes the
-   legacy `opencode-metrics.ts` file:
+3. **Replace a V1 loader.** OpenCode V2 expects a plugin **file** with a
+   **default export** (a directory containing `index.ts` also works).
+   `make install` writes the flat form
+   (`~/.config/opencode/plugins/opencode-metrics.ts`) and removes any legacy
+   directory loader:
 
    ```sh
    make install
@@ -1771,12 +1776,12 @@ to move to the `0.5.x` line.
    If you maintain the loader by hand, replace the named export with
    `export default plugin;`.
 
-4. **Register the loader** in your `opencode.json` `plugins` array (the
-   directory, not a single file):
+4. **Register the loader** (optional — the plugins directory is
+   auto-discovered) in your `opencode.json` `plugins` array:
 
    ```jsonc
    {
-     "plugins": ["~/.config/opencode/plugins/opencode-metrics"]
+     "plugins": ["~/.config/opencode/plugins/opencode-metrics.ts"]
    }
    ```
 
@@ -1830,13 +1835,13 @@ a downgrade does not require restoring a backup.
    make uninstall
    ```
 
-   It removes both the V2 directory loader
-   (`~/.config/opencode/plugins/opencode-metrics/`) and the legacy V1
-   `opencode-metrics.ts` file. To remove the directory by hand:
+   It removes both the V2 loader file
+   (`~/.config/opencode/plugins/opencode-metrics.ts`) and any legacy
+   directory loader. To remove them by hand:
 
    ```sh
-   rm -rf ~/.config/opencode/plugins/opencode-metrics
    rm -f ~/.config/opencode/plugins/opencode-metrics.ts
+   rm -rf ~/.config/opencode/plugins/opencode-metrics
    ```
 
 3. (Optional) Delete the data directory:
@@ -1936,22 +1941,23 @@ collected and `opencode.json` does not list it.
 
 **Causes and fixes:**
 
-- **Loader not listed:** a loader directory is only loaded when it appears
-  in an `opencode.json` `plugins` array. Add it:
+- **Loader not listed:** a loader is only loaded when it is auto-discovered
+  in the plugins directory or appears in an `opencode.json` `plugins` array.
+  Add it:
 
   ```jsonc
   {
-    "plugins": ["~/.config/opencode/plugins/opencode-metrics"]
+    "plugins": ["~/.config/opencode/plugins/opencode-metrics.ts"]
   }
   ```
 
 - **Legacy named export:** OpenCode V2 requires a **default export**. A V1
   loader that ends with a named export (for example
   `export const plugin = ...`) loads but does not register. Re-run
-  `make install` to write the V2 directory layout at
-  `~/.config/opencode/plugins/opencode-metrics/index.ts`, or change the
+  `make install` to write the flat loader at
+  `~/.config/opencode/plugins/opencode-metrics.ts`, or change the
   last line to `export default plugin;`.
-- **Loader points at a missing build:** the generated `index.ts` imports
+- **Loader points at a missing build:** the generated loader imports
   the checkout's `dist/index.js`. Run `make build` in that checkout.
 
 #### Nothing collected after upgrade
@@ -1962,14 +1968,15 @@ after upgrading OpenCode and the plugin.
 **Causes and fixes:**
 
 - **Host still on V1:** see [Plugin loaded on an unsupported host](#plugin-loaded-on-an-unsupported-host).
-- **Install shaped for V1:** a leftover `opencode-metrics.ts` loader using a
-  named export. Run `make install` and confirm the directory layout.
+- **Install shaped for V1:** a leftover loader using a named export. Run
+  `make install` and confirm the flat default-export loader.
 - **Runtime dependency missing (local checkout):** `@opencode/plugin` is a
   runtime dependency. Run `bun install` in the checkout, then `make build`.
-- **Subscription stopped:** the plugin subscribes to `session.status`
-  events. If the event stream ends after repeated failures, an error line
-  explains why and the plugin stops subscribing for that session. Restart
-  OpenCode after fixing the cause.
+- **Subscription stopped:** the plugin subscribes to `session.status`,
+  `session.idle`, and the `session.execution.*` event families. If the event
+  stream ends after repeated failures, an error line explains why and the
+  plugin stops subscribing for that session. Restart OpenCode after fixing
+  the cause.
 - **Gap during the upgrade:** sessions that ran entirely between the V1
   plugin stopping and the V2 plugin starting are not captured, and
   `make backfill` does not recover them.

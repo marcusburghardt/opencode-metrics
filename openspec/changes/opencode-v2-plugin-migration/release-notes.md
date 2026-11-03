@@ -30,8 +30,8 @@ opencode-metrics `0.5.0` targets the OpenCode V2 plugin API
 
 1. Upgrade OpenCode to 2.2 or later.
 2. Upgrade the plugin.
-3. If you use a local loader, replace it with the directory form
-   (`~/.config/opencode/plugins/opencode-metrics/index.ts`) or re-run
+3. If you use a local loader, replace it with the flat default-export file
+   (`~/.config/opencode/plugins/opencode-metrics.ts`) or re-run
    `make install`.
 4. Verify collection with the database query in the README verification
    section (a log line is not required).

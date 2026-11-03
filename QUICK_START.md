@@ -28,14 +28,14 @@ make install
 `bun install` is required: the plugin's OpenCode API package
 (`@opencode/plugin`) is a runtime dependency, not only a build-time one.
 
-`make install` builds the plugin and writes a global loader directory at
-`~/.config/opencode/plugins/opencode-metrics/index.ts` (a directory with a
-default export — the layout OpenCode V2 expects). List that directory in
-your `opencode.json` `plugins` array:
+`make install` builds the plugin and writes a global loader file at
+`~/.config/opencode/plugins/opencode-metrics.ts` (a default-export loader
+file — the form OpenCode V2 loads). List that file in your `opencode.json`
+`plugins` array (optional if the plugins directory is auto-discovered):
 
 ```jsonc
 {
-  "plugins": ["~/.config/opencode/plugins/opencode-metrics"]
+  "plugins": ["~/.config/opencode/plugins/opencode-metrics.ts"]
 }
 ```
 

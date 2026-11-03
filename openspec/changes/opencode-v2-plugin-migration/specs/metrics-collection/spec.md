@@ -109,10 +109,13 @@ alongside per-session project attribution and session diff statistics.
 
 ### Requirement: Sequential event handling
 
-The plugin SHALL process session status events sequentially: each event SHALL
-be fully handled before the next event is consumed, so at most one write per
-session is in flight. This bounds the subscription buffer and prevents
-double-counted measurement deltas.
+The plugin SHALL process session lifecycle events sequentially: each event
+SHALL be fully handled before the next event is consumed, so at most one write
+per session is in flight. This bounds the subscription buffer and prevents
+double-counted measurement deltas. Terminal events for one turn SHALL be
+debounced per session (default window 750 ms, injectable for tests) so that
+one turn produces one capture. The debounce state SHALL be bounded: entries
+older than the window SHALL be evicted.
 
 #### Scenario: Overlapping idle events do not double-count deltas
 
@@ -193,17 +196,24 @@ arguments.
 capture session metrics on every transition to idle state. The plugin SHALL
 query the OpenCode SDK client for session details..." -->
 
-The plugin SHALL subscribe to the V2 event stream with
-`ctx.event.subscribe({ types: ["session.status"], signal })` and capture
-session metrics on every idle transition, reading the session identifier from
-`event.data.sessionID` and the status from `event.data.status.type`. The
-plugin SHALL query the V2 plugin context for session details
-(`ctx.session.get()`, `ctx.session.context()`) and write them to the metrics
-database. The plugin SHALL NOT require any user interaction after initial
-installation for metrics to be collected. The extraction pipeline SHALL
-propagate the SDK session's `parentID` field into the stored session record as
-`parent_session_id`. When `parentID` is undefined or null, `parent_session_id`
-SHALL be stored as NULL.
+The plugin SHALL subscribe to the V2 session lifecycle event stream with
+`ctx.event.subscribe({ types: ["session.status", "session.idle",
+"session.execution.succeeded", "session.execution.failed",
+"session.execution.interrupted"], signal })` and capture session metrics when
+a turn reaches a terminal state. A terminal state is a `session.status` event
+whose `data.status.type` is `idle`, any `session.idle` event, or any
+`session.execution.succeeded`, `session.execution.failed`, or
+`session.execution.interrupted` event. The plugin SHALL read the session
+identifier from `event.data.sessionID`. Non-terminal `session.status`
+transitions (`busy`, `retry`) SHALL NOT trigger a capture. Because several
+terminal families can fire for one turn, captures SHALL be debounced per
+session so one turn produces one capture. The plugin SHALL query the V2 plugin
+context for session details (`ctx.session.get()`, `ctx.session.context()`) and
+write them to the metrics database. The plugin SHALL NOT require any user
+interaction after initial installation for metrics to be collected. The
+extraction pipeline SHALL propagate the SDK session's `parentID` field into
+the stored session record as `parent_session_id`. When `parentID` is undefined
+or null, `parent_session_id` SHALL be stored as NULL.
 
 `cost` and `tokens_*` SHALL represent the session's own cumulative values as
 reported by `Session.Info`, and SHALL NOT include the values of child
@@ -294,9 +304,32 @@ OpenCode exposes session diff data to plugins.
 
 #### Scenario: Non-idle status transitions are ignored
 
-- **GIVEN** the plugin is subscribed to `session.status`
-- **WHEN** an event arrives with `status.type` of `busy` or `retry`
+- **GIVEN** the plugin is subscribed to the lifecycle stream
+- **WHEN** a `session.status` event arrives with `status.type` of `busy` or
+  `retry`
 - **THEN** the plugin SHALL NOT query or write session metrics
+
+#### Scenario: `session.idle` triggers capture
+
+- **GIVEN** the plugin is subscribed to the lifecycle stream
+- **WHEN** a `session.idle` event arrives with a `data.sessionID`
+- **THEN** the plugin SHALL capture that session
+
+#### Scenario: `session.execution.succeeded` triggers capture
+
+- **GIVEN** the plugin is subscribed to the lifecycle stream
+- **WHEN** a terminal `session.execution.*` event arrives with a
+  `data.sessionID`
+- **THEN** the plugin SHALL capture that session
+
+#### Scenario: Duplicate terminal events for one turn produce one capture
+
+- **GIVEN** the same session emits a `session.status` idle event and a
+  `session.idle` event (or a terminal `session.execution.*` event) for one
+  turn
+- **WHEN** the plugin handles them within the debounce window
+- **THEN** only one capture SHALL be performed for that session
+- **AND** the duplicate events SHALL NOT move the debounce timestamp
 
 #### Scenario: Malformed event payload is skipped
 

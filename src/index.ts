@@ -20,6 +20,23 @@ const DEFAULT_RETRY_BASE_DELAY_MS = 500;
 const MAX_RETRY_DELAY_MS = 8000;
 /** Initial attempt plus two resubscriptions. */
 const DEFAULT_MAX_SUBSCRIBE_ATTEMPTS = 3;
+/** Default window used to collapse duplicate terminal events for one turn. */
+const DEFAULT_CAPTURE_DEBOUNCE_MS = 750;
+
+/**
+ * Event families that signal a turn may have reached a terminal state.
+ *
+ * V2 does not guarantee which family fires for a given turn, so we subscribe
+ * to all of them and deduplicate downstream. The `types` filter still keeps
+ * unrelated traffic (LSP updates, etc.) out of the stream.
+ */
+export const SESSION_LIFECYCLE_EVENT_TYPES = [
+	"session.status",
+	"session.idle",
+	"session.execution.succeeded",
+	"session.execution.failed",
+	"session.execution.interrupted",
+] as const;
 
 /** Optional injection points for tests and for hosts that need a custom root. */
 export interface SetupOptions {
@@ -29,6 +46,13 @@ export interface SetupOptions {
 	retryBaseDelayMs?: number;
 	/** Maximum subscribe attempts. Defaults to 3. */
 	maxSubscribeAttempts?: number;
+	/**
+	 * Window in which duplicate terminal events for the same session collapse
+	 * into one capture. Defaults to 750 ms. Set to 0 to disable debouncing.
+	 */
+	captureDebounceMs?: number;
+	/** Clock used by the capture debouncer. Defaults to `Date.now`. */
+	now?: () => number;
 	/** Override the resolved `@opencode/plugin` version (tests). */
 	pluginVersion?: string;
 	/** Root used to resolve `@opencode/plugin` (fixtures and `check.sh`). */
@@ -51,6 +75,10 @@ export interface SubscriptionLoopOptions {
 	sleep?: (delayMs: number) => Promise<void>;
 	retryBaseDelayMs?: number;
 	maxSubscribeAttempts?: number;
+	/** Duplicate-capture debounce window. Defaults to 750 ms. */
+	captureDebounceMs?: number;
+	/** Clock used by the capture debouncer. Defaults to `Date.now`. */
+	now?: () => number;
 	/** Invoked once, immediately after the first successful subscribe call. */
 	onSubscribed?: () => void;
 }
@@ -306,35 +334,103 @@ export function initializePlugin(ctx: Plugin.Context): PluginRuntime {
 }
 
 /**
- * Handle one V2 event. Validates the payload shape, filters to idle
- * transitions, and captures the session. A capture failure is logged and
- * swallowed so one bad session cannot stop the subscription.
+ * Collapse duplicate terminal events for one turn into a single capture.
+ *
+ * V2 may emit several lifecycle events for the same turn (for example
+ * `session.status` idle plus `session.execution.succeeded`). Keyed by session
+ * id, a capture is allowed at most once per window. The map is pruned on every
+ * event so a long-running process cannot grow it without bound.
+ *
+ * A skipped capture MUST NOT move the timestamp, otherwise a steady stream of
+ * duplicates could extend the window indefinitely. A capture that throws still
+ * counts as an attempt (the timestamp is recorded before the attempt) so a
+ * failing session does not retry-storm.
  */
-export async function handleSessionStatusEvent(
+export class CaptureDebouncer {
+	private readonly lastCaptureAt = new Map<string, number>();
+
+	constructor(
+		private readonly windowMs: number,
+		private readonly now: () => number,
+	) {}
+
+	/** Whether a capture is allowed now; records the attempt when allowed. */
+	tryAcquire(sessionId: string): boolean {
+		const timestamp = this.now();
+
+		// Evict stale entries first so the map only reflects the current window.
+		for (const [id, at] of this.lastCaptureAt) {
+			if (timestamp - at >= this.windowMs) this.lastCaptureAt.delete(id);
+		}
+
+		const previous = this.lastCaptureAt.get(sessionId);
+		if (previous !== undefined && timestamp - previous < this.windowMs) {
+			return false;
+		}
+
+		this.lastCaptureAt.set(sessionId, timestamp);
+		return true;
+	}
+
+	/** Number of tracked sessions; exposed for bounded-growth tests. */
+	get size(): number {
+		return this.lastCaptureAt.size;
+	}
+}
+
+/** Whether a `session.status` payload represents a terminal (idle) turn. */
+function isTerminalStatusEvent(eventType: string, data: Record<string, unknown>): boolean | null {
+	if (eventType !== "session.status") return true;
+
+	const status = isRecord(data.status) ? data.status : undefined;
+	if (!status) return null;
+	return status.type === "idle";
+}
+
+/**
+ * Handle one V2 lifecycle event. Validates the payload shape, decides whether
+ * the family represents a terminal turn, debounces duplicates, and captures
+ * the session. A capture failure is logged and swallowed so one bad session
+ * cannot stop the subscription.
+ *
+ * Exported for testing — this is the core event handling logic separated from
+ * the plugin boilerplate and SDK adapter.
+ */
+export async function handleSessionEvent(
 	event: unknown,
 	runtime: PluginRuntime,
+	debouncer?: CaptureDebouncer,
 ): Promise<void> {
-	if (!isRecord(event) || event.type !== "session.status") return;
+	if (!isRecord(event) || typeof event.type !== "string") return;
+	const eventType = event.type;
+	if (!(SESSION_LIFECYCLE_EVENT_TYPES as readonly string[]).includes(eventType)) return;
 
 	const data = isRecord(event.data) ? event.data : undefined;
 	if (!data) {
-		console.warn(`${LOG_PREFIX} skipping session.status event with missing data`);
+		console.warn(`${LOG_PREFIX} skipping ${eventType} event with missing data`);
 		return;
 	}
 
 	const sessionId = data.sessionID;
 	if (typeof sessionId !== "string" || sessionId.length === 0) {
-		console.warn(`${LOG_PREFIX} skipping session.status event with missing session id`);
+		console.warn(`${LOG_PREFIX} skipping ${eventType} event with missing session id`);
 		return;
 	}
 
-	const status = isRecord(data.status) ? data.status : undefined;
-	if (!status) {
-		console.warn(`${LOG_PREFIX} skipping session.status event with missing status`);
+	const terminal = isTerminalStatusEvent(eventType, data);
+	if (terminal === null) {
+		console.warn(`${LOG_PREFIX} skipping ${eventType} event with missing status`);
 		return;
 	}
+	// Non-terminal status transitions (busy/retry) are ignored silently.
+	if (!terminal) return;
 
-	if (status.type !== "idle") return;
+	if (debouncer && !debouncer.tryAcquire(sessionId)) {
+		console.info(
+			`${LOG_PREFIX} skipping duplicate capture for session ${sessionId} within debounce window`,
+		);
+		return;
+	}
 
 	try {
 		await handleSessionIdle(
@@ -351,7 +447,7 @@ export async function handleSessionStatusEvent(
 }
 
 /**
- * Consume the `session.status` stream sequentially until the signal aborts,
+ * Consume the session lifecycle stream sequentially until the signal aborts,
  * the stream completes, or the retry budget is exhausted.
  *
  * Sequential handling is required for correctness: `writeMetrics` reads the
@@ -367,30 +463,34 @@ export async function runSubscriptionLoop(
 	const sleep = options.sleep ?? defaultSleep;
 	const retryBaseDelayMs = options.retryBaseDelayMs ?? DEFAULT_RETRY_BASE_DELAY_MS;
 	const maxAttempts = Math.max(1, options.maxSubscribeAttempts ?? DEFAULT_MAX_SUBSCRIBE_ATTEMPTS);
+	const debouncer = new CaptureDebouncer(
+		options.captureDebounceMs ?? DEFAULT_CAPTURE_DEBOUNCE_MS,
+		options.now ?? Date.now,
+	);
 
 	let failures = 0;
 	let loggedSubscribe = false;
 
 	while (!signal.aborted) {
 		if (!loggedSubscribe) {
-			console.info(`${LOG_PREFIX} subscribed to session.status events`);
+			console.info(`${LOG_PREFIX} subscribed to session lifecycle events`);
 			loggedSubscribe = true;
 			options.onSubscribed?.();
 		}
 
 		try {
-			const stream = ctx.event.subscribe({ types: ["session.status"], signal });
+			const stream = ctx.event.subscribe({ types: SESSION_LIFECYCLE_EVENT_TYPES, signal });
 			for await (const event of stream) {
 				// A consumed event proves the stream is healthy; the next
 				// failure gets a fresh retry budget.
 				failures = 0;
 				if (signal.aborted) break;
-				await handleSessionStatusEvent(event, runtime);
+				await handleSessionEvent(event, runtime, debouncer);
 			}
 
 			// Abort is a normal shutdown, not a terminal stop.
 			if (signal.aborted) return;
-			console.info(`${LOG_PREFIX} session.status subscription completed`);
+			console.info(`${LOG_PREFIX} session lifecycle subscription completed`);
 			return;
 		} catch (error) {
 			// Identify abort by signal state, never by message text.
@@ -398,18 +498,18 @@ export async function runSubscriptionLoop(
 
 			failures += 1;
 			console.error(
-				`${LOG_PREFIX} session.status subscription failed (attempt ${failures}/${maxAttempts}): ${describeError(error)}`,
+				`${LOG_PREFIX} session lifecycle subscription failed (attempt ${failures}/${maxAttempts}): ${describeError(error)}`,
 			);
 
 			if (failures >= maxAttempts) {
 				console.error(
-					`${LOG_PREFIX} session.status subscription stopped after ${failures} attempts; metrics collection halted`,
+					`${LOG_PREFIX} session lifecycle subscription stopped after ${failures} attempts; metrics collection halted`,
 				);
 				return;
 			}
 
 			const delay = Math.min(retryBaseDelayMs * 2 ** (failures - 1), MAX_RETRY_DELAY_MS);
-			console.info(`${LOG_PREFIX} resubscribing to session.status events after ${delay}ms`);
+			console.info(`${LOG_PREFIX} resubscribing to session lifecycle events after ${delay}ms`);
 			await sleep(delay);
 		}
 	}
@@ -459,6 +559,8 @@ export async function setupPlugin(
 		sleep: options.sleep,
 		retryBaseDelayMs: options.retryBaseDelayMs,
 		maxSubscribeAttempts: options.maxSubscribeAttempts,
+		captureDebounceMs: options.captureDebounceMs,
+		now: options.now,
 		onSubscribed: options.onSubscribed,
 	};
 
@@ -480,9 +582,11 @@ export async function setupPlugin(
  * OpenCode metrics plugin definition.
  *
  * Automatically collects session metrics and writes them to a local SQLite
- * database. Listens for `session.status` events with idle status, then
- * extracts session data, classifies the session using configurable rules,
- * and writes metrics atomically.
+ * database. Listens for session lifecycle events that mark a terminal turn
+ * (idle status, `session.idle`, or a terminal `session.execution.*` event),
+ * then extracts session data, classifies the session using configurable rules,
+ * and writes metrics atomically. Duplicate terminal events for one turn are
+ * debounced into a single capture.
  */
 const plugin = Plugin.define({
 	id: "opencode-metrics",

@@ -81,27 +81,47 @@ plugin instance's location, not every session's. `Session.Info` provides
 Without this, sessions from other projects are written under the wrong
 `project_id`. The change is small and covered by extractor tests.
 
-### 2. Event subscription: typed `session.status` stream with AbortController
+### 2. Event subscription: all session lifecycle families with per-session debounce
 
 **Decision:** Subscribe with
-`ctx.event.subscribe({ types: ["session.status"], signal })` in a background
-async loop that `await`s each handler before pulling the next event. Treat
-`event.data.status.type === "idle"` as the capture trigger and read the session
-ID from `event.data.sessionID`. Return `() => controller.abort()` from
-`setup()` as the cleanup function.
+`ctx.event.subscribe({ types: ["session.status", "session.idle",
+"session.execution.succeeded", "session.execution.failed",
+"session.execution.interrupted"], signal })` in a background async loop that
+`await`s each handler before pulling the next event. Capture when a turn
+reaches a terminal state:
 
-**Rationale:** `session.status` preserves current behavior exactly (V1 also
-used idle transitions), and the `types` filter avoids decoding every event.
-V2 also emits `session.idle`, but switching to it would be an unnecessary
-behavior change. Sequential awaiting is required for correctness:
+- `session.status` with `event.data.status.type === "idle"` (ignore `busy` and
+  `retry`),
+- any `session.idle`, and
+- any `session.execution.succeeded`, `session.execution.failed`, or
+  `session.execution.interrupted`.
+
+Read the session ID from `event.data.sessionID`. Collapse duplicates with a
+per-session debounce (default 750 ms, injectable via `captureDebounceMs` and
+`now`). The debounce map evicts entries older than the window on every event,
+a skipped event does not move the timestamp, and a capture that throws still
+counts as an attempt. Return `() => controller.abort()` from `setup()` as the
+cleanup function.
+
+**Rationale:** `@opencode/client@2.2.5` lists all of these event families in
+`SubscribeOptions`, but emission is not guaranteed per family: a local
+flat-file plugin in OpenCode 2.2.5 uses only `session.execution.succeeded`, and
+other builds emit `session.status`/`session.idle`. Subscribing to all of them
+makes capture independent of which family a given host actually emits. Because
+several families can describe the same turn, deduplicating by session is
+required to preserve the one-capture-per-turn contract. Bounding the debounce
+map prevents unbounded growth in a long-running server. Recording the attempt
+before the write means a persistently failing session is not retried on every
+duplicate event. Sequential awaiting remains required for correctness:
 `writeSessionMetrics` computes `delta = new_value - previous_value` from a
 read-then-insert, so two overlapping handlers for the same session would both
 see the same `previous_value` and double-count the delta. Sequential
 processing also bounds the async iterator's buffer. The abort pattern is the
 documented V2 cleanup mechanism.
 
-**Alternative considered:** `session.idle`. Rejected for behavior parity; it
-carries only `sessionID` and does not express busy/retry transitions.
+**Alternative considered:** subscribing to `session.status` only. Rejected
+because the local OpenCode 2.2.5 environment demonstrates a plugin that relies
+on `session.execution.succeeded` and does not receive `session.status`.
 
 **Alternative considered:** concurrent handling with per-session write locks.
 Rejected as more code for no throughput benefit; capture is a local SQLite

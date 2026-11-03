@@ -62,23 +62,14 @@ GLOBAL_LOADER_DIR="${HOME}/.config/opencode/plugins/opencode-metrics"
 LOCAL_LOADER="${PROJECT_DIR}/.opencode/plugins/opencode-metrics.ts"
 LOCAL_LOADER_DIR="${PROJECT_DIR}/.opencode/plugins/opencode-metrics"
 
-# Accept a default-export loader in either a file or a directory layout.
-# OpenCode V2 requires a default export; V1 used a named export, so a
-# named-export file is reported as a migration warning rather than a failure.
+# Accept a default-export loader file first (the proven form), then a
+# directory containing index.ts. OpenCode V2 requires a default export; V1
+# used a named export, so a named-export file is reported as a migration
+# warning rather than a failure.
 check_loader() {
 	label="$1"
 	file="$2"
 	dir="$3"
-
-	if [ -f "${dir}/index.ts" ]; then
-		if grep -qE '^[[:space:]]*export default' "${dir}/index.ts" 2>/dev/null; then
-			pass "${label}: ${dir}/index.ts (directory, default export)"
-			return
-		fi
-		warn "${label} directory exists but index.ts has no default export"
-		dim "OpenCode V2 expects: export default plugin;"
-		return
-	fi
 
 	if [ -f "${file}" ]; then
 		if grep -qE '^[[:space:]]*export default' "${file}" 2>/dev/null; then
@@ -87,10 +78,20 @@ check_loader() {
 		fi
 		if grep -q 'export.*plugin' "${file}" 2>/dev/null; then
 			warn "${label}: legacy named-export loader at ${file}"
-			dim "V1 layout detected. Re-run 'make install' to migrate to the V2 directory loader."
+			dim "V1 layout detected. Re-run 'make install' to write a V2 default-export loader."
 			return
 		fi
 		fail "${label} exists but exports nothing usable — plugin will not register"
+		return
+	fi
+
+	if [ -f "${dir}/index.ts" ]; then
+		if grep -qE '^[[:space:]]*export default' "${dir}/index.ts" 2>/dev/null; then
+			pass "${label}: ${dir}/index.ts (directory, default export)"
+			return
+		fi
+		warn "${label} directory exists but index.ts has no default export"
+		dim "OpenCode V2 expects: export default plugin;"
 		return
 	fi
 
