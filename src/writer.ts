@@ -21,6 +21,11 @@ export interface SessionRecord {
 	ended_at: number;
 	metadata: string | null;
 	budget_tag: string | null;
+	/**
+	 * ID of the parent session for sub-agent sessions, or null/undefined
+	 * for root sessions. Required by the `subagent-linking` spec.
+	 */
+	parent_session_id?: string | null;
 }
 
 /** A single metric measurement to write. */
@@ -65,18 +70,19 @@ export function upsertProject(db: Database, project: ProjectRecord): void {
  */
 export function upsertSession(db: Database, session: SessionRecord): void {
 	db.run(
-		`INSERT INTO sessions (session_id, project_id, agent, model, classification, title, started_at, ended_at, metadata, budget_tag)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO sessions (session_id, project_id, agent, model, classification, title, started_at, ended_at, metadata, budget_tag, parent_session_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(session_id) DO UPDATE SET
-			project_id     = excluded.project_id,
-			agent          = excluded.agent,
-			model          = excluded.model,
-			classification = excluded.classification,
-			title          = excluded.title,
-			started_at     = excluded.started_at,
-			ended_at       = excluded.ended_at,
-			metadata       = excluded.metadata,
-			budget_tag     = excluded.budget_tag`,
+			project_id        = excluded.project_id,
+			agent             = excluded.agent,
+			model             = excluded.model,
+			classification    = excluded.classification,
+			title             = excluded.title,
+			started_at        = excluded.started_at,
+			ended_at          = excluded.ended_at,
+			metadata          = excluded.metadata,
+			budget_tag        = excluded.budget_tag,
+			parent_session_id = excluded.parent_session_id`,
 		[
 			session.session_id,
 			session.project_id,
@@ -88,6 +94,7 @@ export function upsertSession(db: Database, session: SessionRecord): void {
 			session.ended_at,
 			session.metadata,
 			session.budget_tag,
+			session.parent_session_id ?? null,
 		],
 	);
 }

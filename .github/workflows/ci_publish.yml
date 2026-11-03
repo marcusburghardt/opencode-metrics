@@ -2,7 +2,9 @@
 # Primary automated publishing runs in ci_release.yml (publish job).
 # This workflow serves as a manual fallback and handles releases
 # created outside the release-please automation (e.g., manual GitHub
-# Releases from the UI).
+# Releases from the UI). It publishes under the `next` dist-tag, verifies
+# the published artifact installs and registers, and only then promotes
+# `latest`, mirroring the automated path.
 name: CI Publish
 
 on:
@@ -35,9 +37,21 @@ jobs:
           registry-url: "https://registry.npmjs.org"
       - run: bun install --frozen-lockfile
       - run: make build
-      - run: npm publish --access public
+
+      # Capture the pre-publish `latest` so the promotion step can prove the
+      # publish itself did not move it.
+      - name: Record current latest dist-tag
+        id: latest_before
+        run: |
+          CURRENT="$(npm view "@mburghardt/opencode-metrics" dist-tags.latest 2>/dev/null || true)"
+          echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
+          echo "latest before publish: ${CURRENT:-<none>}"
+
+      - name: Publish under the next dist-tag
+        run: npm publish --access public --tag next
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
       - name: Verify publish
         env:
           TAG: ${{ inputs.tag || github.event.release.tag_name }}
@@ -55,3 +69,32 @@ jobs:
           done
           echo "Package not visible after ${MAX_ATTEMPTS} attempts ($((MAX_ATTEMPTS * INTERVAL))s)"
           exit 1
+
+      # Blocking gate: installs the published tarball in a clean project and
+      # proves it resolves @opencode/plugin and registers via Plugin.define.
+      - name: Verify published artifact
+        env:
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          VERSION="${TAG#v}"
+          bash scripts/verify-published-artifact.sh "${VERSION}"
+
+      - name: Assert latest is unchanged before promotion
+        env:
+          EXPECTED: ${{ steps.latest_before.outputs.current }}
+        run: |
+          ACTUAL="$(npm view "@mburghardt/opencode-metrics" dist-tags.latest 2>/dev/null || true)"
+          if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+            echo "::error::latest moved before promotion: expected '${EXPECTED}', got '${ACTUAL}'"
+            exit 1
+          fi
+          echo "latest is unchanged (${ACTUAL:-<none>})"
+
+      - name: Promote latest
+        env:
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          VERSION="${TAG#v}"
+          npm dist-tag add "@mburghardt/opencode-metrics@${VERSION}" latest

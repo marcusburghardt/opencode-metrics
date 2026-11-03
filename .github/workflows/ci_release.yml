@@ -1,8 +1,9 @@
 # CI Release — Automated version management via release-please.
-# When a release is created, publishes the package to npm.
-# Events from the default GITHUB_TOKEN do not cascade to other
-# workflows, so publish runs as a dependent job here instead of
-# relying on a separate release-triggered workflow.
+# When a release is created, publishes the package to npm under the
+# `next` dist-tag, verifies the published artifact installs and registers,
+# and only then promotes `latest`. Events from the default GITHUB_TOKEN do
+# not cascade to other workflows, so publish runs as a dependent job here
+# instead of relying on a separate release-triggered workflow.
 name: CI Release
 
 on:
@@ -45,9 +46,21 @@ jobs:
           registry-url: "https://registry.npmjs.org"
       - run: bun install --frozen-lockfile
       - run: make build
-      - run: npm publish --access public
+
+      # Capture the pre-publish `latest` so the promotion step can prove the
+      # publish itself did not move it.
+      - name: Record current latest dist-tag
+        id: latest_before
+        run: |
+          CURRENT="$(npm view "@mburghardt/opencode-metrics" dist-tags.latest 2>/dev/null || true)"
+          echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
+          echo "latest before publish: ${CURRENT:-<none>}"
+
+      - name: Publish under the next dist-tag
+        run: npm publish --access public --tag next
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
       - name: Verify publish
         env:
           TAG: ${{ needs.release-please.outputs.tag_name }}
@@ -65,3 +78,28 @@ jobs:
           done
           echo "Package not visible after ${MAX_ATTEMPTS} attempts ($((MAX_ATTEMPTS * INTERVAL))s)"
           exit 1
+
+      # Blocking gate: installs the published tarball in a clean project and
+      # proves it resolves @opencode/plugin and registers via Plugin.define.
+      - name: Verify published artifact
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: bash scripts/verify-published-artifact.sh "${TAG#v}"
+
+      - name: Assert latest is unchanged before promotion
+        env:
+          EXPECTED: ${{ steps.latest_before.outputs.current }}
+        run: |
+          ACTUAL="$(npm view "@mburghardt/opencode-metrics" dist-tags.latest 2>/dev/null || true)"
+          if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+            echo "::error::latest moved before promotion: expected '${EXPECTED}', got '${ACTUAL}'"
+            exit 1
+          fi
+          echo "latest is unchanged (${ACTUAL:-<none>})"
+
+      - name: Promote latest
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm dist-tag add "@mburghardt/opencode-metrics@${TAG#v}" latest

@@ -15,6 +15,11 @@ export interface ClassificationContext {
 	/** Bash commands extracted from tool calls. */
 	bash_commands: string[];
 	message_count: number;
+	/**
+	 * Parent session ID for sub-agent sessions. Empty string for root
+	 * sessions so `values: [""]` rules can match roots.
+	 */
+	parent_session_id: string;
 }
 
 /**
@@ -39,6 +44,8 @@ function getFieldAsString(context: ClassificationContext, field: string): string
 			return context.bash_commands.join("\n");
 		case "message_count":
 			return String(context.message_count);
+		case "parent_session_id":
+			return context.parent_session_id;
 		default:
 			return undefined;
 	}
@@ -68,6 +75,8 @@ function getFieldRaw(
 			return context.bash_commands;
 		case "message_count":
 			return context.message_count;
+		case "parent_session_id":
+			return context.parent_session_id;
 		default:
 			return undefined;
 	}

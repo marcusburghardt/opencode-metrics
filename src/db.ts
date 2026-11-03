@@ -9,7 +9,26 @@ import path from "node:path";
  * Schema version for the metrics database.
  * Increment when altering table definitions or adding required migrations.
  */
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
+
+/**
+ * Definition of the v_sessions convenience view. Kept as a constant because
+ * the v5 → v6 migration must drop and recreate it (SQLite's
+ * `CREATE VIEW IF NOT EXISTS` cannot add a column to an existing view).
+ */
+const V_SESSIONS_VIEW_SQL = `
+	CREATE VIEW IF NOT EXISTS v_sessions AS
+	SELECT
+		session_id, project_id, agent, model, classification, title,
+		parent_session_id,
+		started_at / 1000 AS started_at_epoch,
+		ended_at / 1000 AS ended_at_epoch,
+		strftime('%Y-%m-%dT%H:%M:%SZ', started_at / 1000, 'unixepoch') AS started_at_iso,
+		strftime('%Y-%m-%dT%H:%M:%SZ', ended_at / 1000, 'unixepoch') AS ended_at_iso,
+		metadata,
+		budget_tag
+	FROM sessions
+`;
 
 /**
  * V1 metric catalog — seeded into metric_definitions on first database creation.
@@ -24,7 +43,7 @@ const METRIC_DEFINITIONS: ReadonlyArray<{
 	{
 		metric_name: "cost",
 		unit: "usd",
-		description: "Total session cost in USD",
+		description: "Total session cost in USD (own session only; excludes sub-sessions)",
 		aggregation: "sum",
 	},
 	{
@@ -72,25 +91,25 @@ const METRIC_DEFINITIONS: ReadonlyArray<{
 	{
 		metric_name: "files_changed",
 		unit: "count",
-		description: "Number of files changed in the session",
+		description: "Distinct files reported in assistant session snapshots",
 		aggregation: "sum",
 	},
 	{
 		metric_name: "lines_added",
 		unit: "count",
-		description: "Lines added across all file changes",
+		description: "Lines added in file changes (0 for sessions recorded on OpenCode V2)",
 		aggregation: "sum",
 	},
 	{
 		metric_name: "lines_deleted",
 		unit: "count",
-		description: "Lines deleted across all file changes",
+		description: "Lines deleted in file changes (0 for sessions recorded on OpenCode V2)",
 		aggregation: "sum",
 	},
 	{
 		metric_name: "messages_total",
 		unit: "count",
-		description: "Total messages exchanged in the session",
+		description: "Total conversation messages exchanged in the session",
 		aggregation: "sum",
 	},
 	{
@@ -149,7 +168,8 @@ function createSchema(db: Database): void {
 			started_at     INTEGER,
 			ended_at       INTEGER,
 			metadata       TEXT,
-			budget_tag     TEXT
+			budget_tag     TEXT,
+			parent_session_id TEXT
 		)
 	`);
 
@@ -183,18 +203,7 @@ function createSchema(db: Database): void {
 	// strings. Base tables store epoch milliseconds (SDK passthrough);
 	// these views eliminate the /1000 conversion gymnastics for Grafana
 	// and other downstream consumers.
-	db.run(`
-		CREATE VIEW IF NOT EXISTS v_sessions AS
-		SELECT
-			session_id, project_id, agent, model, classification, title,
-			started_at / 1000 AS started_at_epoch,
-			ended_at / 1000 AS ended_at_epoch,
-			strftime('%Y-%m-%dT%H:%M:%SZ', started_at / 1000, 'unixepoch') AS started_at_iso,
-			strftime('%Y-%m-%dT%H:%M:%SZ', ended_at / 1000, 'unixepoch') AS ended_at_iso,
-			metadata,
-			budget_tag
-		FROM sessions
-	`);
+	db.run(V_SESSIONS_VIEW_SQL);
 
 	db.run(`
 		CREATE VIEW IF NOT EXISTS v_measurements AS
@@ -418,13 +427,18 @@ function createSchema(db: Database): void {
 }
 
 /**
- * Seed the metric_definitions table with the V1 metric catalog.
- * Uses INSERT OR IGNORE so existing rows are never overwritten,
- * making this safe to call on every startup.
+ * Seed or refresh the metric_definitions table with the metric catalog.
+ *
+ * Uses an upsert on `metric_name` so descriptions stay current on an
+ * existing database (for example, the V2 line-count limitation must be
+ * visible to upgrading users). Names, units, and aggregation types are
+ * unchanged by this update path.
  */
 export function ensureMetricDefinitions(db: Database): void {
 	const stmt = db.prepare(
-		"INSERT OR IGNORE INTO metric_definitions (metric_name, unit, description, aggregation) VALUES (?, ?, ?, ?)",
+		`INSERT INTO metric_definitions (metric_name, unit, description, aggregation)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(metric_name) DO UPDATE SET description = excluded.description`,
 	);
 
 	for (const metric of METRIC_DEFINITIONS) {
@@ -510,6 +524,31 @@ export function initDatabase(dataDirOverride?: string): InitDatabaseResult {
 	if (currentVersion < 5) {
 		db.run("UPDATE projects SET name = 'unknown' WHERE name = '' OR name IS NULL");
 	}
+
+	// V5 → V6 migration: add parent_session_id column to sessions table.
+	// Guard with try/catch for the same reason as the V2 → V3 migration:
+	// SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, and a fresh
+	// v6 database already has the column from createSchema(). Existing rows
+	// end up NULL, which is the correct value for a root/sub-agent-unknown
+	// session.
+	if (currentVersion < 6) {
+		try {
+			db.run("ALTER TABLE sessions ADD COLUMN parent_session_id TEXT");
+		} catch (_error: unknown) {
+			// Column already exists — safe to ignore.
+		}
+
+		// `CREATE VIEW IF NOT EXISTS` does not alter an existing view, so an
+		// upgrading v5 database would keep the old v_sessions definition
+		// without parent_session_id. Drop and recreate it once.
+		db.run("DROP VIEW IF EXISTS v_sessions");
+		db.run(V_SESSIONS_VIEW_SQL);
+	}
+
+	// Secondary index for sub-agent tree queries (subagent-linking spec).
+	// Created after the migration so it can rely on the column existing on
+	// both fresh and upgraded databases.
+	db.run("CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions (parent_session_id)");
 
 	if (currentVersion < SCHEMA_VERSION) {
 		db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);

@@ -103,9 +103,9 @@ describe("initDatabase", () => {
 		expect(row.journal_mode).toBe("wal");
 	});
 
-	it("sets user_version to 5", () => {
+	it("sets user_version to 6", () => {
 		const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
-		expect(row.user_version).toBe(5);
+		expect(row.user_version).toBe(6);
 	});
 
 	it("preserves user_version on subsequent calls", () => {
@@ -118,7 +118,7 @@ describe("initDatabase", () => {
 		db = second.db;
 
 		const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
-		expect(row.user_version).toBe(5);
+		expect(row.user_version).toBe(6);
 	});
 
 	it("fresh database has budget_tag column on sessions table", () => {
@@ -130,6 +130,113 @@ describe("initDatabase", () => {
 		const columnMap = new Map(columns.map((col) => [col.name, col.type]));
 		expect(columnMap.has("budget_tag")).toBe(true);
 		expect(columnMap.get("budget_tag")).toBe("TEXT");
+	});
+
+	it("fresh database has parent_session_id column on sessions table", () => {
+		const columns = db.prepare("PRAGMA table_info(sessions)").all() as Array<{
+			name: string;
+			type: string;
+		}>;
+
+		const columnMap = new Map(columns.map((col) => [col.name, col.type]));
+		expect(columnMap.has("parent_session_id")).toBe(true);
+		expect(columnMap.get("parent_session_id")).toBe("TEXT");
+	});
+
+	it("fresh database creates the idx_sessions_parent index", () => {
+		const indexes = db
+			.prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+			.all() as Array<{ name: string }>;
+
+		expect(indexes.map((row) => row.name)).toContain("idx_sessions_parent");
+	});
+
+	it("v_sessions exposes parent_session_id", () => {
+		db.run(
+			`INSERT INTO sessions (session_id, project_id, agent, model, classification, title, started_at, ended_at, parent_session_id)
+			 VALUES ('sub-1', 'p1', 'build', 'opus', 'impl', 'sub', 1700000000000, 1700003600000, 'root-1')`,
+		);
+
+		const sub = db.prepare("SELECT * FROM v_sessions WHERE session_id = 'sub-1'").get() as Record<
+			string,
+			unknown
+		>;
+		expect(sub.parent_session_id).toBe("root-1");
+
+		db.run(
+			`INSERT INTO sessions (session_id, project_id, agent, model, classification, title, started_at, ended_at)
+			 VALUES ('root-1', 'p1', 'build', 'opus', 'impl', 'root', 1700000000000, 1700003600000)`,
+		);
+		const root = db
+			.prepare("SELECT * FROM v_sessions WHERE session_id = 'root-1'")
+			.get() as Record<string, unknown>;
+		expect(root.parent_session_id).toBeNull();
+	});
+
+	it("migration from v5 adds parent_session_id with NULL for existing rows", () => {
+		db.close();
+
+		const v5Dir = mkdtempSync(path.join(tmpdir(), "ocm-v5-migration-"));
+		const v5DbPath = path.join(v5Dir, "metrics.db");
+		const { Database } = require("bun:sqlite");
+		const v5Db = new Database(v5DbPath, { create: true });
+
+		// V5 sessions table: budget_tag present, parent_session_id absent.
+		v5Db.run(`
+			CREATE TABLE sessions (
+				session_id     TEXT PRIMARY KEY,
+				project_id     TEXT,
+				agent          TEXT,
+				model          TEXT,
+				classification TEXT,
+				title          TEXT,
+				started_at     INTEGER,
+				ended_at       INTEGER,
+				metadata       TEXT,
+				budget_tag     TEXT
+			)
+		`);
+		// V5 v_sessions view without parent_session_id.
+		v5Db.run(`
+			CREATE VIEW v_sessions AS
+			SELECT session_id, project_id, agent, model, classification, title,
+				started_at / 1000 AS started_at_epoch,
+				ended_at / 1000 AS ended_at_epoch,
+				metadata, budget_tag
+			FROM sessions
+		`);
+		v5Db.run(
+			`INSERT INTO sessions (session_id, project_id, agent, model, classification, title, started_at, ended_at, metadata, budget_tag)
+			 VALUES ('legacy-sess', 'proj-1', 'build', 'opus', 'impl', 'legacy', 1700000000000, 1700003600000, NULL, 'infra')`,
+		);
+		v5Db.run("PRAGMA user_version = 5");
+		v5Db.close();
+
+		const migrated = initDatabase(v5Dir);
+		db = migrated.db;
+
+		const versionRow = db.prepare("PRAGMA user_version").get() as { user_version: number };
+		expect(versionRow.user_version).toBe(6);
+
+		const columns = db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>;
+		expect(columns.map((col) => col.name)).toContain("parent_session_id");
+
+		const row = db
+			.prepare("SELECT * FROM sessions WHERE session_id = ?")
+			.get("legacy-sess") as Record<string, unknown>;
+		expect(row.parent_session_id).toBeNull();
+
+		// The view was recreated, so the new column is visible.
+		const viewRow = db
+			.prepare("SELECT * FROM v_sessions WHERE session_id = ?")
+			.get("legacy-sess") as Record<string, unknown>;
+		expect(viewRow.parent_session_id).toBeNull();
+
+		db.close();
+		rmSync(v5Dir, { recursive: true, force: true });
+
+		const result = initDatabase(tempDir);
+		db = result.db;
 	});
 
 	it("migration from v2 adds budget_tag column without data loss", () => {
@@ -167,16 +274,16 @@ describe("initDatabase", () => {
 		v2Db.run("PRAGMA user_version = 2");
 		v2Db.close();
 
-		// Now run initDatabase on this v2 directory — should migrate to v5
+		// Now run initDatabase on this v2 directory — should migrate to v6
 		// (applying all pending migrations: v2→v3 adds budget_tag, v3→v4
 		// adds cost_pricing table and adjusted cost views, v4→v5 fixes
-		// empty project names).
+		// empty project names, v5→v6 adds parent_session_id).
 		const migrated = initDatabase(v2Dir);
 		db = migrated.db;
 
-		// Schema version should be 5 (latest).
+		// Schema version should be 6 (latest).
 		const versionRow = db.prepare("PRAGMA user_version").get() as { user_version: number };
-		expect(versionRow.user_version).toBe(5);
+		expect(versionRow.user_version).toBe(6);
 
 		// budget_tag column should exist.
 		const columns = db.prepare("PRAGMA table_info(sessions)").all() as Array<{
@@ -490,7 +597,7 @@ describe("initDatabase", () => {
 
 		// Schema version should be 5.
 		const versionRow = db.prepare("PRAGMA user_version").get() as { user_version: number };
-		expect(versionRow.user_version).toBe(5);
+		expect(versionRow.user_version).toBe(6);
 
 		// cost_pricing table should exist.
 		const tables = db
@@ -959,5 +1066,82 @@ describe("adjusted cost edge cases", () => {
 		expect(row.adjusted_cost).toBeCloseTo(0, 10);
 		expect(row.original_cost).toBeCloseTo(0.5, 10);
 		expect(row.cost_difference).toBeCloseTo(-0.5, 10);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Metric catalog descriptions (V2 migration)
+// ---------------------------------------------------------------------------
+
+describe("metric catalog descriptions", () => {
+	let tempDir: string;
+	let db: Database;
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(path.join(tmpdir(), "ocm-catalog-"));
+		const result = initDatabase(tempDir);
+		db = result.db;
+	});
+
+	afterEach(() => {
+		db.close();
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	function descriptionOf(metricName: string): string {
+		const row = db
+			.prepare("SELECT description FROM metric_definitions WHERE metric_name = ?")
+			.get(metricName) as { description: string } | null;
+		return row?.description ?? "";
+	}
+
+	it("seeds descriptions that reflect current derivation", () => {
+		expect(descriptionOf("cost")).toBe(
+			"Total session cost in USD (own session only; excludes sub-sessions)",
+		);
+		expect(descriptionOf("files_changed")).toBe(
+			"Distinct files reported in assistant session snapshots",
+		);
+		expect(descriptionOf("lines_added")).toBe(
+			"Lines added in file changes (0 for sessions recorded on OpenCode V2)",
+		);
+		expect(descriptionOf("lines_deleted")).toBe(
+			"Lines deleted in file changes (0 for sessions recorded on OpenCode V2)",
+		);
+		expect(descriptionOf("messages_total")).toBe(
+			"Total conversation messages exchanged in the session",
+		);
+	});
+
+	it("updates an existing database's lines_added description on re-init", () => {
+		db.prepare("UPDATE metric_definitions SET description = ? WHERE metric_name = ?").run(
+			"Lines added across all file changes",
+			"lines_added",
+		);
+		db.close();
+
+		const reopened = initDatabase(tempDir);
+		db = reopened.db;
+
+		expect(descriptionOf("lines_added")).toBe(
+			"Lines added in file changes (0 for sessions recorded on OpenCode V2)",
+		);
+	});
+
+	it("keeps metric names, units, and aggregation types unchanged", () => {
+		const rows = db
+			.prepare(
+				"SELECT metric_name, unit, aggregation FROM metric_definitions ORDER BY metric_name",
+			)
+			.all() as Array<{ metric_name: string; unit: string; aggregation: string }>;
+
+		expect(rows).toHaveLength(15);
+
+		const byName = new Map(rows.map((row) => [row.metric_name, row]));
+		expect(byName.get("cost")).toMatchObject({ unit: "usd", aggregation: "sum" });
+		expect(byName.get("cache_hit_ratio")).toMatchObject({ unit: "ratio", aggregation: "avg" });
+		expect(byName.get("files_changed")).toMatchObject({ unit: "count", aggregation: "sum" });
+		expect(byName.get("lines_added")).toMatchObject({ unit: "count", aggregation: "sum" });
+		expect(byName.get("messages_total")).toMatchObject({ unit: "count", aggregation: "sum" });
 	});
 });

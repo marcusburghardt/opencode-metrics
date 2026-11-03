@@ -244,6 +244,49 @@ describe("writer", () => {
 			expect(row.budget_tag).toBeNull();
 		});
 
+		it("writes parent_session_id for a sub-agent session", () => {
+			upsertSession(db, makeSession({ parent_session_id: "root-abc" }));
+
+			const row = db
+				.prepare("SELECT parent_session_id FROM sessions WHERE session_id = ?")
+				.get("sess-001") as { parent_session_id: string | null };
+
+			expect(row.parent_session_id).toBe("root-abc");
+		});
+
+		it("writes NULL parent_session_id for a root session", () => {
+			upsertSession(db, makeSession({ parent_session_id: null }));
+
+			const row = db
+				.prepare("SELECT parent_session_id FROM sessions WHERE session_id = ?")
+				.get("sess-001") as { parent_session_id: string | null };
+
+			expect(row.parent_session_id).toBeNull();
+		});
+
+		it("writes NULL parent_session_id when the field is omitted", () => {
+			const session = makeSession();
+			delete session.parent_session_id;
+			upsertSession(db, session);
+
+			const row = db
+				.prepare("SELECT parent_session_id FROM sessions WHERE session_id = ?")
+				.get("sess-001") as { parent_session_id: string | null };
+
+			expect(row.parent_session_id).toBeNull();
+		});
+
+		it("updates parent_session_id on re-upsert", () => {
+			upsertSession(db, makeSession({ parent_session_id: "root-1" }));
+			upsertSession(db, makeSession({ parent_session_id: "root-2" }));
+
+			const row = db
+				.prepare("SELECT parent_session_id FROM sessions WHERE session_id = ?")
+				.get("sess-001") as { parent_session_id: string | null };
+
+			expect(row.parent_session_id).toBe("root-2");
+		});
+
 		it("updates budget_tag on re-upsert", () => {
 			upsertSession(db, makeSession({ budget_tag: null }));
 

@@ -34,7 +34,8 @@ jobs:
         with:
           bun-version: "1.4.2"
       - run: bun install --frozen-lockfile
-      - run: make test
+      - run: bun test --coverage --coverage-reporter=lcov --coverage-dir=coverage
+      - run: bun run scripts/coverage-gate.ts coverage/lcov.info
 
   build:
     name: Build
@@ -48,3 +49,21 @@ jobs:
           bun-version: "1.4.2"
       - run: bun install --frozen-lockfile
       - run: make build
+      - name: Assert runtime dependencies are not bundled
+        run: |
+          set -eu
+          bundle=dist/index.js
+          if grep -qE 'node_modules/@opencode/(plugin|schema)' "$bundle"; then
+            echo "error: @opencode package sources were bundled into $bundle" >&2
+            exit 1
+          fi
+          if grep -qE 'from "effect"|from "effect/' "$bundle"; then
+            echo "error: effect was bundled into $bundle" >&2
+            exit 1
+          fi
+          # @opencode/plugin must remain a single external import.
+          imports=$(grep -c 'from "@opencode/plugin"' "$bundle" || true)
+          if [ "$imports" -ne 1 ]; then
+            echo "error: expected exactly one external @opencode/plugin import, found $imports" >&2
+            exit 1
+          fi
