@@ -1,17 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import type { Database } from "bun:sqlite";
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import type { Plugin } from "@opencode/plugin";
 import { ClassificationCache } from "./classifier";
 import type { CostPricingRule, MetricsConfig } from "./config";
 import { initDatabase } from "./db";
 import { DEFAULT_CONFIG } from "./defaults";
 import type { MessageInfo, ProjectInfo, SDKClient, SessionInfo } from "./extractor";
-import { createSDKAdapter, handleSessionIdle } from "./index";
+import {
+	CaptureDebouncer,
+	createSDKAdapter,
+	handleSessionEvent,
+	handleSessionIdle,
+	runSubscriptionLoop,
+	setupPlugin,
+} from "./index";
 import { syncCostPricing } from "./pricing";
+import { isVersionSupported, resolvePluginVersion } from "./version";
 
 /** Factory for a mock SDKClient with configurable overrides. */
 function makeClient(
@@ -90,52 +99,46 @@ function makeClient(
 	return { client, logs };
 }
 
-/**
- * Factory for a mock PluginInput-like object that createSDKAdapter accepts.
- * Mirrors the shape of PluginInput from @opencode-ai/plugin: includes
- * client (session/project/app), plus the init-time project and directory
- * fields used as fallback for non-git project detection.
- */
-function makePluginInput(
-	overrides: {
-		sessionData?: Record<string, unknown> | null;
-		messagesData?: unknown[];
-		projectData?: Record<string, unknown> | null;
-		logCapture?: string[];
-		/** Init-time project object from PluginInput.project. */
-		initProject?: Record<string, unknown>;
-		/** Init-time directory from PluginInput.directory. */
-		initDirectory?: string;
-	} = {},
-	// biome-ignore lint/suspicious/noExplicitAny: test mock requires flexible typing
-): { client: Record<string, any>; project: Record<string, unknown>; directory: string } {
-	const logCapture = overrides.logCapture ?? [];
+describe("CaptureDebouncer", () => {
+	it("evicts stale sessions so the map stays bounded", () => {
+		let now = 0;
+		const debouncer = new CaptureDebouncer(100, () => now);
 
-	return {
-		client: {
-			session: {
-				get: async (_opts: { path: { id: string } }) => ({
-					data: overrides.sessionData ?? null,
-				}),
-				messages: async (_opts: { path: { id: string } }) => ({
-					data: overrides.messagesData ?? [],
-				}),
-			},
-			project: {
-				current: async () => ({
-					data: overrides.projectData ?? null,
-				}),
-			},
-			app: {
-				log: (opts: { body: { service: string; level: string; message: string } }) => {
-					logCapture.push(opts.body.message);
-				},
-			},
-		},
-		project: overrides.initProject ?? { id: "proj-init", worktree: "/home/user/default" },
-		directory: overrides.initDirectory ?? "/home/user/default",
-	};
-}
+		expect(debouncer.tryAcquire("a")).toBe(true);
+		now = 50;
+		expect(debouncer.tryAcquire("b")).toBe(true);
+		expect(debouncer.size).toBe(2);
+
+		now = 101;
+		expect(debouncer.tryAcquire("c")).toBe(true);
+		// "a" is 101ms old and is evicted; "b" is still within the window.
+		expect(debouncer.size).toBe(2);
+	});
+
+	it("evicts entries older than the window", () => {
+		let now = 0;
+		const debouncer = new CaptureDebouncer(100, () => now);
+
+		debouncer.tryAcquire("a");
+		now = 150;
+		debouncer.tryAcquire("b");
+		expect(debouncer.size).toBe(1);
+	});
+
+	it("counts a skipped event only when no capture is recorded", () => {
+		let now = 0;
+		const debouncer = new CaptureDebouncer(100, () => now);
+
+		expect(debouncer.tryAcquire("a")).toBe(true);
+		now = 50;
+		expect(debouncer.tryAcquire("a")).toBe(false);
+		now = 99;
+		// Still within the window measured from the first capture at t=0.
+		expect(debouncer.tryAcquire("a")).toBe(false);
+		now = 100;
+		expect(debouncer.tryAcquire("a")).toBe(true);
+	});
+});
 
 describe("handleSessionIdle", () => {
 	let tempDir: string;
@@ -163,7 +166,6 @@ describe("handleSessionIdle", () => {
 
 		await handleSessionIdle(client, "sess-001", db, config, cache, budgetCache);
 
-		// Verify project was written
 		const project = db.prepare("SELECT * FROM projects WHERE project_id = ?").get("proj-001") as {
 			project_id: string;
 			name: string;
@@ -174,7 +176,6 @@ describe("handleSessionIdle", () => {
 		expect(project?.name).toBe("test-project");
 		expect(project?.worktree).toBe("/home/user/test");
 
-		// Verify session was written
 		const session = db.prepare("SELECT * FROM sessions WHERE session_id = ?").get("sess-001") as {
 			session_id: string;
 			agent: string;
@@ -185,10 +186,8 @@ describe("handleSessionIdle", () => {
 		expect(session).not.toBeNull();
 		expect(session?.agent).toBe("build");
 		expect(session?.model).toBe("claude-opus-4-20250514");
-		// Default rules classify "build" agent as "implementation"
 		expect(session?.classification).toBe("implementation");
 
-		// Verify metrics were written
 		const metrics = db
 			.prepare("SELECT * FROM measurements WHERE session_id = ? ORDER BY metric_name")
 			.all("sess-001") as Array<{ metric_name: string; value: number }>;
@@ -200,7 +199,6 @@ describe("handleSessionIdle", () => {
 	});
 
 	it("classifies session correctly using default rules", async () => {
-		// Explore agent should be classified as "exploration"
 		const { client } = makeClient({ session: { agent: "explore" } });
 
 		await handleSessionIdle(client, "sess-explore", db, config, cache, budgetCache);
@@ -215,13 +213,9 @@ describe("handleSessionIdle", () => {
 	it("uses classification cache for repeated calls", async () => {
 		const { client } = makeClient();
 
-		// First call populates the cache
+		await handleSessionIdle(client, "sess-cached", db, config, cache, budgetCache);
 		await handleSessionIdle(client, "sess-cached", db, config, cache, budgetCache);
 
-		// Second call should use the cache (same message count)
-		await handleSessionIdle(client, "sess-cached", db, config, cache, budgetCache);
-
-		// Session should still be correctly classified
 		const session = db
 			.prepare("SELECT classification FROM sessions WHERE session_id = ?")
 			.get("sess-cached") as { classification: string } | null;
@@ -234,23 +228,19 @@ describe("handleSessionIdle", () => {
 
 		await handleSessionIdle(client, "", db, config, cache, budgetCache);
 
-		// No data should be written
 		const count = db.prepare("SELECT COUNT(*) AS count FROM sessions").get() as {
 			count: number;
 		};
 		expect(count.count).toBe(0);
 
-		// Warning should be logged
 		expect(logs.some((l) => l.includes("null/empty"))).toBe(true);
 	});
 
-	it("error isolation: SDK session.get failure does not propagate", async () => {
+	it("propagates an SDK session.get failure from handleSessionIdle to the caller", async () => {
 		const { client } = makeClient({
 			sessionGetError: new Error("SDK connection timeout"),
 		});
 
-		// handleSessionIdle should throw (caller is responsible for catch)
-		// In the real plugin, the event handler wraps this in try/catch.
 		await expect(
 			handleSessionIdle(client, "sess-err", db, config, cache, budgetCache),
 		).rejects.toThrow("SDK connection timeout");
@@ -296,7 +286,6 @@ describe("handleSessionIdle", () => {
 		});
 		await handleSessionIdle(client1, "sess-update", db, config, cache, budgetCache);
 
-		// Second call with different title — cache is invalidated by new message count
 		const { client: client2 } = makeClient({
 			session: { title: "Updated title" },
 			messages: [
@@ -401,15 +390,10 @@ describe("handleSessionIdle", () => {
 			],
 		};
 
-		// Sync pricing rules to the database before handling the session,
-		// mirroring what the plugin startup does in index.ts.
 		syncCostPricing(db, configWithPricing.cost_pricing);
 
-		// Core metrics collection should work without regression.
 		await handleSessionIdle(client, "sess-pricing", db, configWithPricing, cache, budgetCache);
 
-		// Verify session was written — proves cost_pricing in config does not
-		// interfere with the extract → classify → write pipeline.
 		const session = db
 			.prepare("SELECT * FROM sessions WHERE session_id = ?")
 			.get("sess-pricing") as { session_id: string; classification: string } | null;
@@ -417,14 +401,12 @@ describe("handleSessionIdle", () => {
 		expect(session).not.toBeNull();
 		expect(session?.classification).toBe("implementation");
 
-		// Verify metrics were written (cost, tokens, etc.).
 		const metrics = db
 			.prepare("SELECT COUNT(*) AS count FROM measurements WHERE session_id = ?")
 			.get("sess-pricing") as { count: number };
 
 		expect(metrics.count).toBeGreaterThan(0);
 
-		// Verify pricing rules are in the database.
 		const pricingRows = db.prepare("SELECT COUNT(*) AS count FROM cost_pricing").get() as {
 			count: number;
 		};
@@ -432,10 +414,6 @@ describe("handleSessionIdle", () => {
 	});
 
 	it("syncCostPricing throws on a closed database", () => {
-		// The try/catch in the plugin startup (index.ts) handles database
-		// errors gracefully — logging the error and continuing without
-		// adjusted cost data. This test verifies the underlying failure
-		// mode by calling syncCostPricing directly with a closed database.
 		const closedDb = initDatabase(tempDir).db;
 		closedDb.close();
 
@@ -459,58 +437,101 @@ describe("handleSessionIdle", () => {
 			],
 		};
 
-		// First call populates both caches
 		await handleSessionIdle(client, "sess-indep", db, configWithBudget, cache, budgetCache);
 
-		// Classification cache should have the work-type classification
 		const cachedClassification = cache.get("sess-indep", 2);
 		expect(cachedClassification).toBe("implementation");
 
-		// Budget cache should have the budget tag independently
 		const cachedBudget = budgetCache.get("sess-indep", 2);
 		expect(cachedBudget).toBe("infra-ops");
 
-		// Verify the two caches are distinct instances — clearing one
-		// does not affect the other.
 		const freshBudgetCache = new ClassificationCache();
 		expect(freshBudgetCache.get("sess-indep", 2)).toBeNull();
 		expect(cache.get("sess-indep", 2)).toBe("implementation");
 	});
 });
 
-describe("createSDKAdapter", () => {
-	it("aggregates tokens from multiple assistant messages", async () => {
-		const input = makePluginInput({
-			sessionData: {
-				id: "sess-tok",
-				title: "Token test",
-				time: { created: 1000, updated: 2000 },
-			},
-			messagesData: [
-				{
-					info: {
-						id: "m1",
-						role: "assistant",
-						cost: 0.1,
-						tokens: { input: 100, output: 50, reasoning: 10, cache: { read: 20, write: 5 } },
-					},
-					parts: [],
-				},
-				{
-					info: {
-						id: "m2",
-						role: "assistant",
-						cost: 0.2,
-						tokens: { input: 200, output: 80, reasoning: 30, cache: { read: 40, write: 15 } },
-					},
-					parts: [],
-				},
-			],
-		});
+// ---------------------------------------------------------------------------
+// V2 SDK adapter
+// ---------------------------------------------------------------------------
 
-		// biome-ignore lint/suspicious/noExplicitAny: test mock
-		const adapter = createSDKAdapter(input as any);
-		const session = await adapter.session.get("sess-tok");
+interface FakeSessionInfo {
+	id: string;
+	cost?: number;
+	tokens?: {
+		input: number;
+		output: number;
+		reasoning: number;
+		cache: { read: number; write: number };
+	};
+	agent?: string;
+	model?: { id: string; providerID: string; variant?: string };
+	title?: string;
+	projectID?: string;
+	parentID?: string;
+	time?: { created: number; updated: number };
+	location?: { directory?: string };
+}
+
+function defaultSession(id: string): FakeSessionInfo {
+	return {
+		id,
+		cost: 0.3,
+		tokens: {
+			input: 300,
+			output: 130,
+			reasoning: 40,
+			cache: { read: 60, write: 20 },
+		},
+		agent: "build",
+		model: { id: "claude-x", providerID: "anthropic" },
+		title: "Test session",
+		projectID: "proj-session",
+		time: { created: 1000, updated: 2000 },
+		location: { directory: "/repo/session-project" },
+	};
+}
+
+function makeAdapterContext(
+	overrides: {
+		session?: FakeSessionInfo | null;
+		messages?: unknown[];
+		project?: { id: string; directory: string; canonical: string };
+	} = {},
+): {
+	ctx: Plugin.Context;
+	calls: { get: number; context: number };
+} {
+	const calls = { get: 0, context: 0 };
+	const ctx = {
+		session: {
+			get: async ({ sessionID }: { sessionID: string }) => {
+				calls.get += 1;
+				return overrides.session === undefined ? defaultSession(sessionID) : overrides.session;
+			},
+			context: async () => {
+				calls.context += 1;
+				return overrides.messages ?? [];
+			},
+		},
+		location: {
+			directory: "/instance/dir",
+			project: overrides.project ?? {
+				id: "proj-instance",
+				directory: "/instance/dir",
+				canonical: "/instance/project",
+			},
+		},
+	};
+	return { ctx: ctx as unknown as Plugin.Context, calls };
+}
+
+describe("createSDKAdapter (V2)", () => {
+	it("maps session aggregates without loading messages", async () => {
+		const { ctx, calls } = makeAdapterContext({ session: defaultSession("s1") });
+		const adapter = createSDKAdapter(ctx);
+
+		const session = await adapter.session.get("s1");
 
 		expect(session).not.toBeNull();
 		expect(session?.cost).toBeCloseTo(0.3);
@@ -519,369 +540,1530 @@ describe("createSDKAdapter", () => {
 		expect(session?.tokensReasoning).toBe(40);
 		expect(session?.tokensCacheRead).toBe(60);
 		expect(session?.tokensCacheWrite).toBe(20);
+		expect(calls.get).toBe(1);
+		expect(calls.context).toBe(0);
 	});
 
-	it("extracts agent and model from first user message", async () => {
-		const input = makePluginInput({
-			sessionData: {
-				id: "sess-agent",
-				title: "Agent test",
-				time: { created: 1000, updated: 2000 },
-			},
-			messagesData: [
-				{
-					info: { id: "m1", role: "user", agent: "build", model: "claude-opus-4-20250514" },
-					parts: [{ type: "text", text: "hello" }],
-				},
-				{
-					info: { id: "m2", role: "user", agent: "plan", model: "gpt-4o" },
-					parts: [{ type: "text", text: "plan something" }],
-				},
-			],
+	it("maps parentID when present and omits it when absent", async () => {
+		const present = await createSDKAdapter(
+			makeAdapterContext({ session: { ...defaultSession("s1"), parentID: "parent-1" } }).ctx,
+		).session.get("s1");
+		expect(present?.parentID).toBe("parent-1");
+
+		const absent = await createSDKAdapter(
+			makeAdapterContext({ session: defaultSession("s1") }).ctx,
+		).session.get("s1");
+		expect(absent?.parentID).toBeUndefined();
+	});
+
+	it("maps user text to a single text part", async () => {
+		const { ctx } = makeAdapterContext({
+			messages: [{ id: "u1", type: "user", text: "hello" }],
 		});
+		const messages = await createSDKAdapter(ctx).session.messages("s1");
 
-		// biome-ignore lint/suspicious/noExplicitAny: test mock
-		const adapter = createSDKAdapter(input as any);
-		const session = await adapter.session.get("sess-agent");
-
-		// Should take agent/model from the first user message only.
-		expect(session?.agent).toBe("build");
-		expect(session?.model).toBe("claude-opus-4-20250514");
+		expect(messages).toHaveLength(1);
+		expect(messages[0].role).toBe("user");
+		expect(messages[0].parts).toEqual([{ type: "text", content: "hello" }]);
 	});
 
-	it("transforms text parts and tool parts correctly", async () => {
-		const input = makePluginInput({
-			messagesData: [
+	it("maps assistant text and tool content, skipping reasoning", async () => {
+		const { ctx } = makeAdapterContext({
+			messages: [
 				{
-					info: { id: "m1", role: "user" },
-					parts: [
-						{ type: "text", text: "hello world" },
+					id: "a1",
+					type: "assistant",
+					content: [
+						{ type: "text", text: "I will run it" },
+						{ type: "reasoning", text: "internal thoughts" },
 						{
 							type: "tool",
-							tool: "bash",
-							state: { input: { command: "ls -la" } },
+							name: "bash",
+							state: {
+								status: "completed",
+								input: { command: "ls" },
+								content: [
+									{ type: "text", text: "file-a" },
+									{ type: "text", text: "file-b" },
+								],
+							},
 						},
 					],
 				},
 			],
 		});
+		const messages = await createSDKAdapter(ctx).session.messages("s1");
 
-		// biome-ignore lint/suspicious/noExplicitAny: test mock
-		const adapter = createSDKAdapter(input as any);
-		const messages = await adapter.session.messages("sess-parts");
-
-		expect(messages.length).toBe(1);
-		expect(messages[0].parts.length).toBe(2);
-
-		// Text part
-		expect(messages[0].parts[0].type).toBe("text");
-		expect(messages[0].parts[0].content).toBe("hello world");
-		expect(messages[0].parts[0].tool).toBeUndefined();
-
-		// Tool part
-		expect(messages[0].parts[1].type).toBe("tool");
-		expect(messages[0].parts[1].tool).toBe("bash");
-		expect(messages[0].parts[1].args).toEqual({ command: "ls -la" });
-		expect(messages[0].parts[1].content).toBeUndefined();
+		expect(messages).toHaveLength(1);
+		expect(messages[0].parts).toHaveLength(2);
+		expect(messages[0].parts?.[0]).toEqual({ type: "text", content: "I will run it" });
+		expect(messages[0].parts?.[1].type).toBe("tool");
+		expect(messages[0].parts?.[1].tool).toBe("bash");
+		expect(messages[0].parts?.[1].args).toEqual({ command: "ls" });
+		expect(messages[0].parts?.[1].output).toBe("file-a\nfile-b");
 	});
 
-	it("handles null session data", async () => {
-		const input = makePluginInput({
-			sessionData: null,
-		});
-
-		// biome-ignore lint/suspicious/noExplicitAny: test mock
-		const adapter = createSDKAdapter(input as any);
-		const session = await adapter.session.get("sess-null");
-
-		expect(session).toBeNull();
-	});
-
-	it("handles missing session fields gracefully", async () => {
-		const input = makePluginInput({
-			sessionData: {
-				id: "sess-sparse",
-				// No title, time, summary, projectID, parentID
-			},
-			messagesData: [],
-		});
-
-		// biome-ignore lint/suspicious/noExplicitAny: test mock
-		const adapter = createSDKAdapter(input as any);
-		const session = await adapter.session.get("sess-sparse");
-
-		expect(session).not.toBeNull();
-		expect(session?.id).toBe("sess-sparse");
-		expect(session?.cost).toBe(0);
-		expect(session?.tokensInput).toBe(0);
-		expect(session?.title).toBeUndefined();
-		expect(session?.agent).toBeUndefined();
-	});
-
-	it("extracts project data", async () => {
-		const input = makePluginInput({
-			projectData: {
-				id: "proj-test",
-				worktree: "/home/user/project",
-			},
-		});
-
-		// biome-ignore lint/suspicious/noExplicitAny: test mock
-		const adapter = createSDKAdapter(input as any);
-		const project = await adapter.project.current();
-
-		expect(project).not.toBeNull();
-		expect(project?.id).toBe("proj-test");
-		expect(project?.path).toBe("/home/user/project");
-	});
-
-	it("falls back to init-time directory when API returns null project", async () => {
-		const input = makePluginInput({
-			projectData: null,
-			initProject: { id: "proj-fallback", worktree: "/" },
-			initDirectory: "/home/user/my-project",
-		});
-
-		// biome-ignore lint/suspicious/noExplicitAny: test mock
-		const adapter = createSDKAdapter(input as any);
-		const project = await adapter.project.current();
-
-		expect(project).not.toBeNull();
-		expect(project?.id).toBe("proj-fallback");
-		expect(project?.path).toBe("/home/user/my-project");
-	});
-
-	it("falls back to init-time directory when API returns global sentinel", async () => {
-		const input = makePluginInput({
-			projectData: { id: "global", worktree: "/" },
-			initProject: { id: "global", worktree: "/" },
-			initDirectory: "/home/user/my-project",
-		});
-
-		// biome-ignore lint/suspicious/noExplicitAny: test mock
-		const adapter = createSDKAdapter(input as any);
-		const project = await adapter.project.current();
-
-		// Should use the init-time directory, not the "/" sentinel.
-		expect(project?.id).toBe("global");
-		expect(project?.path).toBe("/home/user/my-project");
-	});
-
-	it("uses API project data when worktree is a real path", async () => {
-		const input = makePluginInput({
-			projectData: { id: "proj-real", worktree: "/home/user/real-project", name: "real" },
-			initProject: { id: "proj-init", worktree: "/home/user/default" },
-			initDirectory: "/home/user/default",
-		});
-
-		// biome-ignore lint/suspicious/noExplicitAny: test mock
-		const adapter = createSDKAdapter(input as any);
-		const project = await adapter.project.current();
-
-		// Real worktree path — should use the API data, not the fallback.
-		expect(project?.id).toBe("proj-real");
-		expect(project?.path).toBe("/home/user/real-project");
-		expect(project?.name).toBe("real");
-	});
-
-	it("caches messages per session to avoid double-fetching", async () => {
-		let fetchCount = 0;
-		const input = {
-			client: {
-				session: {
-					get: async () => ({ data: { id: "sess-cache", time: {}, title: "t" } }),
-					messages: async () => {
-						fetchCount++;
-						return {
-							data: [
-								{ info: { id: "m1", role: "user" }, parts: [] },
-								{
-									info: {
-										id: "m2",
-										role: "assistant",
-										cost: 0.1,
-										tokens: { input: 10, output: 5, reasoning: 0 },
-									},
-									parts: [],
-								},
-							],
-						};
-					},
+	it("returns an empty tool output when there is no text content", async () => {
+		const { ctx } = makeAdapterContext({
+			messages: [
+				{
+					id: "a1",
+					type: "assistant",
+					content: [
+						{
+							type: "tool",
+							name: "read",
+							state: {
+								status: "completed",
+								input: { file: "x" },
+								content: [{ type: "file", uri: "file:///x", mime: "text/plain" }],
+							},
+						},
+						{
+							type: "tool",
+							name: "todo",
+							state: { status: "running", input: {}, metadata: {} },
+						},
+					],
 				},
-				project: { current: async () => ({ data: null }) },
-				app: { log: () => {} },
+			],
+		});
+		const messages = await createSDKAdapter(ctx).session.messages("s1");
+
+		expect(messages[0].parts?.[0].output).toBe("");
+		expect(messages[0].parts?.[1].output).toBe("");
+	});
+
+	it("skips unknown content variants without throwing", async () => {
+		const { ctx } = makeAdapterContext({
+			messages: [
+				{
+					id: "a1",
+					type: "assistant",
+					content: [
+						{ type: "text", text: "kept" },
+						{ type: "future-variant", payload: { secret: true } },
+						{ type: "tool", name: "broken" },
+					],
+				},
+			],
+		});
+		const messages = await createSDKAdapter(ctx).session.messages("s1");
+
+		expect(messages).toHaveLength(1);
+		expect(messages[0].parts).toHaveLength(2);
+		expect(messages[0].parts?.[0]).toEqual({ type: "text", content: "kept" });
+		expect(messages[0].parts?.[1]).toEqual({
+			type: "tool",
+			tool: "broken",
+			args: undefined,
+			output: "",
+		});
+	});
+
+	it("filters markers, synthetic, system, and idle messages", async () => {
+		const { ctx } = makeAdapterContext({
+			messages: [
+				{ id: "m1", type: "user", text: "hello" },
+				{ id: "m2", type: "agent-switched", agent: "build" },
+				{ id: "m3", type: "model-switched", model: { id: "x", providerID: "p" } },
+				{ id: "m4", type: "idle" },
+				{ id: "m5", type: "synthetic", text: "reminder" },
+				{ id: "m6", type: "system", text: "system prompt" },
+				{ id: "m7", type: "assistant", content: [{ type: "text", text: "done" }] },
+			],
+		});
+		const messages = await createSDKAdapter(ctx).session.messages("s1");
+
+		expect(messages.map((m) => m.role)).toEqual(["user", "assistant"]);
+	});
+
+	it("maps projectDirectory and snapshot files", async () => {
+		const { ctx } = makeAdapterContext({
+			session: {
+				...defaultSession("s1"),
+				location: { directory: "/repo/other-project" },
 			},
-			project: { id: "proj-cache" },
-			directory: "/tmp/cache-test",
+			messages: [
+				{
+					id: "a1",
+					type: "assistant",
+					content: [],
+					snapshot: { files: ["src/a.ts", "src/b.ts"] },
+				},
+			],
+		});
+		const adapter = createSDKAdapter(ctx);
+		const session = await adapter.session.get("s1");
+		const messages = await adapter.session.messages("s1");
+
+		expect(session?.projectDirectory).toBe("/repo/other-project");
+		expect(messages[0].snapshotFiles).toEqual(["src/a.ts", "src/b.ts"]);
+	});
+
+	it("returns the instance project id and canonical path", async () => {
+		const { ctx } = makeAdapterContext({
+			project: { id: "proj-inst", directory: "/d", canonical: "/d/project" },
+		});
+		const project = await createSDKAdapter(ctx).project.current();
+
+		expect(project).toEqual({ id: "proj-inst", path: "/d/project" });
+	});
+
+	it("routes app.log through console.warn with the metrics prefix", () => {
+		const originalWarn = console.warn;
+		const warnings: string[] = [];
+		console.warn = (message?: unknown) => {
+			warnings.push(String(message));
 		};
-
-		// biome-ignore lint/suspicious/noExplicitAny: test mock
-		const adapter = createSDKAdapter(input as any);
-
-		// session.get calls fetchRawMessages internally for token aggregation
-		await adapter.session.get("sess-cache");
-		// session.messages for the same ID should use the cache
-		await adapter.session.messages("sess-cache");
-
-		// Only one actual fetch should have occurred (cached on first call)
-		expect(fetchCount).toBe(1);
-	});
-
-	it("extracts diffStats from session summary", async () => {
-		const input = makePluginInput({
-			sessionData: {
-				id: "sess-diff",
-				title: "Diff test",
-				time: { created: 1000, updated: 2000 },
-				summary: { files: 5, additions: 100, deletions: 20 },
-			},
-			messagesData: [],
-		});
-
-		// biome-ignore lint/suspicious/noExplicitAny: test mock
-		const adapter = createSDKAdapter(input as any);
-		const session = await adapter.session.get("sess-diff");
-
-		expect(session?.diffStats).toEqual({
-			filesChanged: 5,
-			linesAdded: 100,
-			linesDeleted: 20,
-		});
-	});
-
-	it("delegates app.log to the underlying client", () => {
-		const logCapture: string[] = [];
-		const input = makePluginInput({ logCapture });
-
-		// biome-ignore lint/suspicious/noExplicitAny: test mock
-		const adapter = createSDKAdapter(input as any);
-		adapter.app.log("test message");
-
-		expect(logCapture).toContain("test message");
+		try {
+			const { ctx } = makeAdapterContext();
+			createSDKAdapter(ctx).app.log("extractor warning");
+		} finally {
+			console.warn = originalWarn;
+		}
+		expect(warnings).toEqual(["extractor warning"]);
 	});
 });
 
-describe("plugin default export", () => {
-	it("ignores non-session.status events", async () => {
-		// Import the default export (plugin factory function).
-		const pluginModule = await import("./index");
-		const plugin = pluginModule.default;
+// ---------------------------------------------------------------------------
+// Entry point / subscription loop
+// ---------------------------------------------------------------------------
 
-		const logCapture: string[] = [];
-		const input = makePluginInput({ logCapture });
+/** Console capture used by entry-point tests, recorded per channel. */
+function captureConsole(): {
+	info: string[];
+	warn: string[];
+	error: string[];
+	all: () => string[];
+	restore: () => void;
+} {
+	const info: string[] = [];
+	const warn: string[] = [];
+	const error: string[] = [];
+	const original = { info: console.info, warn: console.warn, error: console.error };
+	const record =
+		(target: string[]) =>
+		(...args: unknown[]) => {
+			target.push(args.map((arg) => String(arg)).join(" "));
+		};
+	console.info = record(info);
+	console.warn = record(warn);
+	console.error = record(error);
+	return {
+		info,
+		warn,
+		error,
+		all: () => [...info, ...warn, ...error],
+		restore: () => {
+			console.info = original.info;
+			console.warn = original.warn;
+			console.error = original.error;
+		},
+	};
+}
 
-		// The plugin function initializes DB + config, so we call it.
-		// biome-ignore lint/suspicious/noExplicitAny: test mock
-		const hooks = await plugin(input as any);
-
-		// Fire a non-session.status event — should be silently ignored.
-		await hooks.event?.({
-			event: {
-				type: "lsp.updated",
-				properties: {},
-				// biome-ignore lint/suspicious/noExplicitAny: test mock
-			} as any,
-		});
-
-		// No error logged — the event handler returned early.
-		expect(logCapture.filter((l) => l.includes("error")).length).toBe(0);
+/** A promise with an externally callable resolver, for deterministic sync. */
+function deferred<T = void>(): {
+	promise: Promise<T>;
+	resolve: (value?: T) => void;
+} {
+	let resolve!: (value?: T) => void;
+	const promise = new Promise<T>((res) => {
+		resolve = res;
 	});
+	return { promise, resolve };
+}
 
-	it("ignores non-idle session.status events", async () => {
-		const pluginModule = await import("./index");
-		const plugin = pluginModule.default;
+function idleEvent(sessionID: string): unknown {
+	return { type: "session.status", data: { sessionID, status: { type: "idle" } } };
+}
 
-		const logCapture: string[] = [];
-		const input = makePluginInput({ logCapture });
+function statusEvent(sessionID: string, statusType: string): unknown {
+	return { type: "session.status", data: { sessionID, status: { type: statusType } } };
+}
 
-		// biome-ignore lint/suspicious/noExplicitAny: test mock
-		const hooks = await plugin(input as any);
+function sessionIdleEvent(sessionID: string): unknown {
+	return { type: "session.idle", data: { sessionID } };
+}
 
-		await hooks.event?.({
-			event: {
-				type: "session.status",
-				properties: {
-					sessionID: "sess-busy",
-					status: { type: "busy" },
+function executionEvent(kind: string, sessionID: string): unknown {
+	return { type: `session.execution.${kind}`, data: { sessionID } };
+}
+
+function emptyStream(): AsyncIterable<unknown> {
+	return {
+		[Symbol.asyncIterator]() {
+			return {
+				async next(): Promise<IteratorResult<unknown>> {
+					return { done: true, value: undefined };
 				},
-				// biome-ignore lint/suspicious/noExplicitAny: test mock
-			} as any,
-		});
+			};
+		},
+	};
+}
 
-		// No error logged — non-idle statuses are ignored.
-		expect(logCapture.filter((l) => l.includes("error")).length).toBe(0);
+function finiteStream(events: unknown[]): AsyncIterable<unknown> {
+	return {
+		[Symbol.asyncIterator]() {
+			let index = 0;
+			return {
+				async next(): Promise<IteratorResult<unknown>> {
+					if (index < events.length) {
+						const value = events[index];
+						index += 1;
+						return { done: false, value };
+					}
+					return { done: true, value: undefined };
+				},
+			};
+		},
+	};
+}
+
+function failingStream(error: Error): AsyncIterable<unknown> {
+	return {
+		[Symbol.asyncIterator]() {
+			return {
+				async next(): Promise<IteratorResult<unknown>> {
+					throw error;
+				},
+			};
+		},
+	};
+}
+
+function waitForAbort(signal: AbortSignal | undefined): Promise<void> {
+	if (!signal || signal.aborted) return Promise.resolve();
+	return new Promise((resolve) => {
+		signal.addEventListener("abort", () => resolve(), { once: true });
 	});
+}
 
-	it("ignores events with missing sessionID", async () => {
-		const pluginModule = await import("./index");
-		const plugin = pluginModule.default;
-
-		const logCapture: string[] = [];
-		const input = makePluginInput({ logCapture });
-
-		// biome-ignore lint/suspicious/noExplicitAny: test mock
-		const hooks = await plugin(input as any);
-
-		await hooks.event?.({
-			event: {
-				type: "session.status",
-				properties: {
-					sessionID: "",
-					status: { type: "idle" },
+function abortableStream(
+	events: unknown[],
+	signal: AbortSignal | undefined,
+): AsyncIterable<unknown> {
+	let index = 0;
+	return {
+		[Symbol.asyncIterator]() {
+			return {
+				async next(): Promise<IteratorResult<unknown>> {
+					if (signal?.aborted) throw new DOMException("aborted", "AbortError");
+					if (index < events.length) {
+						const value = events[index];
+						index += 1;
+						return { done: false, value };
+					}
+					await waitForAbort(signal);
+					throw new DOMException("aborted", "AbortError");
 				},
-				// biome-ignore lint/suspicious/noExplicitAny: test mock
-			} as any,
-		});
+			};
+		},
+	};
+}
 
-		// No error logged — empty sessionID is silently ignored.
-		expect(logCapture.filter((l) => l.includes("error")).length).toBe(0);
-	});
+interface FakeEventContext {
+	ctx: Pick<Plugin.Context, "event">;
+	subscribeCalls: Array<{ types?: readonly string[]; signal?: AbortSignal }>;
+}
 
-	it("catches and logs errors from handleSessionIdle", async () => {
-		const pluginModule = await import("./index");
-		const plugin = pluginModule.default;
-
-		const logCapture: string[] = [];
-		// Make session.get throw to trigger an error inside handleSessionIdle.
-		// The adapter's session.get calls client.session.get which throws,
-		// and the plugin's event handler catch block should log it.
-		const input = {
-			client: {
-				session: {
-					get: async () => {
-						throw new Error("simulated SDK failure");
-					},
-					messages: async () => ({ data: [] }),
-				},
-				project: { current: async () => ({ data: null }) },
-				app: {
-					log: (opts: { body: { message: string } }) => {
-						logCapture.push(opts.body.message);
-					},
-				},
+function makeEventContext(
+	streamFactory: (options: {
+		types?: readonly string[];
+		signal?: AbortSignal;
+	}) => AsyncIterable<unknown>,
+): FakeEventContext {
+	const subscribeCalls: Array<{ types?: readonly string[]; signal?: AbortSignal }> = [];
+	const ctx = {
+		event: {
+			subscribe: (options?: { types?: readonly string[]; signal?: AbortSignal }) => {
+				subscribeCalls.push(options ?? {});
+				return streamFactory(options ?? {});
 			},
-			project: { id: "proj-err" },
-			directory: "/tmp/error-test",
+		},
+	};
+	return { ctx: ctx as unknown as Pick<Plugin.Context, "event">, subscribeCalls };
+}
+
+function makeFullContext(
+	options: {
+		stream?: (options: {
+			types?: readonly string[];
+			signal?: AbortSignal;
+		}) => AsyncIterable<unknown>;
+		session?: FakeSessionInfo | null;
+		getSession?: (sessionID: string) => Promise<FakeSessionInfo | null> | FakeSessionInfo | null;
+		messages?: unknown[];
+		project?: { id: string; directory: string; canonical: string };
+	} = {},
+): {
+	ctx: Plugin.Context;
+	subscribeCalls: Array<{ types?: readonly string[]; signal?: AbortSignal }>;
+} {
+	const subscribeCalls: Array<{ types?: readonly string[]; signal?: AbortSignal }> = [];
+	const ctx = {
+		session: {
+			get: async ({ sessionID }: { sessionID: string }) => {
+				if (options.getSession) return options.getSession(sessionID);
+				return options.session === undefined ? defaultSession(sessionID) : options.session;
+			},
+			context: async () => options.messages ?? [],
+		},
+		location: {
+			directory: "/instance",
+			project: options.project ?? {
+				id: "proj-inst",
+				directory: "/instance",
+				canonical: "/instance/project",
+			},
+		},
+		event: {
+			subscribe: (opts?: { types?: readonly string[]; signal?: AbortSignal }) => {
+				subscribeCalls.push(opts ?? {});
+				return options.stream ? options.stream(opts ?? {}) : emptyStream();
+			},
+		},
+	};
+	return { ctx: ctx as unknown as Plugin.Context, subscribeCalls };
+}
+
+describe("event subscription loop", () => {
+	let dataHome: string;
+	let originalXdg: string | undefined;
+	const openDbs: Database[] = [];
+
+	beforeEach(() => {
+		originalXdg = process.env.XDG_DATA_HOME;
+		dataHome = mkdtempSync(path.join(tmpdir(), "ocm-entry-"));
+		process.env.XDG_DATA_HOME = dataHome;
+		openDbs.length = 0;
+	});
+
+	afterEach(() => {
+		for (const db of openDbs) {
+			try {
+				db.close();
+			} catch {
+				// already closed
+			}
+		}
+		if (originalXdg === undefined) {
+			process.env.XDG_DATA_HOME = undefined;
+			delete process.env.XDG_DATA_HOME;
+		} else {
+			process.env.XDG_DATA_HOME = originalXdg;
+		}
+		rmSync(dataHome, { recursive: true, force: true });
+	});
+
+	async function makeRuntime(client: SDKClient = makeClient().client) {
+		const { db } = initDatabase();
+		openDbs.push(db);
+		return {
+			db,
+			config: DEFAULT_CONFIG,
+			classificationCache: new ClassificationCache(),
+			budgetCache: new ClassificationCache(),
+			sdkClient: client,
+		};
+	}
+
+	it("handles idle events sequentially and does not double-count deltas", async () => {
+		let firstGetSettled = false;
+		let getCount = 0;
+		const client: SDKClient = {
+			session: {
+				get: async (id) => {
+					getCount += 1;
+					const cost = getCount === 1 ? 0.1 : 0.3;
+					firstGetSettled = true;
+					return {
+						id,
+						cost,
+						tokensInput: getCount * 10,
+						tokensOutput: 0,
+						tokensReasoning: 0,
+						tokensCacheRead: 0,
+						tokensCacheWrite: 0,
+						agent: "build",
+						model: "m",
+						title: "t",
+						projectID: "p",
+						timeCreated: 1,
+						timeUpdated: getCount,
+					};
+				},
+				messages: async () => [],
+			},
+			project: { current: async () => ({ id: "p", path: "/repo" }) },
+			app: { log: () => {} },
 		};
 
-		// biome-ignore lint/suspicious/noExplicitAny: test mock
-		const hooks = await plugin(input as any);
+		let index = 0;
+		let violation = false;
+		const events = [idleEvent("sess-seq"), idleEvent("sess-seq")];
+		const stream: AsyncIterable<unknown> = {
+			[Symbol.asyncIterator]() {
+				return {
+					async next(): Promise<IteratorResult<unknown>> {
+						if (index === 1 && !firstGetSettled) violation = true;
+						if (index < events.length) {
+							const value = events[index];
+							index += 1;
+							return { done: false, value };
+						}
+						return { done: true, value: undefined };
+					},
+				};
+			},
+		};
+		const { ctx } = makeEventContext(() => stream);
+		const runtime = await makeRuntime(client);
+		const controller = new AbortController();
 
-		// The event handler should catch and log the error, not re-throw.
-		await hooks.event?.({
-			event: {
-				type: "session.status",
-				properties: {
-					sessionID: "sess-err",
-					status: { type: "idle" },
+		await runSubscriptionLoop(
+			ctx,
+			runtime,
+			{ sleep: async () => {}, captureDebounceMs: 0 },
+			controller.signal,
+		);
+
+		expect(violation).toBe(false);
+
+		const delta = runtime.db
+			.prepare(
+				"SELECT COALESCE(SUM(delta), 0) AS total FROM measurement_deltas WHERE session_id = ? AND metric_name = 'cost'",
+			)
+			.get("sess-seq") as { total: number };
+		expect(delta.total).toBeCloseTo(0.3);
+
+		const cumulative = runtime.db
+			.prepare("SELECT value FROM measurements WHERE session_id = ? AND metric_name = 'cost'")
+			.get("sess-seq") as { value: number };
+		expect(cumulative.value).toBeCloseTo(0.3);
+	});
+
+	it("filters non-idle statuses and non-session.status events", async () => {
+		const capture = captureConsole();
+		try {
+			const { ctx } = makeEventContext(() =>
+				finiteStream([
+					{ type: "lsp.updated", data: {} },
+					{ type: "session.status", data: { sessionID: "sess-busy", status: { type: "busy" } } },
+					{ type: "session.status", data: { sessionID: "sess-retry", status: { type: "retry" } } },
+				]),
+			);
+			const runtime = await makeRuntime();
+			await runSubscriptionLoop(
+				ctx,
+				runtime,
+				{ sleep: async () => {} },
+				new AbortController().signal,
+			);
+
+			const count = runtime.db.prepare("SELECT COUNT(*) AS count FROM sessions").get() as {
+				count: number;
+			};
+			expect(count.count).toBe(0);
+			expect(capture.error).toEqual([]);
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("captures for every terminal event family", async () => {
+		const { ctx } = makeEventContext(() =>
+			finiteStream([
+				statusEvent("sess-status-idle", "idle"),
+				sessionIdleEvent("sess-session-idle"),
+				executionEvent("succeeded", "sess-exec-ok"),
+				executionEvent("failed", "sess-exec-fail"),
+				executionEvent("interrupted", "sess-exec-int"),
+			]),
+		);
+		const runtime = await makeRuntime();
+		await runSubscriptionLoop(
+			ctx,
+			runtime,
+			{ sleep: async () => {}, captureDebounceMs: 0 },
+			new AbortController().signal,
+		);
+
+		const rows = runtime.db
+			.prepare("SELECT session_id FROM sessions ORDER BY session_id")
+			.all() as Array<{ session_id: string }>;
+		expect(rows.map((row) => row.session_id)).toEqual([
+			"sess-exec-fail",
+			"sess-exec-int",
+			"sess-exec-ok",
+			"sess-session-idle",
+			"sess-status-idle",
+		]);
+	});
+
+	it("subscribes to every lifecycle event family", async () => {
+		const { ctx, subscribeCalls } = makeEventContext(() => emptyStream());
+		const runtime = await makeRuntime();
+		await runSubscriptionLoop(
+			ctx,
+			runtime,
+			{ sleep: async () => {} },
+			new AbortController().signal,
+		);
+
+		expect(subscribeCalls[0]?.types).toEqual([
+			"session.status",
+			"session.idle",
+			"session.execution.succeeded",
+			"session.execution.failed",
+			"session.execution.interrupted",
+		]);
+	});
+
+	it("collapses duplicate terminal events within the window into one capture", async () => {
+		const capture = captureConsole();
+		try {
+			const { ctx } = makeEventContext(() =>
+				finiteStream([
+					idleEvent("sess-dupe"),
+					sessionIdleEvent("sess-dupe"),
+					executionEvent("succeeded", "sess-dupe"),
+				]),
+			);
+			const runtime = await makeRuntime();
+			await runSubscriptionLoop(
+				ctx,
+				runtime,
+				{ sleep: async () => {}, captureDebounceMs: 750, now: () => 1000 },
+				new AbortController().signal,
+			);
+
+			const count = runtime.db.prepare("SELECT COUNT(*) AS count FROM sessions").get() as {
+				count: number;
+			};
+			expect(count.count).toBe(1);
+			const skips = capture.info.filter((line) => line.includes("skipping duplicate capture"));
+			expect(skips.length).toBe(2);
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("captures again once the debounce window has elapsed", async () => {
+		const times = [1000, 2000];
+		let index = 0;
+		let getCalls = 0;
+		const base = makeClient();
+		const client: SDKClient = {
+			...base.client,
+			session: {
+				...base.client.session,
+				get: async (id) => {
+					getCalls += 1;
+					return base.client.session.get(id);
 				},
-				// biome-ignore lint/suspicious/noExplicitAny: test mock
-			} as any,
-		});
+			},
+		};
+		const { ctx } = makeEventContext(() =>
+			finiteStream([idleEvent("sess-window"), sessionIdleEvent("sess-window")]),
+		);
+		const runtime = await makeRuntime(client);
+		await runSubscriptionLoop(
+			ctx,
+			runtime,
+			{ sleep: async () => {}, captureDebounceMs: 750, now: () => times[index++] ?? 2000 },
+			new AbortController().signal,
+		);
 
-		// The error should be logged, not thrown.
-		expect(
-			logCapture.some((l) => l.includes("error") && l.includes("simulated SDK failure")),
-		).toBe(true);
+		expect(getCalls).toBe(2);
+	});
+
+	it("does not move the timestamp when an event is debounced", async () => {
+		// 1000 captures; 1100 is skipped; 1800 is 800ms after the last real
+		// capture and must still capture. If the skip bumped the timestamp to
+		// 1100, 1800 would fall inside the window and be dropped.
+		const times = [1000, 1100, 1800];
+		let index = 0;
+		let getCalls = 0;
+		const base = makeClient();
+		const client: SDKClient = {
+			...base.client,
+			session: {
+				...base.client.session,
+				get: async (id) => {
+					getCalls += 1;
+					return base.client.session.get(id);
+				},
+			},
+		};
+		const { ctx } = makeEventContext(() =>
+			finiteStream([
+				idleEvent("sess-skip"),
+				sessionIdleEvent("sess-skip"),
+				executionEvent("succeeded", "sess-skip"),
+			]),
+		);
+		const runtime = await makeRuntime(client);
+		await runSubscriptionLoop(
+			ctx,
+			runtime,
+			{ sleep: async () => {}, captureDebounceMs: 750, now: () => times[index++] ?? 1800 },
+			new AbortController().signal,
+		);
+
+		expect(getCalls).toBe(2);
+	});
+
+	it("warns and skips malformed payloads for every family", async () => {
+		const capture = captureConsole();
+		try {
+			const families = [
+				"session.status",
+				"session.idle",
+				"session.execution.succeeded",
+				"session.execution.failed",
+				"session.execution.interrupted",
+			];
+			const events: unknown[] = [];
+			for (const type of families) {
+				events.push({ type, data: null });
+				events.push({ type, data: { sessionID: "" } });
+			}
+			const { ctx } = makeEventContext(() => finiteStream(events));
+			const runtime = await makeRuntime();
+			await runSubscriptionLoop(
+				ctx,
+				runtime,
+				{ sleep: async () => {}, captureDebounceMs: 0 },
+				new AbortController().signal,
+			);
+
+			const count = runtime.db.prepare("SELECT COUNT(*) AS count FROM sessions").get() as {
+				count: number;
+			};
+			expect(count.count).toBe(0);
+			const warnings = capture.warn.filter((line) => line.includes("skipping"));
+			expect(warnings.length).toBe(10);
+			for (const type of families) {
+				expect(warnings.some((line) => line.includes(`${type} event with missing data`))).toBe(
+					true,
+				);
+				expect(
+					warnings.some((line) => line.includes(`${type} event with missing session id`)),
+				).toBe(true);
+			}
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("treats a capture that throws as an attempt (no retry storm)", async () => {
+		const capture = captureConsole();
+		let getCalls = 0;
+		const base = makeClient();
+		const failingOnce: SDKClient = {
+			...base.client,
+			session: {
+				...base.client.session,
+				get: async (id) => {
+					getCalls += 1;
+					if (getCalls === 1) throw new Error("sdk boom");
+					return base.client.session.get(id);
+				},
+			},
+		};
+		try {
+			const { ctx } = makeEventContext(() =>
+				finiteStream([idleEvent("sess-throw"), sessionIdleEvent("sess-throw")]),
+			);
+			const runtime = await makeRuntime(failingOnce);
+			await runSubscriptionLoop(
+				ctx,
+				runtime,
+				{ sleep: async () => {}, captureDebounceMs: 750, now: () => 1000 },
+				new AbortController().signal,
+			);
+
+			// The second event is debounced even though the first attempt threw.
+			expect(getCalls).toBe(1);
+			expect(capture.error.some((line) => line.includes("sdk boom"))).toBe(true);
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("ignores unknown event types silently", async () => {
+		const capture = captureConsole();
+		try {
+			const runtime = await makeRuntime();
+			await handleSessionEvent({ type: "lsp.updated", data: { sessionID: "sess-x" } }, runtime);
+			await handleSessionEvent({ type: "message.updated" }, runtime);
+
+			expect(capture.warn).toEqual([]);
+			expect(capture.error).toEqual([]);
+			const count = runtime.db.prepare("SELECT COUNT(*) AS count FROM sessions").get() as {
+				count: number;
+			};
+			expect(count.count).toBe(0);
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("skips malformed payloads with a warning", async () => {
+		const capture = captureConsole();
+		try {
+			const { ctx } = makeEventContext(() =>
+				finiteStream([
+					{ type: "session.status", data: null },
+					{ type: "session.status", data: { sessionID: "", status: { type: "idle" } } },
+					{ type: "session.status", data: { sessionID: "sess-x", status: null } },
+				]),
+			);
+			const runtime = await makeRuntime();
+			await runSubscriptionLoop(
+				ctx,
+				runtime,
+				{ sleep: async () => {} },
+				new AbortController().signal,
+			);
+
+			const count = runtime.db.prepare("SELECT COUNT(*) AS count FROM sessions").get() as {
+				count: number;
+			};
+			expect(count.count).toBe(0);
+			const warnings = capture.warn.filter((line) => line.includes("skipping"));
+			expect(warnings.length).toBe(3);
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("recovers from an SDK query failure and captures the next idle event", async () => {
+		const capture = captureConsole();
+		let calls = 0;
+		const base = makeClient();
+		const client: SDKClient = {
+			...base.client,
+			session: {
+				...base.client.session,
+				get: async (id) => {
+					calls += 1;
+					if (calls === 1) throw new Error("sdk boom");
+					return base.client.session.get(id);
+				},
+			},
+		};
+		try {
+			const { ctx } = makeEventContext(() =>
+				finiteStream([idleEvent("sess-fail"), idleEvent("sess-ok")]),
+			);
+			const runtime = await makeRuntime(client);
+			await runSubscriptionLoop(
+				ctx,
+				runtime,
+				{ sleep: async () => {} },
+				new AbortController().signal,
+			);
+
+			expect(capture.error.some((line) => line.includes("sdk boom"))).toBe(true);
+			const row = runtime.db
+				.prepare("SELECT COUNT(*) AS count FROM sessions WHERE session_id = ?")
+				.get("sess-ok") as { count: number };
+			expect(row.count).toBe(1);
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("recovers from a database write failure and persists a later capture", async () => {
+		const capture = captureConsole();
+		let failNextWrite = true;
+		let getCalls = 0;
+		const base = makeClient();
+		const client: SDKClient = {
+			...base.client,
+			session: {
+				...base.client.session,
+				get: async (id) => {
+					getCalls += 1;
+					if (getCalls === 2) failNextWrite = false;
+					return base.client.session.get(id);
+				},
+			},
+		};
+		try {
+			const runtime = await makeRuntime(client);
+			const realDb = runtime.db;
+			const flakyDb = new Proxy(realDb, {
+				get(target, property) {
+					if (property === "transaction") {
+						return (fn: () => void) => {
+							if (failNextWrite) throw new Error("disk full");
+							return target.transaction(fn);
+						};
+					}
+					const value = Reflect.get(target, property);
+					return typeof value === "function" ? value.bind(target) : value;
+				},
+			}) as Database;
+			runtime.db = flakyDb;
+
+			const { ctx } = makeEventContext(() =>
+				finiteStream([idleEvent("sess-write-1"), idleEvent("sess-write-2")]),
+			);
+			await runSubscriptionLoop(
+				ctx,
+				runtime,
+				{ sleep: async () => {} },
+				new AbortController().signal,
+			);
+
+			expect(capture.error.some((line) => line.includes("disk full"))).toBe(true);
+			const row = runtime.db
+				.prepare("SELECT COUNT(*) AS count FROM sessions WHERE session_id = ?")
+				.get("sess-write-2") as { count: number };
+			expect(row.count).toBe(1);
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("logs three attempt failures, two resubscribe lines, and a terminal stop", async () => {
+		const capture = captureConsole();
+		const delays: number[] = [];
+		try {
+			const { ctx } = makeEventContext(() => failingStream(new Error("stream boom")));
+			const runtime = await makeRuntime();
+			await runSubscriptionLoop(
+				ctx,
+				runtime,
+				{ sleep: async (ms) => delays.push(ms), retryBaseDelayMs: 500 },
+				new AbortController().signal,
+			);
+
+			expect(delays).toEqual([500, 1000]);
+			const failures = capture.error.filter((line) => line.includes("subscription failed"));
+			expect(failures.length).toBe(3);
+			const resubscribes = capture.info.filter((line) => line.includes("resubscribing"));
+			expect(resubscribes.length).toBe(2);
+			const terminal = capture.error.filter((line) => line.includes("metrics collection halted"));
+			expect(terminal.length).toBe(1);
+			// Regression guard: failures must stay on the error channel, not info.
+			expect(capture.info.some((line) => line.includes("subscription failed"))).toBe(false);
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("caps the resubscribe delay at 8000ms", async () => {
+		const capture = captureConsole();
+		const delays: number[] = [];
+		try {
+			const { ctx } = makeEventContext(() => failingStream(new Error("stream boom")));
+			const runtime = await makeRuntime();
+			await runSubscriptionLoop(
+				ctx,
+				runtime,
+				{ sleep: async (ms) => delays.push(ms), retryBaseDelayMs: 6000 },
+				new AbortController().signal,
+			);
+			expect(delays).toEqual([6000, 8000]);
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("resets the retry budget after a successful subscription", async () => {
+		const capture = captureConsole();
+		const delays: number[] = [];
+		let subscriptions = 0;
+		const client = makeClient().client;
+		try {
+			const { ctx } = makeEventContext(() => {
+				subscriptions += 1;
+				if (subscriptions === 1) {
+					// One successful event, then a stream failure.
+					let step = 0;
+					return {
+						[Symbol.asyncIterator]() {
+							return {
+								async next(): Promise<IteratorResult<unknown>> {
+									step += 1;
+									if (step === 1) return { done: false, value: idleEvent("sess-reset") };
+									throw new Error("after success");
+								},
+							};
+						},
+					};
+				}
+				return failingStream(new Error("boom"));
+			});
+			const runtime = await makeRuntime(client);
+			await runSubscriptionLoop(
+				ctx,
+				runtime,
+				{ sleep: async (ms) => delays.push(ms), retryBaseDelayMs: 500 },
+				new AbortController().signal,
+			);
+
+			// Three subscriptions prove the budget restarted after the success.
+			expect(subscriptions).toBe(3);
+			expect(delays).toEqual([500, 1000]);
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("logs normal stream completion without an error", async () => {
+		const capture = captureConsole();
+		try {
+			const { ctx } = makeEventContext(() => emptyStream());
+			const runtime = await makeRuntime();
+			await runSubscriptionLoop(
+				ctx,
+				runtime,
+				{ sleep: async () => {} },
+				new AbortController().signal,
+			);
+
+			expect(capture.info.some((line) => line.includes("subscription completed"))).toBe(true);
+			expect(capture.error.some((line) => line.includes("subscription failed"))).toBe(false);
+			expect(capture.error.some((line) => line.includes("metrics collection halted"))).toBe(false);
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("does not log an abort as an error, and does not consume further events", async () => {
+		const capture = captureConsole();
+		try {
+			const controller = new AbortController();
+			let captured: AbortSignal | undefined;
+			const subscribed = deferred();
+			const { ctx } = makeEventContext((options) => {
+				captured = options.signal;
+				subscribed.resolve();
+				return abortableStream([], options.signal);
+			});
+			const runtime = await makeRuntime();
+			const loop = runSubscriptionLoop(ctx, runtime, { sleep: async () => {} }, controller.signal);
+
+			await subscribed.promise;
+			expect(captured?.aborted).toBe(false);
+			controller.abort();
+			expect(captured?.aborted).toBe(true);
+			await loop;
+
+			expect(capture.error).toEqual([]);
+			expect(capture.error.some((line) => line.includes("subscription failed"))).toBe(false);
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("logs a non-abort error from the same generator (positive control)", async () => {
+		const capture = captureConsole();
+		try {
+			const { ctx } = makeEventContext(() => failingStream(new Error("real failure")));
+			const runtime = await makeRuntime();
+			await runSubscriptionLoop(
+				ctx,
+				runtime,
+				{ sleep: async () => {}, maxSubscribeAttempts: 1 },
+				new AbortController().signal,
+			);
+			expect(capture.error.some((line) => line.includes("real failure"))).toBe(true);
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("logs an AbortError-named error when the signal is not aborted", async () => {
+		const capture = captureConsole();
+		try {
+			const abortLike = new Error("aborted");
+			abortLike.name = "AbortError";
+			const { ctx } = makeEventContext(() => failingStream(abortLike));
+			const runtime = await makeRuntime();
+			await runSubscriptionLoop(
+				ctx,
+				runtime,
+				{ sleep: async () => {}, maxSubscribeAttempts: 1 },
+				new AbortController().signal,
+			);
+			expect(capture.error.some((line) => line.includes("AbortError"))).toBe(true);
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("completes an in-flight capture atomically when the loop is aborted", async () => {
+		const capture = captureConsole();
+		try {
+			let resolveGet: ((value: FakeSessionInfo | null) => void) | undefined;
+			const pending = new Promise<FakeSessionInfo | null>((resolve) => {
+				resolveGet = resolve;
+			});
+			// Resolved inside session.get so the test can prove the capture
+			// actually started before aborting (never passes vacuously).
+			const started = deferred();
+			const client: SDKClient = {
+				session: {
+					get: () => {
+						started.resolve();
+						return pending;
+					},
+					messages: async () => [],
+				},
+				project: { current: async () => ({ id: "p", path: "/repo" }) },
+				app: { log: () => {} },
+			};
+			const controller = new AbortController();
+			const { ctx } = makeEventContext((options) =>
+				abortableStream([idleEvent("sess-inflight")], options.signal),
+			);
+			const runtime = await makeRuntime(client);
+			const loop = runSubscriptionLoop(ctx, runtime, { sleep: async () => {} }, controller.signal);
+
+			await started.promise;
+			controller.abort();
+			resolveGet?.({
+				...defaultSession("sess-inflight"),
+				projectID: "p",
+				timeCreated: 1,
+				timeUpdated: 2,
+			});
+			await loop;
+
+			const session = runtime.db
+				.prepare("SELECT COUNT(*) AS count FROM sessions WHERE session_id = ?")
+				.get("sess-inflight") as { count: number };
+			const measurements = runtime.db
+				.prepare("SELECT COUNT(*) AS count FROM measurements WHERE session_id = ?")
+				.get("sess-inflight") as { count: number };
+			// Either the write rolled back (no row) or completed fully.
+			if (session.count === 1) {
+				expect(measurements.count).toBe(15);
+			} else {
+				expect(measurements.count).toBe(0);
+			}
+			expect(capture.error.some((line) => line.includes("subscription failed"))).toBe(false);
+		} finally {
+			capture.restore();
+		}
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Setup, version guard, initialization, isolation
+// ---------------------------------------------------------------------------
+
+describe("setupPlugin", () => {
+	let dataHome: string;
+	let originalXdg: string | undefined;
+
+	beforeEach(() => {
+		originalXdg = process.env.XDG_DATA_HOME;
+		dataHome = mkdtempSync(path.join(tmpdir(), "ocm-setup-"));
+		process.env.XDG_DATA_HOME = dataHome;
+	});
+
+	afterEach(() => {
+		if (originalXdg === undefined) {
+			delete process.env.XDG_DATA_HOME;
+		} else {
+			process.env.XDG_DATA_HOME = originalXdg;
+		}
+		rmSync(dataHome, { recursive: true, force: true });
+	});
+
+	it("rejects an unsupported injected plugin version without subscribing", async () => {
+		const capture = captureConsole();
+		try {
+			const { ctx, subscribeCalls } = makeFullContext();
+			const cleanup = await setupPlugin(ctx, { pluginVersion: "3.0.0" });
+
+			expect(capture.error.some((line) => line.includes(">=2.2.5 <3.0.0"))).toBe(true);
+			expect(subscribeCalls.length).toBe(0);
+			expect(() => cleanup()).not.toThrow();
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("returns a no-op cleanup when initialization fails (ENOTDIR)", async () => {
+		const capture = captureConsole();
+		const blocker = path.join(dataHome, "blocker");
+		writeFileSync(blocker, "not a directory");
+		const nested = path.join(blocker, "nested");
+		process.env.XDG_DATA_HOME = nested;
+		try {
+			const { ctx, subscribeCalls } = makeFullContext();
+			const cleanup = await setupPlugin(ctx, {
+				pluginVersion: "2.2.5",
+				sleep: async () => {},
+			});
+
+			expect(capture.error.some((line) => line.includes("initialization failed"))).toBe(true);
+			expect(subscribeCalls.length).toBe(0);
+			expect(() => cleanup()).not.toThrow();
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("captures a session end-to-end and updates cumulatively", async () => {
+		const capture = captureConsole();
+		const sessionState: FakeSessionInfo = {
+			...defaultSession("sess-e2e"),
+			cost: 0.2,
+			projectID: "proj-e2e",
+			location: { directory: "/repo/e2e-project" },
+		};
+		try {
+			const { ctx } = makeFullContext({
+				getSession: () => sessionState,
+				stream: () => finiteStream([idleEvent("sess-e2e")]),
+			});
+
+			const subscribed = deferred();
+			const loopDone = deferred();
+			const cleanup = await setupPlugin(ctx, {
+				pluginVersion: "2.2.5",
+				sleep: async () => {},
+				onSubscribed: () => subscribed.resolve(),
+				onLoopComplete: () => loopDone.resolve(),
+			});
+			await subscribed.promise;
+			cleanup();
+			await loopDone.promise;
+
+			const dbPath = path.join(dataHome, "opencode-metrics", "metrics.db");
+			const db = new Database(dbPath);
+			try {
+				const project = db
+					.prepare("SELECT project_id, worktree FROM projects WHERE project_id = ?")
+					.get("proj-e2e") as { project_id: string; worktree: string } | null;
+				expect(project?.worktree).toBe("/repo/e2e-project");
+
+				const session = db
+					.prepare("SELECT session_id FROM sessions WHERE session_id = ?")
+					.get("sess-e2e") as { session_id: string } | null;
+				expect(session).not.toBeNull();
+
+				const measurement = db
+					.prepare("SELECT value FROM measurements WHERE session_id = ? AND metric_name = 'cost'")
+					.get("sess-e2e") as { value: number };
+				expect(measurement.value).toBeCloseTo(0.2);
+
+				const delta = db
+					.prepare(
+						"SELECT COALESCE(SUM(delta), 0) AS total FROM measurement_deltas WHERE session_id = ? AND metric_name = 'cost'",
+					)
+					.get("sess-e2e") as { total: number };
+				expect(delta.total).toBeCloseTo(0.2);
+
+				// Second idle event with a higher cumulative cost.
+				sessionState.cost = 0.5;
+				sessionState.time = { created: 1, updated: 3 };
+				const secondSubscribed = deferred();
+				const secondDone = deferred();
+				const second = await setupPlugin(ctx, {
+					pluginVersion: "2.2.5",
+					sleep: async () => {},
+					onSubscribed: () => secondSubscribed.resolve(),
+					onLoopComplete: () => secondDone.resolve(),
+				});
+				await secondSubscribed.promise;
+				second();
+				await secondDone.promise;
+
+				const updated = db
+					.prepare("SELECT value FROM measurements WHERE session_id = ? AND metric_name = 'cost'")
+					.get("sess-e2e") as { value: number };
+				expect(updated.value).toBeCloseTo(0.5);
+
+				const totalDelta = db
+					.prepare(
+						"SELECT COALESCE(SUM(delta), 0) AS total FROM measurement_deltas WHERE session_id = ? AND metric_name = 'cost'",
+					)
+					.get("sess-e2e") as { total: number };
+				expect(totalDelta.total).toBeCloseTo(0.5);
+			} finally {
+				db.close();
+			}
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("stores the session's current agent/model, not the first user message", async () => {
+		const capture = captureConsole();
+		const sessionState: FakeSessionInfo = {
+			...defaultSession("sess-prov"),
+			agent: "build",
+			model: { id: "x", providerID: "anthropic" },
+		};
+		try {
+			const { ctx } = makeFullContext({
+				session: sessionState,
+				messages: [
+					{
+						id: "u1",
+						type: "user",
+						text: "plan it",
+						agent: "plan",
+						model: { id: "old", providerID: "openai" },
+					},
+				],
+				stream: () => finiteStream([idleEvent("sess-prov")]),
+			});
+
+			const subscribed = deferred();
+			const loopDone = deferred();
+			const cleanup = await setupPlugin(ctx, {
+				pluginVersion: "2.2.5",
+				sleep: async () => {},
+				onSubscribed: () => subscribed.resolve(),
+				onLoopComplete: () => loopDone.resolve(),
+			});
+			await subscribed.promise;
+			cleanup();
+			await loopDone.promise;
+
+			const db = new Database(path.join(dataHome, "opencode-metrics", "metrics.db"));
+			try {
+				const row = db
+					.prepare("SELECT agent, model, classification FROM sessions WHERE session_id = ?")
+					.get("sess-prov") as {
+					agent: string;
+					model: string;
+					classification: string;
+				};
+				expect(row.agent).toBe("build");
+				expect(row.model).toBe("x");
+				expect(row.classification).toBe("implementation");
+			} finally {
+				db.close();
+			}
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("never logs tool output, message text, or file contents", async () => {
+		const capture = captureConsole();
+		const marker = "SECRET_TOOL_OUTPUT_MARKER";
+		try {
+			const client: SDKClient = {
+				session: {
+					get: async (id) => ({
+						id,
+						cost: 0.1,
+						tokensInput: 1,
+						tokensOutput: 1,
+						tokensReasoning: 0,
+						tokensCacheRead: 0,
+						tokensCacheWrite: 0,
+						agent: "build",
+						model: "m",
+						title: "t",
+						projectID: "p",
+						timeCreated: 1,
+						timeUpdated: 2,
+					}),
+					messages: async () => [
+						{
+							id: "a1",
+							role: "assistant",
+							parts: [
+								{
+									type: "tool",
+									tool: "bash",
+									args: { command: `echo ${marker}` },
+									output: marker,
+								},
+							],
+						},
+					],
+				},
+				project: { current: async () => ({ id: "p", path: "/repo" }) },
+				app: { log: () => {} },
+			};
+			const { db } = initDatabase();
+			const failingDb = new Proxy(db, {
+				get(target, property) {
+					if (property === "transaction") {
+						return () => {
+							throw new Error("disk full");
+						};
+					}
+					const value = Reflect.get(target, property);
+					return typeof value === "function" ? value.bind(target) : value;
+				},
+			}) as Database;
+			const runtime = {
+				db: failingDb,
+				config: DEFAULT_CONFIG,
+				classificationCache: new ClassificationCache(),
+				budgetCache: new ClassificationCache(),
+				sdkClient: client,
+			};
+
+			const { ctx } = makeEventContext(() => finiteStream([idleEvent("sess-log")]));
+			await runSubscriptionLoop(
+				ctx,
+				runtime,
+				{ sleep: async () => {} },
+				new AbortController().signal,
+			);
+			db.close();
+
+			expect(capture.error.some((line) => line.includes("disk full"))).toBe(true);
+			expect(capture.error.some((line) => line.includes("sess-log"))).toBe(true);
+			expect(capture.all().some((line) => line.includes(marker))).toBe(false);
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("creates the data directory, database, and config with explicit permissions", async () => {
+		const capture = captureConsole();
+		const previousUmask = process.umask(0o000);
+		try {
+			const { ctx } = makeFullContext({ stream: () => emptyStream() });
+			const subscribed = deferred();
+			const loopDone = deferred();
+			const cleanup = await setupPlugin(ctx, {
+				pluginVersion: "2.2.5",
+				sleep: async () => {},
+				onSubscribed: () => subscribed.resolve(),
+				onLoopComplete: () => loopDone.resolve(),
+			});
+			await subscribed.promise;
+			cleanup();
+			await loopDone.promise;
+
+			// Startup is an info-level line, not an error.
+			expect(capture.info.some((line) => line.includes("initialized"))).toBe(true);
+			expect(capture.error).toEqual([]);
+
+			const dataDir = path.join(dataHome, "opencode-metrics");
+			expect(statSync(dataDir).mode & 0o777).toBe(0o755);
+			expect(statSync(path.join(dataDir, "metrics.db")).mode & 0o777).toBe(0o644);
+			expect(statSync(path.join(dataDir, "config.yaml")).mode & 0o777).toBe(0o644);
+		} finally {
+			process.umask(previousUmask);
+			capture.restore();
+		}
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Version resolver
+// ---------------------------------------------------------------------------
+
+describe("version resolver", () => {
+	const tempDirs: string[] = [];
+
+	afterEach(() => {
+		for (const dir of tempDirs.splice(0)) {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	function makeFixture(version: string | null, raw?: string): string {
+		const root = mkdtempSync(path.join(tmpdir(), "ocm-version-"));
+		tempDirs.push(root);
+		const packageDir = path.join(root, "node_modules", "@opencode", "plugin");
+		mkdirSync(packageDir, { recursive: true });
+		const contents =
+			raw ?? (version === null ? "" : JSON.stringify({ name: "@opencode/plugin", version }));
+		writeFileSync(path.join(packageDir, "package.json"), contents);
+		return root;
+	}
+
+	it("parses versions with prerelease and build suffixes", () => {
+		expect(isVersionSupported("2.2.5")).toBe(true);
+		expect(isVersionSupported("2.9.9")).toBe(true);
+		expect(isVersionSupported("2.2.4")).toBe(false);
+		expect(isVersionSupported("3.0.0")).toBe(false);
+		expect(isVersionSupported("3.0.0-rc.1")).toBe(false);
+		expect(isVersionSupported("not-a-version")).toBe(false);
+	});
+
+	it("resolves 2.2.4 as incompatible", () => {
+		const root = makeFixture("2.2.4");
+		const resolved = resolvePluginVersion(root);
+		expect(resolved.version).toBe("2.2.4");
+		expect(resolved.compatible).toBe(false);
+	});
+
+	it("resolves 2.2.5 as compatible (inclusive lower bound)", () => {
+		const root = makeFixture("2.2.5");
+		const resolved = resolvePluginVersion(root);
+		expect(resolved.version).toBe("2.2.5");
+		expect(resolved.compatible).toBe(true);
+	});
+
+	it("resolves 3.0.0 as incompatible (exclusive upper bound)", () => {
+		const root = makeFixture("3.0.0");
+		const resolved = resolvePluginVersion(root);
+		expect(resolved.version).toBe("3.0.0");
+		expect(resolved.compatible).toBe(false);
+	});
+
+	it("resolves 3.0.0-rc.1 as incompatible", () => {
+		const root = makeFixture("3.0.0-rc.1");
+		const resolved = resolvePluginVersion(root);
+		expect(resolved.version).toBe("3.0.0-rc.1");
+		expect(resolved.compatible).toBe(false);
+	});
+
+	it("treats a missing package as unresolved", () => {
+		const root = mkdtempSync(path.join(tmpdir(), "ocm-version-"));
+		tempDirs.push(root);
+		const resolved = resolvePluginVersion(root);
+		expect(resolved.version).toBeNull();
+		expect(resolved.compatible).toBe(false);
+	});
+
+	it("treats an unparseable package.json as unresolved", () => {
+		const root = makeFixture(null, "{not json");
+		const resolved = resolvePluginVersion(root);
+		expect(resolved.version).toBeNull();
+		expect(resolved.compatible).toBe(false);
+	});
+
+	it("does not subscribe when the fixture root is out of range or unreadable", async () => {
+		const dataHome = mkdtempSync(path.join(tmpdir(), "ocm-version-xdg-"));
+		const originalXdg = process.env.XDG_DATA_HOME;
+		process.env.XDG_DATA_HOME = dataHome;
+		const capture = captureConsole();
+		try {
+			for (const root of [
+				makeFixture("2.2.4"),
+				makeFixture("3.0.0"),
+				makeFixture(null, "{not json"),
+			]) {
+				const { ctx, subscribeCalls } = makeFullContext();
+				const cleanup = await setupPlugin(ctx, {
+					resolutionRoot: root,
+					sleep: async () => {},
+				});
+				expect(subscribeCalls.length).toBe(0);
+				expect(() => cleanup()).not.toThrow();
+			}
+		} finally {
+			capture.restore();
+			if (originalXdg === undefined) {
+				delete process.env.XDG_DATA_HOME;
+			} else {
+				process.env.XDG_DATA_HOME = originalXdg;
+			}
+			rmSync(dataHome, { recursive: true, force: true });
+		}
 	});
 });

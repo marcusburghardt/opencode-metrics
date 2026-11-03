@@ -44,6 +44,11 @@ export interface SessionInfo {
 	model?: string | Record<string, unknown>;
 	title?: string;
 	projectID?: string;
+	/**
+	 * Directory of the session's own project (V2 `session.location.directory`).
+	 * Preferred over the plugin instance's project path when it is absolute.
+	 */
+	projectDirectory?: string;
 	parentID?: string;
 	/** Epoch milliseconds when the session was created. */
 	timeCreated?: number;
@@ -61,6 +66,11 @@ export interface MessageInfo {
 	id: string;
 	role: string;
 	parts?: PartInfo[];
+	/**
+	 * Repo-relative file paths reported by the assistant message's V2
+	 * `snapshot.files`. Absent for non-assistant messages.
+	 */
+	snapshotFiles?: string[];
 }
 
 /** Simplified part data for text and tool call parts. */
@@ -226,6 +236,41 @@ export function computeDurationSeconds(timeCreated: number, timeUpdated: number)
 	return durationMs > 0 ? durationMs / 1000 : 0;
 }
 
+/** Return true when the value is a non-empty absolute filesystem path. */
+export function isUsableProjectDirectory(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0 && path.isAbsolute(value);
+}
+
+/**
+ * Normalize a snapshot file path to a repo-relative POSIX path.
+ * Returns null for values that are not strings, are empty, or are absolute.
+ */
+function normalizeSnapshotPath(value: unknown): string | null {
+	if (typeof value !== "string") return null;
+	const normalized = path.posix.normalize(value.replace(/\\/g, "/"));
+	if (!normalized || normalized === "." || normalized === "./") return null;
+	if (path.posix.isAbsolute(normalized)) return null;
+	const withoutDotPrefix = normalized.startsWith("./") ? normalized.slice(2) : normalized;
+	return withoutDotPrefix.length > 0 ? withoutDotPrefix : null;
+}
+
+/**
+ * Collect the distinct union of repo-relative snapshot file paths across
+ * assistant messages. Non-assistant messages and non-string entries are
+ * ignored.
+ */
+export function collectSnapshotFiles(messages: MessageInfo[]): string[] {
+	const files = new Set<string>();
+	for (const message of messages) {
+		if (message.role !== "assistant") continue;
+		for (const raw of message.snapshotFiles ?? []) {
+			const normalized = normalizeSnapshotPath(raw);
+			if (normalized) files.add(normalized);
+		}
+	}
+	return [...files];
+}
+
 /**
  * Build the full metrics array from extracted session values.
  * All 12 metric catalog entries are always produced.
@@ -322,8 +367,18 @@ export async function extractSessionData(
 	const tokensCacheWrite = session?.tokensCacheWrite ?? 0;
 	const agent = session?.agent ?? "unknown";
 	const title = session?.title ?? "unknown";
-	const projectId = project?.id ?? session?.projectID ?? "unknown";
-	const projectName = deriveProjectName(project?.name, project?.path);
+	// Prefer the session's own project data. V2 serves sessions from multiple
+	// projects, so the plugin instance's project is a fallback only. A
+	// non-absolute projectDirectory would silently break artifact resolution
+	// (git -C <path>), so it is ignored.
+	const sessionProjectDirectory = isUsableProjectDirectory(session?.projectDirectory)
+		? session.projectDirectory
+		: undefined;
+	const projectId = session?.projectID ?? project?.id ?? "unknown";
+	const projectPath = sessionProjectDirectory ?? project?.path;
+	const projectName = sessionProjectDirectory
+		? deriveProjectName(undefined, sessionProjectDirectory)
+		: deriveProjectName(project?.name, project?.path);
 	const timeCreated = session?.timeCreated ?? 0;
 	const timeUpdated = session?.timeUpdated ?? 0;
 	const model = resolveModelString(session?.model);
@@ -331,6 +386,12 @@ export async function extractSessionData(
 	// Derived metrics (Task 6.5).
 	const cacheHitRatio = computeCacheHitRatio(tokensCacheRead, tokensInput);
 	const durationSeconds = computeDurationSeconds(timeCreated, timeUpdated);
+
+	// V2 reports changed files through assistant snapshots instead of a
+	// session diff summary. Line counts are unavailable on V2 (0) until the
+	// upstream API exposes session diff data. A caller that still supplies
+	// diffStats (legacy/backfill paths) keeps the previous behavior.
+	const snapshotFiles = collectSnapshotFiles(messages);
 
 	// Use timeUpdated as the recorded_at timestamp, falling back to now.
 	const recordedAt = timeUpdated || Date.now();
@@ -345,7 +406,7 @@ export async function extractSessionData(
 			tokensCacheWrite,
 			cacheHitRatio,
 			durationSeconds,
-			filesChanged: session?.diffStats?.filesChanged ?? 0,
+			filesChanged: session?.diffStats?.filesChanged ?? snapshotFiles.length,
 			linesAdded: session?.diffStats?.linesAdded ?? 0,
 			linesDeleted: session?.diffStats?.linesDeleted ?? 0,
 			messagesTotal: messageCount,
@@ -355,7 +416,7 @@ export async function extractSessionData(
 
 	// Extract PR/issue artifacts from bash tool calls.
 	const bashToolCalls = extractBashToolCalls(messages);
-	const repoContext = project?.path ? resolveRepoContext(project.path) : null;
+	const repoContext = projectPath ? resolveRepoContext(projectPath) : null;
 
 	const prsCreated = extractPRsCreated(bashToolCalls);
 	const prsReviewed = extractPRsReviewed(bashToolCalls, repoContext);
@@ -377,7 +438,7 @@ export async function extractSessionData(
 		project: {
 			project_id: projectId,
 			name: projectName,
-			worktree: project?.path ?? "unknown",
+			worktree: projectPath ?? "unknown",
 		},
 		session: {
 			session_id: sessionId,
@@ -390,6 +451,7 @@ export async function extractSessionData(
 			ended_at: timeUpdated,
 			metadata: null,
 			budget_tag: null,
+			parent_session_id: session?.parentID ?? null,
 		},
 		metrics,
 		classificationContext: {
@@ -400,6 +462,7 @@ export async function extractSessionData(
 			part_content: partContent,
 			bash_commands: bashCommands,
 			message_count: messageCount,
+			parent_session_id: session?.parentID ?? "",
 		},
 		artifacts,
 	};

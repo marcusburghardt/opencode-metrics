@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import type { MessageInfo, ProjectInfo, SDKClient, SessionInfo } from "./extractor";
 import {
+	collectSnapshotFiles,
 	computeCacheHitRatio,
 	computeDurationSeconds,
 	deriveProjectName,
 	extractSessionData,
+	isUsableProjectDirectory,
 } from "./extractor";
 
 /** Factory for a mock SDKClient with configurable overrides. */
@@ -261,6 +266,7 @@ describe("extractSessionData", () => {
 
 	it("derives project name from worktree path when name is missing", async () => {
 		const client = makeClient({
+			session: { projectID: undefined },
 			project: { id: "proj-derived", name: undefined, path: "/home/user/repos/my-project" },
 		});
 		const result = await extractSessionData(client, "sess-derive");
@@ -372,6 +378,211 @@ describe("extractSessionData", () => {
 
 		expect(result).not.toBeNull();
 		expect(result?.session.budget_tag).toBeNull();
+	});
+
+	it("propagates parentID to the session record and classification context", async () => {
+		const client = makeClient({ session: { parentID: "sess-parent-abc" } });
+		const result = await extractSessionData(client, "sess-sub");
+
+		expect(result?.session.parent_session_id).toBe("sess-parent-abc");
+		expect(result?.classificationContext.parent_session_id).toBe("sess-parent-abc");
+	});
+
+	it("stores NULL and empty-string parent context for a root session", async () => {
+		const client = makeClient({ session: { parentID: undefined } });
+		const result = await extractSessionData(client, "sess-root");
+
+		expect(result?.session.parent_session_id).toBeNull();
+		expect(result?.classificationContext.parent_session_id).toBe("");
+	});
+});
+
+describe("extractSessionData project precedence", () => {
+	it("prefers the session's own projectID and projectDirectory", async () => {
+		const client = makeClient({
+			session: {
+				projectID: "proj-session",
+				projectDirectory: "/home/user/other-project",
+			},
+			project: { id: "proj-instance", name: "instance", path: "/home/user/instance" },
+		});
+		const result = await extractSessionData(client, "sess-precedence");
+
+		expect(result?.project.project_id).toBe("proj-session");
+		expect(result?.project.worktree).toBe("/home/user/other-project");
+		expect(result?.project.name).toBe("other-project");
+		expect(result?.session.project_id).toBe("proj-session");
+	});
+
+	it("ignores a relative projectDirectory and falls back to the instance path", async () => {
+		const client = makeClient({
+			session: {
+				projectID: "proj-session",
+				projectDirectory: "relative/path",
+			},
+			project: { id: "proj-instance", name: "instance", path: "/home/user/instance" },
+		});
+		const result = await extractSessionData(client, "sess-relative");
+
+		expect(result?.project.worktree).toBe("/home/user/instance");
+		expect(result?.project.name).toBe("instance");
+	});
+
+	it("falls back to the instance project when the session has no project data", async () => {
+		const client = makeClient({
+			session: { projectID: undefined, projectDirectory: undefined },
+			project: { id: "proj-instance", name: "instance", path: "/home/user/instance" },
+		});
+		const result = await extractSessionData(client, "sess-fallback");
+
+		expect(result?.project.project_id).toBe("proj-instance");
+		expect(result?.project.worktree).toBe("/home/user/instance");
+	});
+
+	it("uses the session project directory for artifact repo context", async () => {
+		// Seed a real git repo at the session directory with a GitHub remote.
+		// If the extractor used the instance path instead, resolveRepoContext
+		// would fail there and no PR artifact would be produced.
+		const repoDir = mkdtempSync(path.join(tmpdir(), "ocm-repo-"));
+		const instanceDir = mkdtempSync(path.join(tmpdir(), "ocm-instance-"));
+		const runGit = (...args: string[]) => {
+			const proc = Bun.spawnSync(["git", "-C", repoDir, ...args], {
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (proc.exitCode !== 0) {
+				throw new Error(`git ${args.join(" ")} failed: ${proc.stderr.toString()}`);
+			}
+		};
+
+		try {
+			runGit("init");
+			runGit("remote", "add", "origin", "git@github.com:stub-org/stub-repo.git");
+
+			const client = makeClient({
+				session: { projectID: "proj-session", projectDirectory: repoDir },
+				project: { id: "proj-instance", path: instanceDir },
+				messages: [
+					{
+						id: "msg-1",
+						role: "assistant",
+						parts: [{ type: "tool", tool: "bash", args: { command: "gh pr view 1" } }],
+					},
+				],
+			});
+			const result = await extractSessionData(client, "sess-repo");
+
+			// The resolved path is the session's directory, not the instance path.
+			expect(result?.project.worktree).toBe(repoDir);
+			// The artifact resolves against the session repo, proving
+			// resolveRepoContext received the session directory.
+			expect(result?.artifacts).toContainEqual({
+				artifact_type: "pr-reviewed",
+				reference: "stub-org/stub-repo#1",
+			});
+			expect(result?.metrics.find((m) => m.metric_name === "prs_reviewed")?.value).toBe(1);
+		} finally {
+			rmSync(repoDir, { recursive: true, force: true });
+			rmSync(instanceDir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("extractSessionData snapshot files", () => {
+	it("derives files_changed from the distinct union of assistant snapshots", async () => {
+		const client = makeClient({
+			session: { diffStats: undefined },
+			messages: [
+				{
+					id: "a1",
+					role: "assistant",
+					parts: [{ type: "text", content: "one" }],
+					snapshotFiles: ["src/a.ts", "src/b.ts"],
+				},
+				{
+					id: "a2",
+					role: "assistant",
+					parts: [{ type: "text", content: "two" }],
+					snapshotFiles: ["src/b.ts", "src/c.ts"],
+				},
+			],
+		});
+		const result = await extractSessionData(client, "sess-snap");
+
+		const files = result?.metrics.find((m) => m.metric_name === "files_changed");
+		expect(files?.value).toBe(3);
+	});
+
+	it("records zero line counts for V2 sessions", async () => {
+		const client = makeClient({
+			session: { diffStats: undefined },
+			messages: [
+				{
+					id: "a1",
+					role: "assistant",
+					parts: [],
+					snapshotFiles: ["src/a.ts"],
+				},
+			],
+		});
+		const result = await extractSessionData(client, "sess-v2-lines");
+
+		expect(result?.metrics.find((m) => m.metric_name === "lines_added")?.value).toBe(0);
+		expect(result?.metrics.find((m) => m.metric_name === "lines_deleted")?.value).toBe(0);
+	});
+
+	it("records files_changed as 0 when there are no snapshots", async () => {
+		const client = makeClient({
+			session: { diffStats: undefined },
+			messages: [
+				{ id: "a1", role: "assistant", parts: [] },
+				{ id: "u1", role: "user", parts: [] },
+			],
+		});
+		const result = await extractSessionData(client, "sess-no-snap");
+
+		expect(result?.metrics.find((m) => m.metric_name === "files_changed")?.value).toBe(0);
+		expect(result?.session.session_id).toBe("sess-no-snap");
+	});
+
+	it("preserves diffStats when a caller supplies them", async () => {
+		const client = makeClient({
+			messages: [{ id: "a1", role: "assistant", parts: [], snapshotFiles: ["src/a.ts"] }],
+		});
+		const result = await extractSessionData(client, "sess-legacy-diff");
+
+		expect(result?.metrics.find((m) => m.metric_name === "files_changed")?.value).toBe(3);
+		expect(result?.metrics.find((m) => m.metric_name === "lines_added")?.value).toBe(50);
+		expect(result?.metrics.find((m) => m.metric_name === "lines_deleted")?.value).toBe(10);
+	});
+
+	it("normalizes Windows separators and deduplicates paths", () => {
+		const files = collectSnapshotFiles([
+			{ id: "a1", role: "assistant", snapshotFiles: ["src\\a.ts", "./src/a.ts"] },
+			{ id: "a2", role: "assistant", snapshotFiles: ["src/b.ts", "src/b.ts"] },
+			{ id: "u1", role: "user", snapshotFiles: ["ignored.ts"] },
+		]);
+		expect(files.sort()).toEqual(["src/a.ts", "src/b.ts"]);
+	});
+
+	it("ignores non-string and empty snapshot entries", () => {
+		const files = collectSnapshotFiles([
+			{
+				id: "a1",
+				role: "assistant",
+				// biome-ignore lint/suspicious/noExplicitAny: exercising malformed input
+				snapshotFiles: ["", "src/a.ts", 42 as any, null as any],
+			},
+		]);
+		expect(files).toEqual(["src/a.ts"]);
+	});
+
+	it("validates absolute project directories", () => {
+		expect(isUsableProjectDirectory("/abs/path")).toBe(true);
+		expect(isUsableProjectDirectory("relative/path")).toBe(false);
+		expect(isUsableProjectDirectory("")).toBe(false);
+		expect(isUsableProjectDirectory(undefined)).toBe(false);
+		expect(isUsableProjectDirectory(42)).toBe(false);
 	});
 });
 

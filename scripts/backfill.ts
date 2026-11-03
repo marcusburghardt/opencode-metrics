@@ -570,6 +570,7 @@ async function runBackfill(args: CliArgs): Promise<BackfillStats> {
 					part_content: partContent,
 					bash_commands: bashCommands,
 					message_count: messageCount,
+					parent_session_id: "",
 				};
 				const classification = classify(config.classification_rules, classificationContext);
 				const budgetTag = classifyBudget(config.budget_rules ?? [], classificationContext);
@@ -613,6 +614,7 @@ async function runBackfill(args: CliArgs): Promise<BackfillStats> {
 						ended_at: session.time_updated ?? 0,
 						metadata: null,
 						budget_tag: budgetTag,
+						parent_session_id: null,
 					});
 
 					const metricRows = [

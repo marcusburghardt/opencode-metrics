@@ -15,6 +15,7 @@ function makeContext(overrides: Partial<ClassificationContext> = {}): Classifica
 		part_content: "some content here",
 		bash_commands: [],
 		message_count: 5,
+		parent_session_id: "",
 		...overrides,
 	};
 }
@@ -246,6 +247,47 @@ describe("classify — project_name field", () => {
 		];
 
 		const result = classify(rules, makeContext({ project_name: "opencode-metrics" }));
+
+		expect(result).toBe("ad-hoc");
+	});
+});
+
+describe("classify — parent_session_id field", () => {
+	it("matches a sub-agent session with a non-empty pattern", () => {
+		const rules: ClassificationRule[] = [
+			{
+				name: "sub-agent",
+				conditions: [{ field: "parent_session_id", pattern: ".+" }],
+			},
+		];
+
+		const result = classify(rules, makeContext({ parent_session_id: "sess-abc-123" }));
+
+		expect(result).toBe("sub-agent");
+	});
+
+	it("matches a root session with values: ['']", () => {
+		const rules: ClassificationRule[] = [
+			{
+				name: "root-only",
+				conditions: [{ field: "parent_session_id", values: [""] }],
+			},
+		];
+
+		const result = classify(rules, makeContext({ parent_session_id: "" }));
+
+		expect(result).toBe("root-only");
+	});
+
+	it("does not match a root session against a non-empty pattern", () => {
+		const rules: ClassificationRule[] = [
+			{
+				name: "sub-agent",
+				conditions: [{ field: "parent_session_id", pattern: ".+" }],
+			},
+		];
+
+		const result = classify(rules, makeContext({ parent_session_id: "" }));
 
 		expect(result).toBe("ad-hoc");
 	});

@@ -1,16 +1,21 @@
 # opencode-metrics
 
 Automatic session metrics collection for [OpenCode](https://opencode.ai).
-Captures cost, token usage, session duration, diff stats, and classification
-data into a local SQLite database — queryable with standard SQL tools or
-Grafana dashboards.
+Captures cost, token usage, session duration, code-impact stats, and
+classification data into a local SQLite database — queryable with standard
+SQL tools or Grafana dashboards.
 
 ## Quick Reference
 
 ### Install
 
-Add to your OpenCode config (`~/.config/opencode/opencode.json` or
-project-level `opencode.json`):
+**Requires OpenCode V2 (2.2 or later).** Releases from `0.5.0` target the
+OpenCode V2 plugin API (`@opencode/plugin`) and do not load on OpenCode V1.
+If you are still on OpenCode V1, pin the previous line — see
+[Upgrading](#upgrading).
+
+Install the published package by adding it to your OpenCode config
+(`~/.config/opencode/opencode.json` or project-level `opencode.json`):
 
 ```jsonc
 {
@@ -21,14 +26,34 @@ project-level `opencode.json`):
 No separate `npm install` required — OpenCode resolves the plugin on
 startup.
 
+Install from a local checkout by installing runtime dependencies, building,
+and writing the loader file:
+
+```sh
+git clone https://github.com/marcusburghardt/opencode-metrics.git
+cd opencode-metrics
+bun install   # required: @opencode/plugin is a runtime dependency
+make build
+make install  # writes ~/.config/opencode/plugins/opencode-metrics.ts
+```
+
+```jsonc
+{
+  "plugins": ["~/.config/opencode/plugins/opencode-metrics.ts"]
+}
+```
+
+See [From local checkout](#from-local-checkout) for the loader layout and
+the alternative of referencing `dist/index.js` directly.
+
 ### What it collects
 
 | Category       | Metrics                                                          |
 |----------------|------------------------------------------------------------------|
-| Cost           | `cost` (USD)                                                     |
+| Cost           | `cost` (USD, own session only — sub-sessions are recorded separately) |
 | Tokens         | `tokens_input`, `tokens_output`, `tokens_reasoning`, `tokens_cache_read`, `tokens_cache_write` |
 | Derived        | `cache_hit_ratio`, `duration_seconds`                            |
-| Code impact    | `files_changed`, `lines_added`, `lines_deleted`                  |
+| Code impact    | `files_changed`, `lines_added`, `lines_deleted` (line counts are `0` on OpenCode V2) |
 | Activity       | `messages_total`                                                 |
 | Artifacts      | `prs_created`, `prs_reviewed`, `issues_referenced`               |
 
@@ -128,6 +153,7 @@ container and point the datasource at `metrics.db`. See
   - [Adjusted cost queries](#adjusted-cost-queries)
 - [Upgrade and Uninstall](#upgrade-and-uninstall)
   - [Upgrading](#upgrading)
+  - [Migrating from V1](#migrating-from-v1)
   - [Uninstalling](#uninstalling)
 - [Troubleshooting](#troubleshooting)
   - [Common issues](#common-issues)
@@ -143,9 +169,12 @@ container and point the datasource at `metrics.db`. See
 
 ### Prerequisites
 
-- **OpenCode** with plugin support (v1.18+)
+- **OpenCode V2** (2.2 or later) — releases from `0.5.0` use the OpenCode
+  V2 plugin API and do not load on OpenCode V1. OpenCode V1 users must stay
+  on the `0.4.x` line (see [Upgrading](#upgrading)).
 - **Bun** runtime — handled automatically by OpenCode (plugins run inside
-  OpenCode's Bun process)
+  OpenCode's Bun process). A local checkout also needs Bun to install
+  runtime dependencies and build.
 
 ### From npm
 
@@ -161,27 +190,63 @@ file (`~/.config/opencode/opencode.json` or `opencode.json` in your project):
 OpenCode resolves the plugin from npm on startup. No separate `npm install`
 step is required.
 
+To pin an exact release (recommended for hosts that cannot upgrade past a
+known-good version):
+
+```jsonc
+{
+  "plugins": ["@mburghardt/opencode-metrics@0.5.0"]
+}
+```
+
 ### From local checkout
 
-Clone the repository and build:
+Install runtime dependencies **before** building. `@opencode/plugin` is a
+runtime dependency of the published package, so a plain `git clone` without
+`bun install` will not resolve the plugin API at load time.
 
 ```sh
 git clone https://github.com/marcusburghardt/opencode-metrics.git
 cd opencode-metrics
+bun install
 make build
 ```
 
-Then reference the local path in your OpenCode config:
+OpenCode V2 loads a plugin **file** with a default export (a directory
+containing `index.ts` is also accepted). `make install` writes the flat form
+for you, globally:
+
+```
+~/.config/opencode/plugins/
+└── opencode-metrics.ts   # export default plugin;
+```
+
+```sh
+make install   # build + write the global loader file
+make uninstall # remove it again
+```
+
+Reference the loader file in your OpenCode config:
 
 ```jsonc
 {
-  "plugins": ["./path/to/opencode-metrics"]
+  "plugins": ["~/.config/opencode/plugins/opencode-metrics.ts"]
 }
 ```
 
-OpenCode resolves local paths relative to the config file location. The
-`dist/index.js` entry point is used automatically (configured via
-`"main"` in `package.json`).
+The plugin is also auto-discovered from the plugins directory, so listing it
+explicitly is optional.
+
+Alternatively, skip the loader and point the `plugins` array straight at the
+built entry point (configured via `"main"` in `package.json`):
+
+```jsonc
+{
+  "plugins": ["./path/to/opencode-metrics/dist/index.js"]
+}
+```
+
+OpenCode resolves local paths relative to the config file location.
 
 ### Ansible integration
 
@@ -199,24 +264,21 @@ provisioning.
 
 ### Verifying the installation
 
-1. **Check logs** — Start an OpenCode session and look for the
-   initialization message:
-
-   ```
-   [opencode-metrics] initialized
-   ```
-
-   OpenCode logs appear in the bottom status bar or in
-   `~/.local/share/opencode/log/`.
-
-2. **Verify the database** — After completing at least one prompt/response
-   cycle, the database file should exist:
+1. **Verify the database** — after completing at least one prompt/response
+   cycle, query the database directly. This is the primary check and does
+   not depend on log capture:
 
    ```sh
-   ls -la ~/.local/share/opencode-metrics/metrics.db
+   sqlite3 ~/.local/share/opencode-metrics/metrics.db \
+     "SELECT COUNT(*) AS sessions FROM sessions;"
    ```
 
-3. **Verify tables** — Open the database and confirm the schema:
+   A non-zero count confirms the plugin is loaded and collecting. If the
+   database file does not exist yet, see
+   [Database not created](#database-not-created).
+
+2. **Verify the schema** — open the database and confirm the tables and
+   views:
 
    ```sh
    sqlite3 ~/.local/share/opencode-metrics/metrics.db ".tables"
@@ -225,9 +287,28 @@ provisioning.
    Expected output:
 
    ```
-    measurements        metric_definitions  projects
-    session_artifacts   sessions
+   cost_pricing            session_artifacts       v_measurements
+   measurement_deltas      sessions                v_session_artifacts
+   measurements            v_adjusted_cost_deltas  v_sessions
+   metric_definitions      v_adjusted_costs
+   projects                v_measurement_deltas
    ```
+
+   `measurement_deltas` and `cost_pricing` are part of the current schema,
+   and the `v_` prefixes are SQL views over the base tables.
+
+3. **Check the plugin log line** (secondary) — some host versions forward the
+   plugin's `console.*` output to their log directory; OpenCode 2.2.5 sends it
+   to the process stdout/TUI instead. A healthy start logs:
+
+   ```
+   [opencode-metrics] initialized
+   ```
+
+   Look in `~/.local/share/opencode/log/` (or
+   `$XDG_DATA_HOME/opencode/log/` when `$XDG_DATA_HOME` is set) if your host
+   captures it there. Capture location varies by host version and logs rotate,
+   so a missing line is not by itself evidence of failure — rely on step 1.
 
 ## Historical Data Backfill
 
@@ -235,6 +316,12 @@ The backfill script performs a one-time import of historical session data
 from OpenCode's internal database into the opencode-metrics database. This
 gives you full visibility into past sessions without waiting for new data
 to accumulate through the live plugin.
+
+> **Coverage caveat:** OpenCode's legacy `session`/`message`/`part` tables
+> stop at 2026-10-30. `make backfill` reads only those tables, so it cannot
+> import sessions created after that date. Sessions recorded through the
+> OpenCode V2 plugin are collected live from the time the plugin is
+> installed forward; `make backfill` does not close that gap.
 
 ### Quick start
 
@@ -614,6 +701,10 @@ The fastest way to populate the metrics database is to run
 This imports all historical sessions in one step, giving you immediate
 data to query and visualize.
 
+> **Covers history only up to 2026-10-30.** The backfill reads OpenCode's
+> legacy tables, so it cannot import later sessions. `make backfill` does
+> not close that gap; V2-era sessions come from the live plugin only.
+
 For ongoing collection, the plugin records metrics automatically. After
 completing at least one OpenCode prompt/response cycle, verify data is
 being collected:
@@ -880,6 +971,12 @@ ORDER BY avg_messages DESC;
 ```
 
 #### Code impact
+
+> **V2 limitation:** `lines_added` and `lines_deleted` are recorded as 0 for
+> sessions captured on OpenCode V2 (the V2 plugin API exposes no session
+> diff data). The queries below therefore return zero line counts for
+> V2-era sessions; `files_changed` remains populated. See
+> [Known metric limitations](#metric-reference).
 
 **Lines changed over time:**
 
@@ -1295,11 +1392,12 @@ make lint
 ## Metric Reference
 
 All 15 metrics are recorded per session on every idle event (UPSERT
-semantics — the latest cumulative value is stored).
+semantics — the latest cumulative value is stored). Descriptions below
+match the `metric_definitions` table in the database.
 
 | Metric Name        | Unit    | Description                                    | Aggregation |
 |--------------------|---------|------------------------------------------------|-------------|
-| `cost`             | usd     | Total session cost in USD                      | sum         |
+| `cost`             | usd     | Total session cost in USD (own session only; sub-sessions are recorded separately) | sum |
 | `tokens_input`     | tokens  | Non-cached input tokens sent to the model      | sum         |
 | `tokens_output`    | tokens  | Output tokens generated by the model           | sum         |
 | `tokens_reasoning` | tokens  | Reasoning tokens consumed by the model         | sum         |
@@ -1307,13 +1405,29 @@ semantics — the latest cumulative value is stored).
 | `tokens_cache_write`| tokens | Input tokens written to prompt cache           | sum         |
 | `cache_hit_ratio`  | ratio   | Fraction of input tokens served from cache     | avg         |
 | `duration_seconds` | seconds | Wall-clock session duration in seconds         | sum         |
-| `files_changed`    | count   | Number of files changed in the session         | sum         |
-| `lines_added`      | count   | Lines added across all file changes            | sum         |
-| `lines_deleted`    | count   | Lines deleted across all file changes          | sum         |
-| `messages_total`   | count   | Total messages exchanged in the session        | sum         |
+| `files_changed`    | count   | Distinct files reported in assistant session snapshots | sum  |
+| `lines_added`      | count   | Lines added in file changes (0 for sessions recorded on OpenCode V2) | sum |
+| `lines_deleted`    | count   | Lines deleted in file changes (0 for sessions recorded on OpenCode V2) | sum |
+| `messages_total`   | count   | Total conversation messages exchanged in the session | sum   |
 | `prs_created`      | count   | PRs created in the session                     | sum         |
 | `prs_reviewed`     | count   | PRs reviewed in the session                    | sum         |
 | `issues_referenced`| count   | Issues referenced in the session               | sum         |
+
+**Known metric limitations:**
+
+- `lines_added` / `lines_deleted` are recorded as **0** for sessions
+  captured through the OpenCode V2 plugin API, because V2 does not expose
+  session diff data to plugins. `files_changed` is still populated, from
+  the distinct files reported in assistant session snapshots. Code-impact
+  charts show a flat zero line for V2-era sessions; this is expected, not
+  data loss. Rows written before the migration keep their original values,
+  so a time series can span both behaviors.
+- `files_changed` counts distinct files named in assistant session
+  snapshots. It can include files that were touched but not modified, so
+  it is not directly comparable with diff-derived counts from older
+  releases.
+- `cost` is the session's own cost as reported by the host. Sub-sessions
+  (sub-agents) are recorded as separate session rows with their own cost.
 
 **Derived metrics:**
 
@@ -1522,7 +1636,16 @@ ORDER BY difference;
 
 ### Upgrading
 
-Update the plugin to the latest version:
+**Check your host first.** Releases from `0.5.0` require **OpenCode V2
+(2.2 or later)**. They do not load on OpenCode V1.
+
+```sh
+opencode --version
+```
+
+#### Same release line
+
+Update the plugin to the latest version within the current line:
 
 ```sh
 npm update @mburghardt/opencode-metrics
@@ -1533,19 +1656,167 @@ Or, if installed from a local checkout:
 ```sh
 cd opencode-metrics
 git pull
+bun install
 make build
 ```
 
 **Data preservation:** Your existing `metrics.db` database and
-`config.yaml` are preserved across upgrades. The schema uses `CREATE
-TABLE IF NOT EXISTS` and `INSERT OR IGNORE` for metric definitions, so
-the database is never destructively modified. Schema versioning
-(`PRAGMA user_version`) ensures future migrations are applied
-automatically on startup.
+`config.yaml` are preserved across same-line upgrades. The schema uses
+`CREATE TABLE IF NOT EXISTS` and `INSERT OR IGNORE` for metric definitions,
+so the database is never destructively modified. New metrics are additive
+rows. Schema versioning (`PRAGMA user_version`, currently `6`) ensures
+migrations are applied automatically on startup.
 
-> **Note:** Existing users should re-run `make backfill` after upgrading
-> to populate artifact data for historical sessions. The backfill is
-> idempotent and safe to re-run.
+#### Across the breaking line (OpenCode V1 → V2)
+
+`0.5.0` is a breaking release. Before upgrading, know the host requirement:
+
+- The current line (`0.5.x` and later) requires **OpenCode 2.2+**.
+- The last release supporting OpenCode V1 is **`0.4.1`**; the `0.4.x` line
+  is the V1-compatible line and receives no further planned releases.
+
+**If you cannot upgrade OpenCode**, pin the previous line explicitly:
+
+```jsonc
+{
+  "plugins": ["@mburghardt/opencode-metrics@0.4.1"]
+}
+```
+
+or, for a local install:
+
+```sh
+npm install @mburghardt/opencode-metrics@0.4.1
+```
+
+**If you can upgrade**, update OpenCode to 2.2+ first, then update the
+plugin. On a V1 host, loading `0.5.0` fails to load and OpenCode continues
+to start without the plugin — collection stops silently, so upgrade the
+host first.
+
+Three behavior changes apply to sessions captured after the upgrade:
+
+1. **`files_changed` comes from session snapshots.** It is the count of
+   distinct files reported in assistant session snapshots. It can include
+   files that were touched rather than modified, so it is not directly
+   comparable with pre-`0.5.0` values.
+2. **Sessions are attributed to their own project.** Metrics use the
+   session's project id and location instead of the plugin instance's
+   directory. Sessions from other projects are no longer written under the
+   wrong `project_id`.
+3. **`agent` and `model` come from the session's current selection**, not
+   from the first user message. For sessions that switch agent or model
+   mid-session, the stored values — and therefore the classification — can
+   differ from previous releases.
+
+What stops being populated:
+
+- `lines_added` and `lines_deleted` are recorded as **0** for V2-era
+  sessions, because the V2 plugin API exposes no session diff data.
+  `files_changed` continues to be populated.
+- No metrics are written between the V1 plugin stopping and the V2 plugin
+  starting. Upgrade the host and plugin in one step to keep that window
+  short; sessions that run entirely inside the gap are not captured, and
+  `make backfill` does not recover them.
+- `make backfill` cannot import sessions created after 2026-10-30 (see the
+  [coverage caveat](#historical-data-backfill)).
+
+Historical rows are **not** re-attributed or rewritten. Project-level
+totals for new sessions may differ from what you saw before, and a time
+series can span both eras.
+
+### Migrating from V1
+
+**Audience:** users running the `0.4.x` plugin line on OpenCode V1 who want
+to move to the `0.5.x` line.
+
+**Prerequisites:**
+
+- An OpenCode installation you can upgrade to **2.2 or later**.
+- Bun on `PATH` if you build from a local checkout.
+- A backup copy of the metrics database (optional but recommended):
+  `cp ~/.local/share/opencode-metrics/metrics.db ~/metrics.db.bak`.
+
+**Steps:**
+
+1. **Upgrade OpenCode first.** The V2 plugin cannot load on a V1 host.
+
+   ```sh
+   opencode --version   # must be 2.2 or later
+   ```
+
+2. **Upgrade the plugin.** Remove any explicit version pin, or pin the new
+   line:
+
+   ```jsonc
+   {
+     "plugins": ["@mburghardt/opencode-metrics@0.5.0"]
+   }
+   ```
+
+   If you install from a local checkout, pull and install runtime
+   dependencies before building:
+
+   ```sh
+   cd opencode-metrics
+   git pull
+   bun install
+   make build
+   ```
+
+3. **Replace a V1 loader.** OpenCode V2 expects a plugin **file** with a
+   **default export** (a directory containing `index.ts` also works).
+   `make install` writes the flat form
+   (`~/.config/opencode/plugins/opencode-metrics.ts`) and removes any legacy
+   directory loader:
+
+   ```sh
+   make install
+   ```
+
+   If you maintain the loader by hand, replace the named export with
+   `export default plugin;`.
+
+4. **Register the loader** (optional — the plugins directory is
+   auto-discovered) in your `opencode.json` `plugins` array:
+
+   ```jsonc
+   {
+     "plugins": ["~/.config/opencode/plugins/opencode-metrics.ts"]
+   }
+   ```
+
+5. **Restart OpenCode** and complete one prompt/response cycle.
+
+**Verification:**
+
+```sh
+sqlite3 ~/.local/share/opencode-metrics/metrics.db \
+  "SELECT COUNT(*) AS sessions FROM sessions;"
+
+sqlite3 ~/.local/share/opencode-metrics/metrics.db "PRAGMA user_version;"
+```
+
+The session count must increase after a new session, and `user_version`
+must report `6`. The `[opencode-metrics] initialized` log line is a
+secondary signal only; see
+[Verifying the installation](#verifying-the-installation).
+
+**Rollback:** to return to the V1 line, pin the plugin and downgrade the
+host:
+
+```jsonc
+{
+  "plugins": ["@mburghardt/opencode-metrics@0.4.1"]
+}
+```
+
+```sh
+opencode --version   # must be a V1 release that the 0.4.x line supports
+```
+
+Your existing database is reused; migrations only add tables and views, so
+a downgrade does not require restoring a backup.
 
 ### Uninstalling
 
@@ -1559,14 +1830,55 @@ automatically on startup.
    }
    ```
 
-2. (Optional) Delete the data directory:
+2. Remove a locally installed loader. If you used `make install`, run:
+
+   ```sh
+   make uninstall
+   ```
+
+   It removes both the V2 loader file
+   (`~/.config/opencode/plugins/opencode-metrics.ts`) and any legacy
+   directory loader. To remove them by hand:
+
+   ```sh
+   rm -f ~/.config/opencode/plugins/opencode-metrics.ts
+   rm -rf ~/.config/opencode/plugins/opencode-metrics
+   ```
+
+3. (Optional) Delete the data directory:
 
    ```sh
    rm -rf ~/.local/share/opencode-metrics
    ```
 
    This removes `metrics.db`, `config.yaml`, and any WAL/SHM files. If
-   you used a custom `data_dir`, also delete that directory.
+   `$XDG_DATA_HOME` is set, delete `$XDG_DATA_HOME/opencode-metrics`
+   instead.
+
+### Maintaining releases
+
+Releases are produced by release-please from conventional commits; do not
+hand-edit `CHANGELOG.md`, the `package.json` version, or
+`.release-please-manifest.json`.
+
+The publish workflows push a new version under the `next` dist-tag, verify the
+published tarball (`scripts/verify-published-artifact.sh`), and only then
+promote it to `latest`. If a release is found to be broken:
+
+```sh
+# 1. Move the latest tag back to the last good version
+npm dist-tag add @mburghardt/opencode-metrics@<last-good> latest
+
+# 2. Mark the broken version so it is not installed by accident
+npm deprecate @mburghardt/opencode-metrics@<broken> "Broken release; use <last-good>"
+
+# 3. Land the fix and publish a patch release the normal way
+```
+
+If the verification step failed before promotion, `latest` was never moved:
+fix the problem, land another commit, and let the next release PR run. The
+GitHub Release and its tag remain in place and can stay published once a
+working artifact is promoted.
 
 ## Troubleshooting
 
@@ -1574,7 +1886,8 @@ automatically on startup.
 
 #### Plugin not loading
 
-**Symptom:** No `[opencode-metrics] initialized` message in logs.
+**Symptom:** No new rows appear in `sessions` (and no
+`[opencode-metrics] initialized` message in logs).
 
 **Causes and fixes:**
 
@@ -1587,7 +1900,110 @@ automatically on startup.
   connectivity on first run. OpenCode needs to download the plugin.
 - **Local path incorrect:** If using a local path, ensure the path
   resolves to a directory containing `package.json` with a valid `main`
-  entry.
+  entry, and that `bun install` has run so `@opencode/plugin` resolves.
+
+#### Plugin loaded on an unsupported host
+
+**Symptom:** OpenCode starts normally but the plugin never collects
+anything. On an OpenCode V1 host you will see no plugin log output at all —
+the module cannot be imported, so the plugin cannot log a message.
+
+**Cause:** `0.5.x` (and later) targets the OpenCode V2 plugin API
+(`@opencode/plugin`, `Plugin.define`, default export). An OpenCode V1 host
+cannot consume the export, so it silently skips the plugin.
+
+**Resolution:**
+
+1. Check the host version:
+
+   ```sh
+   opencode --version
+   ```
+
+2. If it is older than 2.2, either upgrade OpenCode or return to the V1
+   line by pinning `0.4.1`:
+
+   ```jsonc
+   {
+     "plugins": ["@mburghardt/opencode-metrics@0.4.1"]
+   }
+   ```
+
+   On a V2 host, the plugin runs a runtime guard against
+   `@opencode/plugin`: a resolved version outside `>=2.2.5 <3.0.0` logs an
+   error naming the supported range and disables collection instead of
+   crashing.
+
+#### Loader present but not registering
+
+**Symptom:** A loader file exists under
+`~/.config/opencode/plugins/` (or `.opencode/plugins/`), but nothing is
+collected and `opencode.json` does not list it.
+
+**Causes and fixes:**
+
+- **Loader not listed:** a loader is only loaded when it is auto-discovered
+  in the plugins directory or appears in an `opencode.json` `plugins` array.
+  Add it:
+
+  ```jsonc
+  {
+    "plugins": ["~/.config/opencode/plugins/opencode-metrics.ts"]
+  }
+  ```
+
+- **Legacy named export:** OpenCode V2 requires a **default export**. A V1
+  loader that ends with a named export (for example
+  `export const plugin = ...`) loads but does not register. Re-run
+  `make install` to write the flat loader at
+  `~/.config/opencode/plugins/opencode-metrics.ts`, or change the
+  last line to `export default plugin;`.
+- **Loader points at a missing build:** the generated loader imports
+  the checkout's `dist/index.js`. Run `make build` in that checkout.
+
+#### Nothing collected after upgrade
+
+**Symptom:** Existing sessions are present, but no new session rows appear
+after upgrading OpenCode and the plugin.
+
+**Causes and fixes:**
+
+- **Host still on V1:** see [Plugin loaded on an unsupported host](#plugin-loaded-on-an-unsupported-host).
+- **Install shaped for V1:** a leftover loader using a named export. Run
+  `make install` and confirm the flat default-export loader.
+- **Runtime dependency missing (local checkout):** `@opencode/plugin` is a
+  runtime dependency. Run `bun install` in the checkout, then `make build`.
+- **Subscription stopped:** the plugin subscribes to `session.status`,
+  `session.idle`, and the `session.execution.*` event families. If the event
+  stream ends after repeated failures, an error line explains why and the
+  plugin stops subscribing for that session. Restart OpenCode after fixing
+  the cause.
+- **Gap during the upgrade:** sessions that ran entirely between the V1
+  plugin stopping and the V2 plugin starting are not captured, and
+  `make backfill` does not recover them.
+
+#### Missing console log lines
+
+**Symptom:** The plugin collects metrics, but no `[opencode-metrics]` lines
+appear where you expect them.
+
+**Cause:** on OpenCode V2 the plugin logs through `console.info` /
+`console.warn` / `console.error`; the host decides where that output lands,
+and log files rotate. The capture location is not part of the plugin's
+contract.
+
+**Resolution:** verify collection from the database instead:
+
+```sh
+sqlite3 ~/.local/share/opencode-metrics/metrics.db \
+  "SELECT COUNT(*) FROM sessions;"
+```
+
+To search logs anyway, include the XDG-derived directory:
+
+```sh
+grep -r "opencode-metrics" "${XDG_DATA_HOME:-$HOME/.local/share}/opencode/log/"
+```
 
 #### Database not created
 
@@ -1648,9 +2064,19 @@ the malformed rule. Remaining valid rules continue to work.
 **Check plugin log output:**
 
 ```sh
-# Tail OpenCode logs for metrics-related messages
-grep -r "opencode-metrics" ~/.local/share/opencode/log/
+# OpenCode forwards the plugin's console.* output to its log directory.
+grep -r "opencode-metrics" "${XDG_DATA_HOME:-$HOME/.local/share}/opencode/log/"
 ```
+
+**Run the bundled diagnostic:**
+
+```sh
+make check
+```
+
+Reports loader layout, registration in `opencode.json`, resolved
+`@opencode/plugin` version against the supported range, database health,
+session counts, and recent log lines.
 
 **Inspect the database schema:**
 
@@ -1672,7 +2098,7 @@ Expected output: `wal`
 sqlite3 ~/.local/share/opencode-metrics/metrics.db "PRAGMA user_version;"
 ```
 
-Expected output: `4`
+Expected output: `5`
 
 **Run an integrity check:**
 

@@ -5,7 +5,8 @@ Get session metrics and a Grafana dashboard in under 5 minutes.
 ## Prerequisites
 
 ```bash
-# OpenCode must be installed and working
+# OpenCode V2, version 2.2 or later — required by the 0.5.x plugin line.
+# (On OpenCode V1, pin @mburghardt/opencode-metrics@0.4.1 instead.)
 opencode --version
 
 # Bun runtime (OpenCode bundles it, but you need it on PATH for CLI commands)
@@ -24,12 +25,23 @@ bun install
 make install
 ```
 
-That's it. `make install` builds the plugin and installs a global loader
-at `~/.config/opencode/plugins/opencode-metrics.ts`. Every OpenCode
-session across all projects will now collect metrics automatically.
+`bun install` is required: the plugin's OpenCode API package
+(`@opencode/plugin`) is a runtime dependency, not only a build-time one.
 
-Restart OpenCode to activate the plugin. You'll see
-`[opencode-metrics] initialized` in the logs on startup.
+`make install` builds the plugin and writes a global loader file at
+`~/.config/opencode/plugins/opencode-metrics.ts` (a default-export loader
+file — the form OpenCode V2 loads). List that file in your `opencode.json`
+`plugins` array (optional if the plugins directory is auto-discovered):
+
+```jsonc
+{
+  "plugins": ["~/.config/opencode/plugins/opencode-metrics.ts"]
+}
+```
+
+Every OpenCode session across all projects then collects metrics
+automatically on its next idle event. Remove the loader later with
+`make uninstall`.
 
 ## Step 2: Import Your History
 
@@ -45,13 +57,18 @@ historical session, and writes the metrics into
 `~/.local/share/opencode-metrics/metrics.db`. Typical output:
 
 ```
+opencode-metrics backfill
+========================
+
 Found 905 sessions to process
+Destination: /home/you/.local/share/opencode-metrics/metrics.db
 Imported 30 projects
 Processed 905/905 sessions...
 
 --- Summary ---
 Sessions:  905
 Cost:      $3430.26
+Skipped:   0
 Elapsed:   0.9s
 
 Classification distribution:
@@ -62,7 +79,14 @@ Classification distribution:
   implementation: 40
   pr-review: 23
   planning: 14
+
+Backfill complete.
 ```
+
+> **Coverage caveat:** OpenCode's legacy tables stop at 2026-10-30, so the
+> backfill cannot import sessions created after that date. `make backfill`
+> does not close that gap; V2-era sessions are collected by the live plugin
+> from the time it is installed forward.
 
 Preview first without writing: `bun run scripts/backfill.ts --dry-run`
 
@@ -90,6 +114,13 @@ The dashboard has 28 panels across 8 sections:
 | **Code Impact** | Lines changed over time, files changed by project |
 | **Top Sessions** | Most expensive sessions with title, classification, model, project, cost |
 | **Trends** | Weekly cost trend, 7-day rolling average |
+
+> **Code-impact baseline:** on OpenCode V2 the plugin API exposes no session
+> diff data, so `lines_added` and `lines_deleted` are recorded as `0`.
+> The Code Impact panels show a flat zero line for V2-era sessions while
+> `files_changed` keeps counting distinct files from session snapshots.
+> Historical rows keep their original line counts, so the chart starts from
+> a zero baseline at the upgrade point rather than showing data loss.
 
 To stop Grafana: `make grafana-stop` (data volume is preserved for
 next start).
