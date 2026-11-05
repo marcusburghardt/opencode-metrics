@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { CostPricingRule } from "./config";
-import { initDatabase } from "./db";
+import { countChildSessions, initDatabase } from "./db";
 import { syncCostPricing } from "./pricing";
 
 /** Helper tables expected in the v4 schema. */
@@ -315,11 +315,11 @@ describe("initDatabase", () => {
 		db = result.db;
 	});
 
-	it("seeds 15 metric definitions", () => {
+	it("seeds 24 metric definitions", () => {
 		const row = db.prepare("SELECT COUNT(*) AS count FROM metric_definitions").get() as {
 			count: number;
 		};
-		expect(row.count).toBe(15);
+		expect(row.count).toBe(24);
 	});
 
 	it("seeds correct metric names", () => {
@@ -360,7 +360,7 @@ describe("initDatabase", () => {
 		const row = db.prepare("SELECT COUNT(*) AS count FROM metric_definitions").get() as {
 			count: number;
 		};
-		expect(row.count).toBe(15);
+		expect(row.count).toBe(24);
 	});
 
 	it("returns the resolved data directory path", () => {
@@ -1135,7 +1135,7 @@ describe("metric catalog descriptions", () => {
 			)
 			.all() as Array<{ metric_name: string; unit: string; aggregation: string }>;
 
-		expect(rows).toHaveLength(15);
+		expect(rows).toHaveLength(24);
 
 		const byName = new Map(rows.map((row) => [row.metric_name, row]));
 		expect(byName.get("cost")).toMatchObject({ unit: "usd", aggregation: "sum" });
@@ -1143,5 +1143,100 @@ describe("metric catalog descriptions", () => {
 		expect(byName.get("files_changed")).toMatchObject({ unit: "count", aggregation: "sum" });
 		expect(byName.get("lines_added")).toMatchObject({ unit: "count", aggregation: "sum" });
 		expect(byName.get("messages_total")).toMatchObject({ unit: "count", aggregation: "sum" });
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Flow metric catalog and child session counts
+// ---------------------------------------------------------------------------
+
+describe("flow metric catalog", () => {
+	let tempDir: string;
+	let db: Database;
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(path.join(tmpdir(), "ocm-flow-catalog-"));
+		const result = initDatabase(tempDir);
+		db = result.db;
+	});
+
+	afterEach(() => {
+		db.close();
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("registers every flow metric with a unit, description, and sum aggregation", () => {
+		const expected = [
+			"permission_prompts",
+			"permission_wait_seconds",
+			"turns_total",
+			"context_tokens_max",
+			"context_tokens_final",
+			"generation_seconds",
+			"post_generation_seconds",
+			"compactions",
+			"child_sessions",
+		];
+		for (const name of expected) {
+			const row = db
+				.prepare(
+					"SELECT metric_name, unit, description, aggregation FROM metric_definitions WHERE metric_name = ?",
+				)
+				.get(name) as {
+				metric_name: string;
+				unit: string;
+				description: string;
+				aggregation: string;
+			} | null;
+			expect(row).not.toBeNull();
+			expect(row?.unit.length).toBeGreaterThan(0);
+			expect(row?.description.length).toBeGreaterThan(0);
+			expect(row?.aggregation).toBe("sum");
+		}
+	});
+});
+
+describe("countChildSessions", () => {
+	let tempDir: string;
+	let db: Database;
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(path.join(tmpdir(), "ocm-children-"));
+		const result = initDatabase(tempDir);
+		db = result.db;
+	});
+
+	afterEach(() => {
+		db.close();
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	function insertSession(sessionID: string, parentID: string | null): void {
+		db.run(
+			"INSERT INTO sessions (session_id, project_id, agent, model, classification, title, started_at, ended_at, parent_session_id) VALUES (?, 'p', 'a', 'm', 'c', 't', 0, 0, ?)",
+			[sessionID, parentID],
+		);
+	}
+
+	it("counts only direct children", () => {
+		insertSession("root", null);
+		insertSession("child-1", "root");
+		insertSession("child-2", "root");
+		insertSession("grandchild", "child-1");
+
+		expect(countChildSessions(db, "root")).toBe(2);
+		expect(countChildSessions(db, "child-1")).toBe(1);
+	});
+
+	it("returns zero for a session with no children", () => {
+		insertSession("root", null);
+
+		expect(countChildSessions(db, "root")).toBe(0);
+	});
+
+	it("does not count a session that points at itself", () => {
+		insertSession("root", "root");
+
+		expect(countChildSessions(db, "root")).toBe(0);
 	});
 });

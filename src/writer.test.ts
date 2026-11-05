@@ -375,7 +375,7 @@ describe("writer", () => {
 
 			expect(projectCount.count).toBe(1);
 			expect(sessionCount.count).toBe(1);
-			expect(metricCount.count).toBe(3);
+			expect(metricCount.count).toBe(4);
 		});
 
 		it("rolls back all writes when a measurement insert fails", async () => {
@@ -685,6 +685,97 @@ describe("writer", () => {
 			expect(MONOTONIC_METRICS.has("cost")).toBe(true);
 			expect(MONOTONIC_METRICS.has("tokens_input")).toBe(true);
 			expect(MONOTONIC_METRICS.has("messages_total")).toBe(true);
+		});
+
+		it("flow metrics are monotonic except final context and child count", () => {
+			for (const name of [
+				"permission_prompts",
+				"permission_wait_seconds",
+				"turns_total",
+				"context_tokens_max",
+				"generation_seconds",
+				"post_generation_seconds",
+				"compactions",
+			]) {
+				expect(MONOTONIC_METRICS.has(name)).toBe(true);
+			}
+			expect(MONOTONIC_METRICS.has("context_tokens_final")).toBe(false);
+			expect(MONOTONIC_METRICS.has("child_sessions")).toBe(false);
+		});
+
+		it("allows a negative context_tokens_final delta after compaction", () => {
+			writeMetrics(db, "sess-compact", [
+				{ metric_name: "context_tokens_final", value: 400000, recorded_at: 1700000000000 },
+			]);
+			writeMetrics(db, "sess-compact", [
+				{ metric_name: "context_tokens_final", value: 25000, recorded_at: 1700001000000 },
+			]);
+
+			const deltas = db
+				.prepare(
+					"SELECT delta FROM measurement_deltas WHERE session_id = ? AND metric_name = ? ORDER BY recorded_at",
+				)
+				.all("sess-compact", "context_tokens_final") as Array<{ delta: number }>;
+
+			expect(deltas.length).toBe(2);
+			expect(deltas[1].delta).toBe(-375000);
+
+			const row = db
+				.prepare("SELECT value FROM measurements WHERE session_id = ? AND metric_name = ?")
+				.get("sess-compact", "context_tokens_final") as { value: number };
+			expect(row.value).toBe(25000);
+		});
+
+		it("flow metric deltas sum to the cumulative value after repeated captures", () => {
+			const captures: Array<Array<{ metric_name: string; value: number }>> = [
+				[
+					{ metric_name: "permission_prompts", value: 1 },
+					{ metric_name: "permission_wait_seconds", value: 2 },
+					{ metric_name: "turns_total", value: 3 },
+					{ metric_name: "context_tokens_max", value: 20000 },
+					{ metric_name: "context_tokens_final", value: 20000 },
+					{ metric_name: "generation_seconds", value: 4 },
+					{ metric_name: "post_generation_seconds", value: 5 },
+					{ metric_name: "compactions", value: 0 },
+					{ metric_name: "child_sessions", value: 0 },
+				],
+				[
+					{ metric_name: "permission_prompts", value: 3 },
+					{ metric_name: "permission_wait_seconds", value: 8 },
+					{ metric_name: "turns_total", value: 5 },
+					{ metric_name: "context_tokens_max", value: 90000 },
+					{ metric_name: "context_tokens_final", value: 25000 },
+					{ metric_name: "generation_seconds", value: 10 },
+					{ metric_name: "post_generation_seconds", value: 12 },
+					{ metric_name: "compactions", value: 1 },
+					{ metric_name: "child_sessions", value: 2 },
+				],
+			];
+
+			captures.forEach((metrics, index) => {
+				writeMetrics(
+					db,
+					"sess-flow-invariant",
+					metrics.map((metric) => ({
+						...metric,
+						recorded_at: 1700000000000 + index * 1000,
+					})),
+				);
+			});
+
+			for (const { metric_name: name, value } of captures[1]) {
+				const sum = db
+					.prepare(
+						"SELECT SUM(delta) AS total FROM measurement_deltas WHERE session_id = ? AND metric_name = ?",
+					)
+					.get("sess-flow-invariant", name) as { total: number };
+				const cumulative = db
+					.prepare("SELECT value FROM measurements WHERE session_id = ? AND metric_name = ?")
+					.get("sess-flow-invariant", name) as { value: number };
+
+				expect(sum.total).toBeCloseTo(value);
+				expect(cumulative.value).toBeCloseTo(value);
+			}
 		});
 
 		it("multiple metrics in a single writeMetrics() call each get their own delta rows", () => {

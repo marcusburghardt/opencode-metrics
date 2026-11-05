@@ -9,6 +9,7 @@ import {
 	collectSnapshotFiles,
 	computeCacheHitRatio,
 	computeDurationSeconds,
+	deriveFlowMetrics,
 	deriveProjectName,
 	extractSessionData,
 	isUsableProjectDirectory,
@@ -100,8 +101,8 @@ describe("extractSessionData", () => {
 		expect(result?.session.ended_at).toBe(1700003600000);
 		expect(result?.session.classification).toBe("unknown");
 
-		// Metrics: all 15 present (12 base + 3 artifact counts)
-		expect(result?.metrics.length).toBe(15);
+		// Metrics: all 21 present (12 base + 3 artifact counts + 6 flow metrics)
+		expect(result?.metrics.length).toBe(21);
 
 		const costMetric = result?.metrics.find((m) => m.metric_name === "cost");
 		expect(costMetric?.value).toBeCloseTo(0.42);
@@ -653,5 +654,80 @@ describe("deriveProjectName", () => {
 
 	it("falls back to 'unknown' for root path where basename is empty", () => {
 		expect(deriveProjectName(undefined, "/")).toBe("unknown");
+	});
+});
+
+describe("deriveFlowMetrics", () => {
+	function assistant(context: number, time: Record<string, number> = {}) {
+		return {
+			type: "assistant",
+			tokens: { input: context, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+			time,
+		};
+	}
+
+	it("derives context growth across turns", () => {
+		const flow = deriveFlowMetrics([assistant(20000), assistant(80000), assistant(150000)]);
+
+		expect(flow.turns_total).toBe(3);
+		expect(flow.context_tokens_max).toBe(150000);
+		expect(flow.context_tokens_final).toBe(150000);
+	});
+
+	it("includes cache read and write in per-turn context", () => {
+		const flow = deriveFlowMetrics([
+			{
+				type: "assistant",
+				tokens: { input: 1000, cache: { read: 2000, write: 3000 } },
+			},
+		]);
+
+		expect(flow.context_tokens_max).toBe(6000);
+		expect(flow.context_tokens_final).toBe(6000);
+	});
+
+	it("returns zero context when there are no assistant messages", () => {
+		const flow = deriveFlowMetrics([{ type: "user", text: "hello" }]);
+
+		expect(flow.turns_total).toBe(0);
+		expect(flow.context_tokens_max).toBe(0);
+		expect(flow.context_tokens_final).toBe(0);
+	});
+
+	it("splits generation and post-generation time", () => {
+		const flow = deriveFlowMetrics([
+			assistant(1000, { created: 0, streamed: 4000, completed: 9000 }),
+		]);
+
+		expect(flow.generation_seconds).toBe(4);
+		expect(flow.post_generation_seconds).toBe(5);
+	});
+
+	it("skips only the timing metric whose timestamps are missing", () => {
+		const flow = deriveFlowMetrics([
+			assistant(1000, { created: 1000, streamed: 2000 }),
+			assistant(2000, { created: 3000 }),
+		]);
+
+		expect(flow.turns_total).toBe(2);
+		expect(flow.generation_seconds).toBe(1);
+		expect(flow.post_generation_seconds).toBe(0);
+	});
+
+	it("counts a compaction marker once", () => {
+		const flow = deriveFlowMetrics([
+			{ type: "compaction", id: "c1", reason: "auto", status: "running" },
+			{ type: "compaction", id: "c1", reason: "auto", status: "completed" },
+		]);
+
+		expect(flow.compactions).toBe(1);
+	});
+
+	it("degrades to zero for an assistant message without tokens", () => {
+		const flow = deriveFlowMetrics([{ type: "assistant", time: { created: 0 } }]);
+
+		expect(flow.turns_total).toBe(1);
+		expect(flow.context_tokens_max).toBe(0);
+		expect(flow.context_tokens_final).toBe(0);
 	});
 });

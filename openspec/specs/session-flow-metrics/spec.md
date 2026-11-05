@@ -1,4 +1,10 @@
-## ADDED Requirements
+# session-flow-metrics Specification
+
+## Purpose
+Expose permission, turn, context, timing, and subagent flow metrics alongside
+cost so consumers can see where a session's time and money went.
+
+## Requirements
 
 ### Requirement: Permission prompt metrics
 

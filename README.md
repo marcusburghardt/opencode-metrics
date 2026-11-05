@@ -56,8 +56,9 @@ the alternative of referencing `dist/index.js` directly.
 | Code impact    | `files_changed`, `lines_added`, `lines_deleted` (line counts are `0` on OpenCode V2) |
 | Activity       | `messages_total`                                                 |
 | Artifacts      | `prs_created`, `prs_reviewed`, `issues_referenced`               |
+| Flow           | `permission_prompts`, `permission_wait_seconds`, `turns_total`, `context_tokens_max`, `context_tokens_final`, `generation_seconds`, `post_generation_seconds`, `compactions`, `child_sessions` |
 
-All 15 metrics are recorded per session into a local SQLite database at
+All 24 metrics are recorded per session into a local SQLite database at
 `~/.local/share/opencode-metrics/metrics.db`.
 
 ### Key commands
@@ -336,7 +337,7 @@ metrics database at `~/.local/share/opencode-metrics/metrics.db`.
 ### What gets imported
 
 The backfill reads every session from OpenCode's internal database and
-writes all 15 metrics for each one:
+writes all 24 metrics for each one:
 
 - **Token metrics:** `tokens_input`, `tokens_output`, `tokens_reasoning`,
   `tokens_cache_read`, `tokens_cache_write`
@@ -1391,7 +1392,7 @@ make lint
 
 ## Metric Reference
 
-All 15 metrics are recorded per session on every idle event (UPSERT
+All 24 metrics are recorded per session on every idle event (UPSERT
 semantics — the latest cumulative value is stored). Descriptions below
 match the `metric_definitions` table in the database.
 
@@ -1412,6 +1413,15 @@ match the `metric_definitions` table in the database.
 | `prs_created`      | count   | PRs created in the session                     | sum         |
 | `prs_reviewed`     | count   | PRs reviewed in the session                    | sum         |
 | `issues_referenced`| count   | Issues referenced in the session               | sum         |
+| `permission_prompts` | count | Permission prompts shown in the session        | sum         |
+| `permission_wait_seconds` | seconds | Total time spent waiting for permission replies in the session | sum |
+| `turns_total`      | count   | Number of assistant turns in the session       | sum         |
+| `context_tokens_max` | count | Peak per-turn context tokens (input + cache read + cache write) | sum |
+| `context_tokens_final` | count | Per-turn context tokens of the last assistant message (input + cache read + cache write) | sum |
+| `generation_seconds` | seconds | Total model generation time across assistant turns | sum    |
+| `post_generation_seconds` | seconds | Total time between stream completion and turn completion; includes tool and approval wait | sum |
+| `compactions`      | count   | Number of compaction markers in the session message history | sum |
+| `child_sessions`   | count   | Number of direct child sessions created by this session | sum |
 
 **Known metric limitations:**
 
@@ -1435,6 +1445,26 @@ match the `metric_definitions` table in the database.
   Returns 0 when the denominator is 0.
 - `duration_seconds` = `(time_updated - time_created) / 1000`.
   Returns 0 when either timestamp is missing or the result would be negative.
+- `context_tokens_max` / `context_tokens_final` use
+  `input + cache.read + cache.write` for each assistant turn.
+- `generation_seconds` = `SUM(streamed - created) / 1000`; a turn missing
+  either timestamp is skipped for this metric only.
+- `post_generation_seconds` = `SUM(completed - streamed) / 1000`. It includes
+  tool execution **and permission approval wait**; subtract
+  `permission_wait_seconds` to isolate tool time.
+
+**Event families consumed:** the plugin subscribes to
+`session.status`, `session.idle`, `session.execution.succeeded`,
+`session.execution.failed`, `session.execution.interrupted`,
+`permission.asked`, and `permission.replied` in one sequential loop.
+Lifecycle events trigger a capture; permission events only update
+per-session state that the next capture reads.
+
+**In-memory permission state:** permission prompts and closed wait
+intervals are accumulated in memory per session and written on the next
+capture. Counts survive across captures, but open intervals do not survive
+a plugin process restart: a prompt asked before the restart and answered
+after it still counts, while its wait is not recorded.
 
 **Aggregation column** indicates the recommended SQL aggregate function
 for dashboard panels: `sum` for additive metrics, `avg` for ratios.

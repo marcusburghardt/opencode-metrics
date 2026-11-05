@@ -19,6 +19,7 @@ import {
 	runSubscriptionLoop,
 	setupPlugin,
 } from "./index";
+import { PermissionTracker } from "./permissions";
 import { syncCostPricing } from "./pricing";
 import { isVersionSupported, resolvePluginVersion } from "./version";
 
@@ -164,7 +165,15 @@ describe("handleSessionIdle", () => {
 	it("full flow: extract, classify, write to DB", async () => {
 		const { client } = makeClient();
 
-		await handleSessionIdle(client, "sess-001", db, config, cache, budgetCache);
+		await handleSessionIdle(
+			client,
+			"sess-001",
+			db,
+			config,
+			cache,
+			budgetCache,
+			new PermissionTracker(),
+		);
 
 		const project = db.prepare("SELECT * FROM projects WHERE project_id = ?").get("proj-001") as {
 			project_id: string;
@@ -192,7 +201,7 @@ describe("handleSessionIdle", () => {
 			.prepare("SELECT * FROM measurements WHERE session_id = ? ORDER BY metric_name")
 			.all("sess-001") as Array<{ metric_name: string; value: number }>;
 
-		expect(metrics.length).toBe(15);
+		expect(metrics.length).toBe(24);
 
 		const costMetric = metrics.find((m) => m.metric_name === "cost");
 		expect(costMetric?.value).toBeCloseTo(0.42);
@@ -791,6 +800,18 @@ function executionEvent(kind: string, sessionID: string): unknown {
 	return { type: `session.execution.${kind}`, data: { sessionID } };
 }
 
+function permissionAsked(sessionID: string, id: string | undefined, created?: number): unknown {
+	return { type: "permission.asked", created, data: { sessionID, id } };
+}
+
+function permissionReplied(
+	sessionID: string,
+	requestID: string | undefined,
+	created?: number,
+): unknown {
+	return { type: "permission.replied", created, data: { sessionID, requestID } };
+}
+
 function emptyStream(): AsyncIterable<unknown> {
 	return {
 		[Symbol.asyncIterator]() {
@@ -966,6 +987,7 @@ describe("event subscription loop", () => {
 			classificationCache: new ClassificationCache(),
 			budgetCache: new ClassificationCache(),
 			sdkClient: client,
+			permissionTracker: new PermissionTracker(),
 		};
 	}
 
@@ -1118,6 +1140,8 @@ describe("event subscription loop", () => {
 			"session.execution.succeeded",
 			"session.execution.failed",
 			"session.execution.interrupted",
+			"permission.asked",
+			"permission.replied",
 		]);
 	});
 
@@ -1306,6 +1330,103 @@ describe("event subscription loop", () => {
 				count: number;
 			};
 			expect(count.count).toBe(0);
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("subscribes to permission events alongside lifecycle events", async () => {
+		const { ctx, subscribeCalls } = makeEventContext(() => emptyStream());
+		const runtime = await makeRuntime();
+		await runSubscriptionLoop(
+			ctx,
+			runtime,
+			{ sleep: async () => {} },
+			new AbortController().signal,
+		);
+
+		expect(subscribeCalls).toHaveLength(1);
+		expect(subscribeCalls[0].types).toContain("permission.asked");
+		expect(subscribeCalls[0].types).toContain("permission.replied");
+		expect(subscribeCalls[0].types).toContain("session.status");
+	});
+
+	it("tracks permission events without capturing the session", async () => {
+		const { ctx } = makeEventContext(() =>
+			finiteStream([
+				permissionAsked("sess-perm", "p1", 1000),
+				permissionReplied("sess-perm", "p1", 4000),
+			]),
+		);
+		const runtime = await makeRuntime();
+		await runSubscriptionLoop(
+			ctx,
+			runtime,
+			{ sleep: async () => {} },
+			new AbortController().signal,
+		);
+
+		const count = runtime.db.prepare("SELECT COUNT(*) AS count FROM sessions").get() as {
+			count: number;
+		};
+		expect(count.count).toBe(0);
+		expect(runtime.permissionTracker.drain("sess-perm")).toEqual({
+			permission_prompts: 1,
+			permission_wait_seconds: 3,
+		});
+	});
+
+	it("writes captured permission metrics after a lifecycle event", async () => {
+		const { ctx } = makeEventContext(() =>
+			finiteStream([
+				permissionAsked("sess-perm-capture", "p1", 1000),
+				permissionReplied("sess-perm-capture", "p1", 4000),
+				idleEvent("sess-perm-capture"),
+			]),
+		);
+		const runtime = await makeRuntime();
+		await runSubscriptionLoop(
+			ctx,
+			runtime,
+			{ sleep: async () => {}, captureDebounceMs: 0 },
+			new AbortController().signal,
+		);
+
+		const prompts = runtime.db
+			.prepare(
+				"SELECT value FROM measurements WHERE session_id = ? AND metric_name = 'permission_prompts'",
+			)
+			.get("sess-perm-capture") as { value: number } | null;
+		const wait = runtime.db
+			.prepare(
+				"SELECT value FROM measurements WHERE session_id = ? AND metric_name = 'permission_wait_seconds'",
+			)
+			.get("sess-perm-capture") as { value: number } | null;
+
+		expect(prompts?.value).toBe(1);
+		expect(wait?.value).toBe(3);
+	});
+
+	it("ignores malformed permission events", async () => {
+		const capture = captureConsole();
+		try {
+			const runtime = await makeRuntime();
+			await handleSessionEvent({ type: "permission.asked", data: null }, runtime);
+			await handleSessionEvent(
+				{ type: "permission.asked", data: { sessionID: 42, id: "p1" } },
+				runtime,
+			);
+			await handleSessionEvent(permissionReplied("", "p1"), runtime);
+
+			expect(runtime.permissionTracker.drain("42")).toEqual({
+				permission_prompts: 0,
+				permission_wait_seconds: 0,
+			});
+			const count = runtime.db.prepare("SELECT COUNT(*) AS count FROM sessions").get() as {
+				count: number;
+			};
+			expect(count.count).toBe(0);
+			expect(capture.error).toEqual([]);
 		} finally {
 			capture.restore();
 		}
@@ -1645,7 +1766,7 @@ describe("event subscription loop", () => {
 				.get("sess-inflight") as { count: number };
 			// Either the write rolled back (no row) or completed fully.
 			if (session.count === 1) {
-				expect(measurements.count).toBe(15);
+				expect(measurements.count).toBe(24);
 			} else {
 				expect(measurements.count).toBe(0);
 			}
@@ -1910,6 +2031,7 @@ describe("setupPlugin", () => {
 				classificationCache: new ClassificationCache(),
 				budgetCache: new ClassificationCache(),
 				sdkClient: client,
+				permissionTracker: new PermissionTracker(),
 			};
 
 			const { ctx } = makeEventContext(() => finiteStream([idleEvent("sess-log")]));

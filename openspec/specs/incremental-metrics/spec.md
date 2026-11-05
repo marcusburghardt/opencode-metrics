@@ -1,10 +1,23 @@
+## Purpose
+
+Record per-metric deltas on every idle event so consumers can aggregate
+sessions over time windows without attributing a multi-day session's entire
+value to a single day.
+
 ## Requirements
 
 ### Requirement: Incremental delta tracking for all metrics
 
 The plugin SHALL record the incremental change (delta) for each metric
 on every idle event, storing it in a `measurement_deltas` table
-alongside the existing cumulative `measurements` table.
+alongside the existing cumulative `measurements` table. This SHALL apply
+to the flow metrics as well: `permission_prompts`,
+`permission_wait_seconds`, `turns_total`, `context_tokens_max`,
+`context_tokens_final`, `generation_seconds`, `post_generation_seconds`,
+`compactions`, and `child_sessions`.
+
+Previously: the requirement covered every recorded metric but did not name
+the flow metrics, which are introduced by the `session-flow-metrics` change.
 
 #### Scenario: First idle event for a new session
 
@@ -37,6 +50,23 @@ alongside the existing cumulative `measurements` table.
 - **THEN** a row SHALL be inserted into measurement_deltas with
   delta = -2
 - **AND** the measurements row SHALL be updated to value = 3
+
+#### Scenario: Flow metric delta
+
+- **GIVEN** measurements contains permission_prompts = 1 for session "s1"
+- **WHEN** a later capture records permission_prompts = 3
+- **THEN** a row SHALL be inserted into measurement_deltas with
+  metric_name = "permission_prompts" and delta = 2
+- **AND** the measurements row SHALL be updated to value = 3
+
+#### Scenario: Flow metric decreases after a context reset
+
+- **GIVEN** measurements contains context_tokens_final = 400000
+- **WHEN** a compaction is followed by a capture with
+  context_tokens_final = 25000
+- **THEN** a row SHALL be inserted into measurement_deltas with
+  delta = -375000
+- **AND** the measurements row SHALL be updated to value = 25000
 
 ### Requirement: Delta table schema
 

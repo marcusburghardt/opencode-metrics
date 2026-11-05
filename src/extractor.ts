@@ -22,6 +22,13 @@ export interface SDKClient {
 	session: {
 		get: (id: string) => Promise<SessionInfo | null>;
 		messages: (id: string) => Promise<MessageInfo[]>;
+		/**
+		 * Untranslated message history, used to derive flow metrics
+		 * (tokens, timestamps, compaction markers). Optional so clients that
+		 * only provide translated messages keep working; flow metrics then
+		 * degrade to 0.
+		 */
+		rawMessages?: (id: string) => Promise<readonly unknown[]>;
 	};
 	project: {
 		current: () => Promise<ProjectInfo | null>;
@@ -271,6 +278,98 @@ export function collectSnapshotFiles(messages: MessageInfo[]): string[] {
 	return [...files];
 }
 
+/** Flow metrics derived from the raw message history. */
+export interface FlowMetrics {
+	turns_total: number;
+	context_tokens_max: number;
+	context_tokens_final: number;
+	generation_seconds: number;
+	post_generation_seconds: number;
+	compactions: number;
+}
+
+/** Empty flow metric set, used when no raw messages are available. */
+const EMPTY_FLOW_METRICS: FlowMetrics = {
+	turns_total: 0,
+	context_tokens_max: 0,
+	context_tokens_final: 0,
+	generation_seconds: 0,
+	post_generation_seconds: 0,
+	compactions: 0,
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function finiteNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/** Per-turn context: input + cache.read + cache.write, defaulting each to 0. */
+function turnContextTokens(tokens: unknown): number {
+	if (!isRecord(tokens)) return 0;
+	const cache = isRecord(tokens.cache) ? tokens.cache : {};
+	return (
+		(finiteNumber(tokens.input) ?? 0) +
+		(finiteNumber(cache.read) ?? 0) +
+		(finiteNumber(cache.write) ?? 0)
+	);
+}
+
+/**
+ * Derive turn, context, timing, and compaction metrics from the raw V2
+ * message history.
+ *
+ * Every metric degrades independently: a message without token data still
+ * counts as a turn, and a turn missing a timestamp is skipped only for the
+ * timing metric that needs it. Compaction markers are counted once per id so
+ * a running/completed pair does not double-count.
+ */
+export function deriveFlowMetrics(rawMessages: readonly unknown[]): FlowMetrics {
+	const metrics: FlowMetrics = { ...EMPTY_FLOW_METRICS };
+	const seenCompactions = new Set<string>();
+	let unnamedCompactions = 0;
+
+	for (const raw of rawMessages) {
+		if (!isRecord(raw)) continue;
+
+		if (raw.type === "compaction") {
+			if (typeof raw.id === "string" && raw.id.length > 0) {
+				seenCompactions.add(raw.id);
+			} else {
+				unnamedCompactions += 1;
+			}
+			continue;
+		}
+
+		if (raw.type !== "assistant") continue;
+
+		metrics.turns_total += 1;
+
+		const contextTokens = turnContextTokens(raw.tokens);
+		metrics.context_tokens_final = contextTokens;
+		if (contextTokens > metrics.context_tokens_max) {
+			metrics.context_tokens_max = contextTokens;
+		}
+
+		const time = isRecord(raw.time) ? raw.time : {};
+		const created = finiteNumber(time.created);
+		const streamed = finiteNumber(time.streamed);
+		const completed = finiteNumber(time.completed);
+
+		if (created !== undefined && streamed !== undefined && streamed >= created) {
+			metrics.generation_seconds += (streamed - created) / 1000;
+		}
+		if (streamed !== undefined && completed !== undefined && completed >= streamed) {
+			metrics.post_generation_seconds += (completed - streamed) / 1000;
+		}
+	}
+
+	metrics.compactions = seenCompactions.size + unnamedCompactions;
+	return metrics;
+}
+
 /**
  * Build the full metrics array from extracted session values.
  * All 12 metric catalog entries are always produced.
@@ -331,8 +430,8 @@ function buildMetrics(
  * - Project dimension record
  * - Session dimension record (classification set to "unknown" — caller
  *   is responsible for running the classifier and updating it)
- * - 15 metric measurements including derived cache_hit_ratio, duration_seconds,
- *   and PR/issue artifact counts
+ * - 21 metric measurements including derived cache_hit_ratio, duration_seconds,
+ *   PR/issue artifact counts, and message-history flow metrics
  * - PR/issue artifact references extracted from bash tool calls
  * - Classification context for the rule-based classifier
  *
@@ -350,7 +449,14 @@ export async function extractSessionData(
 
 	const session = await client.session.get(sessionId);
 	const messages = await client.session.messages(sessionId);
+	const rawMessages = client.session.rawMessages
+		? await client.session.rawMessages(sessionId)
+		: [];
 	const project = await client.project.current();
+
+	// Flow metrics come from the raw message history (tokens, timestamps,
+	// compaction markers). Missing data degrades each value to 0.
+	const flowMetrics = deriveFlowMetrics(rawMessages);
 
 	// Extract classification-relevant data from messages.
 	const firstUserMessage = extractFirstUserMessage(messages);
@@ -432,6 +538,32 @@ export async function extractSessionData(
 			value: issuesReferenced.length,
 			recorded_at: recordedAt,
 		},
+	);
+
+	// Append the flow metrics derived from the message history.
+	metrics.push(
+		{ metric_name: "turns_total", value: flowMetrics.turns_total, recorded_at: recordedAt },
+		{
+			metric_name: "context_tokens_max",
+			value: flowMetrics.context_tokens_max,
+			recorded_at: recordedAt,
+		},
+		{
+			metric_name: "context_tokens_final",
+			value: flowMetrics.context_tokens_final,
+			recorded_at: recordedAt,
+		},
+		{
+			metric_name: "generation_seconds",
+			value: flowMetrics.generation_seconds,
+			recorded_at: recordedAt,
+		},
+		{
+			metric_name: "post_generation_seconds",
+			value: flowMetrics.post_generation_seconds,
+			recorded_at: recordedAt,
+		},
+		{ metric_name: "compactions", value: flowMetrics.compactions, recorded_at: recordedAt },
 	);
 
 	return {

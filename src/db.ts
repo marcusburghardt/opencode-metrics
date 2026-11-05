@@ -130,6 +130,62 @@ const METRIC_DEFINITIONS: ReadonlyArray<{
 		description: "Issues referenced in the session",
 		aggregation: "sum",
 	},
+	{
+		metric_name: "permission_prompts",
+		unit: "count",
+		description: "Permission prompts shown in the session",
+		aggregation: "sum",
+	},
+	{
+		metric_name: "permission_wait_seconds",
+		unit: "seconds",
+		description: "Total time spent waiting for permission replies in the session",
+		aggregation: "sum",
+	},
+	{
+		metric_name: "turns_total",
+		unit: "count",
+		description: "Number of assistant turns in the session",
+		aggregation: "sum",
+	},
+	{
+		metric_name: "context_tokens_max",
+		unit: "count",
+		description: "Peak per-turn context tokens (input + cache read + cache write)",
+		aggregation: "sum",
+	},
+	{
+		metric_name: "context_tokens_final",
+		unit: "count",
+		description:
+			"Per-turn context tokens of the last assistant message (input + cache read + cache write)",
+		aggregation: "sum",
+	},
+	{
+		metric_name: "generation_seconds",
+		unit: "seconds",
+		description: "Total model generation time across assistant turns",
+		aggregation: "sum",
+	},
+	{
+		metric_name: "post_generation_seconds",
+		unit: "seconds",
+		description:
+			"Total time between stream completion and turn completion; includes tool and approval wait",
+		aggregation: "sum",
+	},
+	{
+		metric_name: "compactions",
+		unit: "count",
+		description: "Number of compaction markers in the session message history",
+		aggregation: "sum",
+	},
+	{
+		metric_name: "child_sessions",
+		unit: "count",
+		description: "Number of direct child sessions created by this session",
+		aggregation: "sum",
+	},
 ] as const;
 
 /**
@@ -444,6 +500,22 @@ export function ensureMetricDefinitions(db: Database): void {
 	for (const metric of METRIC_DEFINITIONS) {
 		stmt.run(metric.metric_name, metric.unit, metric.description, metric.aggregation);
 	}
+}
+
+/**
+ * Count the stored sessions whose parent is the given session.
+ *
+ * Only direct children are counted; grandchildren belong to their own
+ * parent. A malformed row that points a session at itself is excluded so
+ * the count never reports the session as its own child.
+ */
+export function countChildSessions(db: Database, sessionID: string): number {
+	const row = db
+		.prepare(
+			"SELECT COUNT(*) AS count FROM sessions WHERE parent_session_id = ? AND session_id != ?",
+		)
+		.get(sessionID, sessionID) as { count: number } | null;
+	return row?.count ?? 0;
 }
 
 /**

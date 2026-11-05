@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { Database } from "bun:sqlite";
+import { countChildSessions } from "./db";
 
 /** Record for the projects dimension table. */
 export interface ProjectRecord {
@@ -139,6 +140,16 @@ export const MONOTONIC_METRICS: ReadonlySet<string> = new Set([
 	"prs_created",
 	"prs_reviewed",
 	"issues_referenced",
+	// Flow metrics. context_tokens_final and child_sessions are excluded:
+	// a compaction resets the final context, and a child session may be
+	// removed, so both may legitimately decrease.
+	"permission_prompts",
+	"permission_wait_seconds",
+	"turns_total",
+	"context_tokens_max",
+	"generation_seconds",
+	"post_generation_seconds",
+	"compactions",
 ]);
 
 /**
@@ -277,7 +288,19 @@ export async function writeSessionData(db: Database, data: WriteSessionDataInput
 	const transactionFn = db.transaction(() => {
 		upsertProject(db, data.project);
 		upsertSession(db, data.session);
-		writeMetrics(db, data.session.session_id, data.metrics);
+
+		// Derive the child count inside the transaction so it reflects the
+		// sessions stored at write time. A child captured later is picked up
+		// on the parent's next idle capture.
+		const sessionId = data.session.session_id;
+		const metrics = data.metrics.filter((metric) => metric.metric_name !== "child_sessions");
+		metrics.push({
+			metric_name: "child_sessions",
+			value: countChildSessions(db, sessionId),
+			recorded_at: data.session.ended_at || Date.now(),
+		});
+
+		writeMetrics(db, sessionId, metrics);
 		if (data.artifacts && data.artifacts.length > 0) {
 			const recordedAt = data.session.ended_at || Date.now();
 			upsertArtifacts(db, data.session.session_id, data.artifacts, recordedAt);

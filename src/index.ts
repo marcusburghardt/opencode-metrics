@@ -8,6 +8,7 @@ import { loadConfig, writeDefaultConfig } from "./config";
 import { initDatabase } from "./db";
 import type { MessageInfo, PartInfo, SDKClient } from "./extractor";
 import { extractSessionData } from "./extractor";
+import { PERMISSION_EVENT_TYPES, PermissionTracker } from "./permissions";
 import { syncCostPricing } from "./pricing";
 import { isVersionSupported, resolvePluginVersion, SUPPORTED_PLUGIN_RANGE } from "./version";
 import { writeSessionData } from "./writer";
@@ -36,6 +37,17 @@ export const SESSION_LIFECYCLE_EVENT_TYPES = [
 	"session.execution.succeeded",
 	"session.execution.failed",
 	"session.execution.interrupted",
+] as const;
+
+/**
+ * Everything the single subscription loop consumes: lifecycle events drive
+ * captures, permission events only update per-session state. Keeping one
+ * subscription preserves the sequential ordering that delta correctness
+ * depends on.
+ */
+const SUBSCRIBED_EVENT_TYPES = [
+	...SESSION_LIFECYCLE_EVENT_TYPES,
+	...PERMISSION_EVENT_TYPES,
 ] as const;
 
 /** Optional injection points for tests and for hosts that need a custom root. */
@@ -90,6 +102,8 @@ export interface PluginRuntime {
 	classificationCache: ClassificationCache;
 	budgetCache: ClassificationCache;
 	sdkClient: SDKClient;
+	/** Accumulates permission prompts and approval wait per session. */
+	permissionTracker: PermissionTracker;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -199,6 +213,18 @@ export function translateMessages(messages: readonly unknown[]): MessageInfo[] {
  * message-loading path stays isolated to `session.messages()`.
  */
 export function createSDKAdapter(ctx: Plugin.Context): SDKClient {
+	// Single-slot cache: `messages()` and `rawMessages()` are called back to
+	// back for the same session, so the raw context is fetched once and then
+	// reused instead of issuing a second SDK request.
+	let lastContext: { id: string; messages: readonly unknown[] } | undefined;
+
+	const loadContext = async (id: string): Promise<readonly unknown[]> => {
+		if (lastContext?.id === id) return lastContext.messages;
+		const messages = (await ctx.session.context({ sessionID: id })) as readonly unknown[];
+		lastContext = { id, messages };
+		return messages;
+	};
+
 	return {
 		session: {
 			get: async (id) => {
@@ -232,9 +258,11 @@ export function createSDKAdapter(ctx: Plugin.Context): SDKClient {
 			},
 
 			messages: async (id) => {
-				const messages = await ctx.session.context({ sessionID: id });
-				return translateMessages(messages as readonly unknown[]);
+				const messages = await loadContext(id);
+				return translateMessages(messages);
 			},
+
+			rawMessages: (id) => loadContext(id),
 		},
 
 		project: {
@@ -264,9 +292,29 @@ export async function handleSessionIdle(
 	config: MetricsConfig,
 	classificationCache: ClassificationCache,
 	budgetCache: ClassificationCache,
+	permissionTracker?: PermissionTracker,
 ): Promise<void> {
 	const data = await extractSessionData(sdkClient, sessionId);
 	if (!data) return;
+
+	// Merge the permission state accumulated since the previous capture.
+	// Both metrics are always written so a session without prompts records 0.
+	if (permissionTracker) {
+		const permission = permissionTracker.drain(sessionId);
+		const recordedAt = data.metrics[0]?.recorded_at ?? (data.session.ended_at || Date.now());
+		data.metrics.push(
+			{
+				metric_name: "permission_prompts",
+				value: permission.permission_prompts,
+				recorded_at: recordedAt,
+			},
+			{
+				metric_name: "permission_wait_seconds",
+				value: permission.permission_wait_seconds,
+				recorded_at: recordedAt,
+			},
+		);
+	}
 
 	// Check cache first; reclassify if message count changed.
 	let classification = classificationCache.get(
@@ -330,6 +378,7 @@ export function initializePlugin(ctx: Plugin.Context): PluginRuntime {
 		classificationCache: new ClassificationCache(),
 		budgetCache: new ClassificationCache(),
 		sdkClient: createSDKAdapter(ctx),
+		permissionTracker: new PermissionTracker(),
 	};
 }
 
@@ -396,6 +445,40 @@ function isTerminalStatusEvent(eventType: string, data: Record<string, unknown>)
  * Exported for testing — this is the core event handling logic separated from
  * the plugin boilerplate and SDK adapter.
  */
+/**
+ * Update the permission tracker from a `permission.asked`/`replied` event.
+ * These events never trigger a capture; the next lifecycle capture reads the
+ * accumulated state. Events without a usable session id are dropped, and an
+ * asked event without a permission id still counts the prompt.
+ */
+function handlePermissionEvent(
+	eventType: string,
+	event: Record<string, unknown>,
+	data: Record<string, unknown>,
+	tracker: PermissionTracker,
+): void {
+	const sessionId = data.sessionID;
+	if (typeof sessionId !== "string" || sessionId.length === 0) {
+		console.warn(`${LOG_PREFIX} skipping ${eventType} event with missing session id`);
+		return;
+	}
+
+	const timestamp =
+		typeof event.created === "number" && Number.isFinite(event.created)
+			? event.created
+			: undefined;
+
+	if (eventType === "permission.asked") {
+		const permissionId = typeof data.id === "string" && data.id.length > 0 ? data.id : undefined;
+		tracker.handleAsked(sessionId, permissionId, timestamp);
+		return;
+	}
+
+	const requestId =
+		typeof data.requestID === "string" && data.requestID.length > 0 ? data.requestID : undefined;
+	tracker.handleReplied(sessionId, requestId, timestamp);
+}
+
 export async function handleSessionEvent(
 	event: unknown,
 	runtime: PluginRuntime,
@@ -403,11 +486,22 @@ export async function handleSessionEvent(
 ): Promise<void> {
 	if (!isRecord(event) || typeof event.type !== "string") return;
 	const eventType = event.type;
-	if (!(SESSION_LIFECYCLE_EVENT_TYPES as readonly string[]).includes(eventType)) return;
+	const isPermissionEvent = (PERMISSION_EVENT_TYPES as readonly string[]).includes(eventType);
+	if (
+		!isPermissionEvent &&
+		!(SESSION_LIFECYCLE_EVENT_TYPES as readonly string[]).includes(eventType)
+	) {
+		return;
+	}
 
 	const data = isRecord(event.data) ? event.data : undefined;
 	if (!data) {
 		console.warn(`${LOG_PREFIX} skipping ${eventType} event with missing data`);
+		return;
+	}
+
+	if (isPermissionEvent) {
+		handlePermissionEvent(eventType, event, data, runtime.permissionTracker);
 		return;
 	}
 
@@ -440,6 +534,7 @@ export async function handleSessionEvent(
 			runtime.config,
 			runtime.classificationCache,
 			runtime.budgetCache,
+			runtime.permissionTracker,
 		);
 	} catch (error) {
 		console.error(`${LOG_PREFIX} failed to capture session ${sessionId}: ${describeError(error)}`);
@@ -479,7 +574,7 @@ export async function runSubscriptionLoop(
 		}
 
 		try {
-			const stream = ctx.event.subscribe({ types: SESSION_LIFECYCLE_EVENT_TYPES, signal });
+			const stream = ctx.event.subscribe({ types: SUBSCRIBED_EVENT_TYPES, signal });
 			for await (const event of stream) {
 				// A consumed event proves the stream is healthy; the next
 				// failure gets a fresh retry budget.
