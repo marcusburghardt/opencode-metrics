@@ -139,11 +139,11 @@ with only the README-only wording normalization parallelized.
 ## 10. Release
 
 - [x] 10.1 [P] Draft `release-notes.md` in this change with sections: breaking changes (host + plugin API), changed (project attribution, agent/model provenance, `files_changed` source), known limitations (line counts 0, backfill gap, write gap), and upgrade notes
-- [ ] 10.2 Do NOT hand-edit `CHANGELOG.md`, `package.json` version, or `.release-please-manifest.json`; release-please owns them
-- [ ] 10.3 Land the change with a breaking-change marker (`feat!:` subject or a `BREAKING CHANGE:` footer) so release-please emits a breaking section and bumps 0.4.1 to 0.5.0 via `bump-minor-pre-major`
-- [ ] 10.4 Verify the release-please PR: version is 0.5.0, the changelog contains a breaking-changes section, and `package.json` matches `.release-please-manifest.json`
+- [x] 10.2 Do NOT hand-edit `CHANGELOG.md`, `package.json` version, or `.release-please-manifest.json`; release-please owns them
+- [x] 10.3 Land the change with a breaking-change marker (`feat!:` subject or a `BREAKING CHANGE:` footer) so release-please emits a breaking section and bumps 0.4.1 to 0.5.0 via `bump-minor-pre-major`
+- [x] 10.4 Verify the release-please PR: version is 0.5.0, the changelog contains a breaking-changes section, and `package.json` matches `.release-please-manifest.json`
 - [ ] 10.5 Reconcile the generated release PR body against `release-notes.md` and add the hand-written upgrade section to the GitHub Release
-- [ ] 10.6 Fold the stale `## [Unreleased] (2026-09-18)` entries in `CHANGELOG.md` into their released sections in a dedicated `docs:` commit (the one-time remediation exception in the `ci-release` delta); delete nothing
+- [x] 10.6 Fold the stale `## [Unreleased] (2026-09-18)` entries in `CHANGELOG.md` into their released sections in a dedicated `docs:` commit (the one-time remediation exception in the `ci-release` delta); delete nothing
 - [ ] 10.7 Confirm the automated gate ran during the real release: record the 10.12 script output and the resulting dist-tags (`latest` unchanged until promotion) in `evidence.md`
 - [ ] 10.8 After promoting, add the 0.4.x deprecation notice directing V1 hosts to pin `0.4.1`
 - [ ] 10.9 [P] Open the `ansible-role-ai` change re-enabling the plugin with an explicit `0.5.x` pin, plus a version/OpenCode-compatibility note in the README ansible sections
