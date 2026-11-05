@@ -44,6 +44,13 @@
 * add CI/CD pipeline and publish as @mburghardt/opencode-metrics ([5b20619](https://github.com/marcusburghardt/opencode-metrics/commit/5b2061987308dc7f6996816ccaa9e5f82952c3fe))
 * add CI/CD pipeline and publish as @mburghardt/opencode-metrics ([141bc7b](https://github.com/marcusburghardt/opencode-metrics/commit/141bc7bd033c8b0ff628c61b14616cf03125dd9d))
 * add cost adjustment layer for user-defined pricing ([1fe6377](https://github.com/marcusburghardt/opencode-metrics/commit/1fe6377831a32e07a47574c9ead8ce1f6d834272))
+* add `cost_pricing` configuration section for per-model token pricing rules
+* add `cost_pricing` table via V4 schema migration
+* add `v_adjusted_costs` view for cumulative adjusted cost per session
+* add `v_adjusted_cost_deltas` view for time-sliced adjusted cost deltas
+* sync cost pricing rules from config.yaml to database on startup (full-replace strategy)
+* support optional `cache_read_price`, `cache_write_price`, and `reasoning_price` fields in pricing rules
+* validate cost pricing rules during config loading (skip malformed with warning)
 * add historical session backfill script ([02952d5](https://github.com/marcusburghardt/opencode-metrics/commit/02952d5c55d9a233427cfd27b8ed774af7646b17))
 * add PR and issue tracking with session artifacts ([0a424ff](https://github.com/marcusburghardt/opencode-metrics/commit/0a424ffdd62d470c644e051fb8afd8017cc33ab1))
 * add QUICK_START guide with install, grafana, and classification examples ([7ed92ae](https://github.com/marcusburghardt/opencode-metrics/commit/7ed92ae1601b7d3d8236262bb0872c988ba5cdde))
@@ -85,20 +92,6 @@
 * sync ci-release specs to main and archive npm-release change ([90a007b](https://github.com/marcusburghardt/opencode-metrics/commit/90a007b3f89d907f13f2fbbc09f827e393be193a))
 * sync delta specs to main and archive completed changes ([ced6dfd](https://github.com/marcusburghardt/opencode-metrics/commit/ced6dfd974b0520462f9beb989e0fdacbcc7cc87))
 * sync subagent-cost-attribution specs to main and archive change ([cc521e4](https://github.com/marcusburghardt/opencode-metrics/commit/cc521e426ea7e1714d63bab9aac76ce5c29332b4))
-
-## [Unreleased] (2026-09-18)
-
-
-### Features
-
-* add `cost_pricing` configuration section for per-model token pricing rules
-* add `cost_pricing` table via V4 schema migration
-* add `v_adjusted_costs` view for cumulative adjusted cost per session
-* add `v_adjusted_cost_deltas` view for time-sliced adjusted cost deltas
-* sync cost pricing rules from config.yaml to database on startup (full-replace strategy)
-* support optional `cache_read_price`, `cache_write_price`, and `reasoning_price` fields in pricing rules
-* validate cost pricing rules during config loading (skip malformed with warning)
-
 
 ## [0.2.0](https://github.com/marcusburghardt/opencode-metrics/compare/opencode-metrics-v0.1.0...opencode-metrics-v0.2.0) (2026-09-17)
 
