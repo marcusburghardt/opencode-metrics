@@ -4,8 +4,8 @@ OpenCode V2 changed where it stores session history. The legacy `session`,
 `message`, and `part` tables stop receiving rows at the V1 to V2 upgrade and
 are frozen, while new sessions are written to `session_v2`,
 `session_message`, and `session_part`. On this machine the legacy `session`
-table ends at 2026-10-30, and 164 sessions created since then exist only in
-`session_v2`.
+table ends at 2026-10-30, and 311 sessions exist only in `session_v2`
+(2026-11-05 count).
 
 `scripts/backfill.ts` still reads the legacy tables. As a result it cannot
 import any session created after the upgrade, and future backfill runs would
@@ -26,13 +26,19 @@ reviewable and testable.
   and summary columns from `session_v2` instead of `session`.
 - **Message source**: read message and part data from `session_message` and
   `session_part`, decoding the JSON `data` column into the same intermediate
-  shapes the extraction helpers already use.
+  shapes the extraction helpers already use. On OpenCode 2.2.5
+  `session_part` is empty and content is embedded in `session_message.data`,
+  so the reader falls back to the embedded user text and assistant content
+  when no part rows exist.
+- **Parent links**: read `parent_id` from `session_v2` (and the legacy
+  `session` table) and persist it as `parent_session_id`, so backfilled
+  sub-agent sessions join correctly in the existing views.
 - **Diff summary limitation**: `session_v2.summary_files`,
-  `summary_additions`, and `summary_deletions` are NULL for V2-era sessions
-  (164 of 165 observed), so backfilled V2 sessions record 0 for
-  `files_changed`, `lines_added`, and `lines_deleted`. This is an upstream
-  data gap, not a backfill defect, and MUST NOT be worked around by
-  fabricating values.
+  `summary_additions`, and `summary_deletions` are NULL for many V2-era
+  sessions (319 of 1980 observed on 2026-11-05), so backfilled V2 sessions
+  record 0 for `files_changed`, `lines_added`, and `lines_deleted` when the
+  columns are NULL. This is an upstream data gap, not a backfill defect, and
+  MUST NOT be worked around by fabricating values.
 - **Existing behavior preserved**: `--dry-run`, `--since`, `--with-deltas`,
   classification, budget tags, artifact extraction, and idempotent upserts
   keep working for both source layouts.
@@ -53,7 +59,8 @@ _None._
 
 - **Files modified**: `scripts/backfill.ts` (source adapter, message/part
   readers), `scripts/backfill.test.ts` (V2 fixtures alongside V1 fixtures),
-  `README.md` (backfill section note on V2 sources and the diff limitation).
+  `README.md` and `QUICK_START.md` (backfill coverage, layout output, and the
+  V2 diff limitation).
 - **Files unchanged**: `src/**` plugin code, `metrics.db` schema, Grafana
   dashboards. The destination contract is unchanged.
 - **Data**: recovers the post-upgrade session gap and makes future backfills

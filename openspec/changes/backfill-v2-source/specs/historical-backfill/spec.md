@@ -14,12 +14,16 @@ When reading the V2 layout, the script SHALL:
 
 - read session aggregates (`cost`, `tokens_input`, `tokens_output`,
   `tokens_reasoning`, `tokens_cache_read`, `tokens_cache_write`,
-  `agent`, `model`, `title`, `time_created`, `time_updated`) from
-  `session_v2`
-- read messages from `session_message`, decoding the JSON `data`
-  column into the intermediate message shape used by the extractor
-- read message parts from `session_part`, keyed by `message_id` and
-  ordered by `ordinal`, decoding the JSON `data` column
+  `agent`, `model`, `parent_id`, `title`, `time_created`,
+  `time_updated`) from `session_v2`
+- read `user` and `assistant` messages from `session_message`, decoding
+  the JSON `data` column into the intermediate message shape used by
+  the extractor, and ignore control message types
+- read message parts from `session_part` when rows exist, keyed by
+  `message_id` and ordered by `ordinal`, decoding the JSON `data`
+  column; when a message has no `session_part` rows, decode the
+  content embedded in `session_message.data` (OpenCode 2.2.5 stores
+  user text and assistant content inline)
 
 #### Scenario: Backfill imports all historical sessions
 
@@ -81,6 +85,25 @@ When reading the V2 layout, the script SHALL:
 - **THEN** the script SHALL read from the legacy `session`, `message`,
   and `part` tables
 - **AND** SHALL produce the same results as before this change
+
+#### Scenario: V2 content is read from embedded message data
+
+- **GIVEN** the source database has `session_message` rows but no
+  `session_part` rows for those messages
+- **WHEN** the backfill imports a session
+- **THEN** it SHALL read user text from `session_message.data.text`
+- **AND** SHALL read assistant text and tool entries from
+  `session_message.data.content`
+- **AND** SHALL NOT treat the session as empty solely because
+  `session_part` is empty
+
+#### Scenario: Backfill preserves V2 parent session links
+
+- **GIVEN** a `session_v2` row has `parent_id = "ses-parent"`
+- **WHEN** the backfill imports that session
+- **THEN** the stored session record SHALL have
+  `parent_session_id = "ses-parent"`
+- **AND** a `session_v2` row with `parent_id = NULL` SHALL store NULL
 
 ## ADDED Requirements
 
