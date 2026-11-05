@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -12,10 +12,15 @@ import { initDatabase } from "../src/db";
 import { computeCacheHitRatio, computeDurationSeconds } from "../src/extractor";
 import { upsertProject, upsertSession, writeMetrics } from "../src/writer";
 import {
+	type BackfillStats,
 	backfillMissingDeltas,
+	createSourceReader,
 	deriveProjectName,
+	detectSourceLayout,
 	extractModelId,
 	parseDateToEpochMs,
+	runBackfill,
+	SourceSchemaError,
 	validateSourceSchema,
 } from "./backfill";
 
@@ -41,6 +46,7 @@ function createSourceDb(dbPath: string): Database {
 		CREATE TABLE session (
 			id TEXT PRIMARY KEY,
 			project_id TEXT,
+			parent_id TEXT,
 			cost REAL DEFAULT 0,
 			tokens_input INTEGER DEFAULT 0,
 			tokens_output INTEGER DEFAULT 0,
@@ -116,18 +122,20 @@ function insertSessionWithData(
 		summaryAdditions?: number;
 		summaryDeletions?: number;
 		userMessage?: string;
+		parentId?: string | null;
 	},
 ): void {
 	db.run(
 		`INSERT INTO session (
-			id, project_id, cost, tokens_input, tokens_output,
+			id, project_id, parent_id, cost, tokens_input, tokens_output,
 			tokens_reasoning, tokens_cache_read, tokens_cache_write,
 			agent, model, title, time_created, time_updated,
 			summary_files, summary_additions, summary_deletions
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		[
 			opts.sessionId,
 			opts.projectId,
+			opts.parentId ?? null,
 			opts.cost,
 			opts.tokensInput,
 			opts.tokensOutput,
@@ -360,6 +368,248 @@ function backfillSession(
 		},
 		{ metric_name: "messages_total", value: messageCount, recorded_at: recordedAt },
 	], { skipDeltas: !withDeltas });
+}
+
+// ---------------------------------------------------------------------------
+// V2 source database helper — mirrors the OpenCode 2.2.5 layout.
+// ---------------------------------------------------------------------------
+
+/** A part payload as stored in `session_message.data.content` or `session_part.data`. */
+type V2PartFixture = Record<string, unknown>;
+
+function textPart(text: string): V2PartFixture {
+	return { type: "text", text };
+}
+
+function reasoningPart(text: string): V2PartFixture {
+	return { type: "reasoning", text };
+}
+
+function toolPart(
+	name: string,
+	options: {
+		command?: string;
+		status?: string;
+		output?: string[];
+		extraContent?: unknown[];
+	} = {},
+): V2PartFixture {
+	const content = [
+		...(options.output ?? []).map((text) => ({ type: "text", text })),
+		...(options.extraContent ?? []),
+	];
+	return {
+		type: "tool",
+		name,
+		state: {
+			status: options.status ?? "completed",
+			input: options.command !== undefined ? { command: options.command } : {},
+			...(content.length > 0 ? { content } : {}),
+		},
+	};
+}
+
+/**
+ * One message fixture. `content` is embedded in `session_message.data`;
+ * `parts`, when present, writes `session_part` rows for the same message so
+ * tests can prove part precedence over embedded content.
+ */
+interface V2MessageFixture {
+	type: string;
+	text?: string;
+	agent?: string;
+	modelId?: string;
+	content?: V2PartFixture[];
+	parts?: V2PartFixture[];
+	malformed?: boolean;
+}
+
+interface V2SessionFixture {
+	sessionId: string;
+	projectId: string;
+	cost?: number;
+	tokensInput?: number;
+	tokensOutput?: number;
+	tokensReasoning?: number;
+	tokensCacheRead?: number;
+	tokensCacheWrite?: number;
+	agent?: string | null;
+	/** Raw JSON string, matching `session_v2.model`. */
+	model?: string | null;
+	title?: string | null;
+	timeCreated: number;
+	timeUpdated: number;
+	summaryFiles?: number | null;
+	summaryAdditions?: number | null;
+	summaryDeletions?: number | null;
+	parentId?: string | null;
+	messages?: V2MessageFixture[];
+}
+
+/**
+ * Create a temporary SQLite database with the OpenCode V2 schema.
+ * Tests that need a partial layout drop the relevant table afterwards.
+ */
+function createV2SourceDb(dbPath: string): Database {
+	const db = new Database(dbPath, { create: true });
+
+	db.run(`
+		CREATE TABLE project (
+			id TEXT PRIMARY KEY,
+			name TEXT,
+			worktree TEXT
+		)
+	`);
+	db.run(`
+		CREATE TABLE session_v2 (
+			id TEXT PRIMARY KEY,
+			project_id TEXT NOT NULL,
+			parent_id TEXT,
+			title TEXT,
+			cost REAL DEFAULT 0 NOT NULL,
+			tokens_input INTEGER DEFAULT 0 NOT NULL,
+			tokens_output INTEGER DEFAULT 0 NOT NULL,
+			tokens_reasoning INTEGER DEFAULT 0 NOT NULL,
+			tokens_cache_read INTEGER DEFAULT 0 NOT NULL,
+			tokens_cache_write INTEGER DEFAULT 0 NOT NULL,
+			agent TEXT,
+			model TEXT,
+			time_created INTEGER NOT NULL,
+			time_updated INTEGER NOT NULL,
+			summary_files INTEGER,
+			summary_additions INTEGER,
+			summary_deletions INTEGER
+		)
+	`);
+	db.run(`
+		CREATE TABLE session_message (
+			id TEXT PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			type TEXT NOT NULL,
+			seq INTEGER NOT NULL,
+			time_created INTEGER NOT NULL,
+			time_updated INTEGER NOT NULL,
+			data TEXT NOT NULL
+		)
+	`);
+	db.run(`
+		CREATE TABLE session_part (
+			message_id TEXT NOT NULL,
+			session_id TEXT NOT NULL,
+			ordinal INTEGER NOT NULL,
+			type TEXT NOT NULL,
+			call_id TEXT,
+			time_created INTEGER NOT NULL,
+			time_updated INTEGER NOT NULL,
+			data TEXT NOT NULL,
+			PRIMARY KEY (message_id, ordinal)
+		)
+	`);
+
+	return db;
+}
+
+function buildV2MessageData(
+	message: V2MessageFixture,
+	createdAt: number,
+): Record<string, unknown> {
+	const data: Record<string, unknown> = { time: { created: createdAt } };
+
+	if (message.type === "user") {
+		data.text = message.text ?? "";
+		return data;
+	}
+
+	data.content = message.content ?? [];
+	if (message.text !== undefined) data.text = message.text;
+	if (message.agent !== undefined) data.agent = message.agent;
+	if (message.modelId !== undefined) data.model = { id: message.modelId };
+	return data;
+}
+
+/**
+ * Insert a V2 session with conversation messages, optional inline content, and
+ * optional `session_part` rows.
+ */
+function insertV2Session(db: Database, session: V2SessionFixture): void {
+	db.run(
+		`INSERT INTO session_v2 (
+			id, project_id, parent_id, title, cost, tokens_input, tokens_output,
+			tokens_reasoning, tokens_cache_read, tokens_cache_write, agent, model,
+			time_created, time_updated, summary_files, summary_additions, summary_deletions
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		[
+			session.sessionId,
+			session.projectId,
+			session.parentId ?? null,
+			session.title ?? "Test session",
+			session.cost ?? 0,
+			session.tokensInput ?? 0,
+			session.tokensOutput ?? 0,
+			session.tokensReasoning ?? 0,
+			session.tokensCacheRead ?? 0,
+			session.tokensCacheWrite ?? 0,
+			session.agent === undefined ? "build" : session.agent,
+			session.model === undefined ? '{"id":"claude-opus-4-6"}' : session.model,
+			session.timeCreated,
+			session.timeUpdated,
+			session.summaryFiles === undefined ? 0 : session.summaryFiles,
+			session.summaryAdditions === undefined ? 0 : session.summaryAdditions,
+			session.summaryDeletions === undefined ? 0 : session.summaryDeletions,
+		],
+	);
+
+	const messages = session.messages ?? [
+		{ type: "user", text: "implement the feature" },
+		{ type: "assistant", content: [textPart("Done implementing the feature.")] },
+	];
+
+	messages.forEach((message, index) => {
+		const messageId = `msg-${session.sessionId}-${index}`;
+		const createdAt = session.timeCreated + index * 100;
+		const data = message.malformed
+			? "{not valid json"
+			: JSON.stringify(buildV2MessageData(message, createdAt));
+
+		db.run(
+			`INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			[messageId, session.sessionId, message.type, index + 1, createdAt, createdAt, data],
+		);
+
+		for (const [ordinal, part] of (message.parts ?? []).entries()) {
+			db.run(
+				`INSERT INTO session_part (message_id, session_id, ordinal, type, call_id, time_created, time_updated, data)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				[
+					messageId,
+					session.sessionId,
+					ordinal,
+					typeof part.type === "string" ? part.type : "text",
+					null,
+					createdAt,
+					createdAt,
+					JSON.stringify(part),
+				],
+			);
+		}
+	});
+}
+
+/** Run the backfill while suppressing its operator-facing console output. */
+async function runQuietBackfill(
+	args: Parameters<typeof runBackfill>[0],
+): Promise<BackfillStats> {
+	const logSpy = spyOn(console, "log").mockImplementation(() => {});
+	const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+	const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+	try {
+		return await runBackfill(args);
+	} finally {
+		logSpy.mockRestore();
+		warnSpy.mockRestore();
+		errorSpy.mockRestore();
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1150,5 +1400,1018 @@ describe("--with-deltas behavior", () => {
 			)
 			.get("sess-1", "cost") as { total: number };
 		expect(sumRow.total).toBeCloseTo(0.50);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// V2 source layout detection
+// ---------------------------------------------------------------------------
+
+describe("source layout detection", () => {
+	let tempDir: string;
+	let db: Database | null = null;
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(path.join(tmpdir(), "ocm-backfill-detect-"));
+	});
+
+	afterEach(() => {
+		db?.close();
+		db = null;
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("detects a complete V2 layout", () => {
+		db = createV2SourceDb(path.join(tempDir, "v2.db"));
+		expect(detectSourceLayout(db)).toBe("v2");
+		expect(createSourceReader(db).layout).toBe("v2");
+	});
+
+	it("detects a complete legacy layout", () => {
+		db = createSourceDb(path.join(tempDir, "legacy.db"));
+		expect(detectSourceLayout(db)).toBe("legacy");
+		expect(createSourceReader(db).layout).toBe("legacy");
+	});
+
+	it("names every missing V2 table in a partial layout", () => {
+		for (const table of ["session_v2", "session_message", "session_part"]) {
+			const partialPath = path.join(tempDir, `${table}.db`);
+			const partial = createV2SourceDb(partialPath);
+			partial.run(`DROP TABLE ${table}`);
+
+			let error: unknown;
+			try {
+				detectSourceLayout(partial);
+			} catch (err) {
+				error = err;
+			}
+
+			expect(error).toBeInstanceOf(SourceSchemaError);
+			expect((error as Error).message).toContain(table);
+			for (const present of ["session_v2", "session_message", "session_part"]) {
+				if (present !== table) {
+					expect((error as Error).message).not.toContain(present);
+				}
+			}
+
+			partial.close();
+		}
+	});
+
+	it("rejects a database with neither layout", () => {
+		db = new Database(path.join(tempDir, "empty.db"), { create: true });
+		expect(() => detectSourceLayout(db as Database)).toThrow(SourceSchemaError);
+		expect(() => detectSourceLayout(db as Database)).toThrow(
+			/does not appear to be an OpenCode database/,
+		);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// V2 session reader
+// ---------------------------------------------------------------------------
+
+describe("V2 session reader", () => {
+	let tempDir: string;
+	let db: Database | null = null;
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(path.join(tmpdir(), "ocm-backfill-v2-sessions-"));
+		db = createV2SourceDb(path.join(tempDir, "source.db"));
+		insertProject(db, "proj-1", "test-project", "/home/user/test-project");
+		insertProject(db, "proj-2", null, "/home/user/other-project");
+
+		insertV2Session(db, {
+			sessionId: "s-root",
+			projectId: "proj-1",
+			cost: 0.1,
+			tokensInput: 1000,
+			tokensOutput: 500,
+			tokensCacheRead: 300,
+			timeCreated: 1000,
+			timeUpdated: 2000,
+			summaryFiles: 2,
+			summaryAdditions: 10,
+			summaryDeletions: 3,
+		});
+		insertV2Session(db, {
+			sessionId: "b-session",
+			projectId: "proj-2",
+			timeCreated: 2000,
+			timeUpdated: 2500,
+		});
+		insertV2Session(db, {
+			sessionId: "a-session",
+			projectId: "proj-1",
+			timeCreated: 2000,
+			timeUpdated: 2600,
+		});
+		insertV2Session(db, {
+			sessionId: "s-late",
+			projectId: "proj-1",
+			parentId: "s-root",
+			cost: 0.3,
+			timeCreated: 3000,
+			timeUpdated: 4000,
+			summaryFiles: null,
+			summaryAdditions: null,
+			summaryDeletions: null,
+		});
+	});
+
+	afterEach(() => {
+		db?.close();
+		db = null;
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("lists projects", () => {
+		const source = createSourceReader(db as Database);
+		const projects = source.listProjects();
+		expect(projects).toHaveLength(2);
+		expect(projects.find((project) => project.id === "proj-1")?.name).toBe("test-project");
+	});
+
+	it("counts sessions with and without --since", () => {
+		const source = createSourceReader(db as Database);
+		expect(source.countSessions(null)).toBe(4);
+		expect(source.countSessions(2000)).toBe(3);
+	});
+
+	it("orders by time_created then id", () => {
+		const source = createSourceReader(db as Database);
+		const sessions = source.listSessions(null, 10, 0);
+		expect(sessions.map((session) => session.id)).toEqual([
+			"s-root",
+			"a-session",
+			"b-session",
+			"s-late",
+		]);
+	});
+
+	it("honours limit and offset", () => {
+		const source = createSourceReader(db as Database);
+		const sessions = source.listSessions(null, 2, 1);
+		expect(sessions.map((session) => session.id)).toEqual(["a-session", "b-session"]);
+	});
+
+	it("filters sessions by time_created", () => {
+		const source = createSourceReader(db as Database);
+		const sessions = source.listSessions(2000, 10, 0);
+		expect(sessions.map((session) => session.id)).toEqual(["a-session", "b-session", "s-late"]);
+	});
+
+	it("returns aggregates and preserves NULL summaries", () => {
+		const source = createSourceReader(db as Database);
+		const sessions = source.listSessions(null, 10, 0);
+		const root = sessions.find((session) => session.id === "s-root");
+		const late = sessions.find((session) => session.id === "s-late");
+
+		expect(root?.cost).toBeCloseTo(0.1);
+		expect(root?.tokens_input).toBe(1000);
+		expect(root?.tokens_cache_read).toBe(300);
+		expect(root?.summary_files).toBe(2);
+		expect(root?.parent_id).toBeNull();
+
+		expect(late?.summary_files).toBeNull();
+		expect(late?.summary_additions).toBeNull();
+		expect(late?.summary_deletions).toBeNull();
+		expect(late?.parent_id).toBe("s-root");
+		expect(late?.cost).toBeCloseTo(0.3);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// V2 messages, parts, and tools
+// ---------------------------------------------------------------------------
+
+function createV2ReaderFor(tempDir: string, session: V2SessionFixture): {
+	db: Database;
+	reader: ReturnType<typeof createSourceReader>;
+} {
+	const db = createV2SourceDb(path.join(tempDir, "source.db"));
+	insertV2Session(db, session);
+	return { db, reader: createSourceReader(db) };
+}
+
+describe("V2 conversation messages", () => {
+	let tempDir: string;
+	let db: Database | null = null;
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(path.join(tmpdir(), "ocm-backfill-v2-messages-"));
+	});
+
+	afterEach(() => {
+		db?.close();
+		db = null;
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("counts only user and assistant messages", () => {
+		const created = createV2ReaderFor(tempDir, {
+			sessionId: "s1",
+			projectId: "proj-1",
+			timeCreated: 1000,
+			timeUpdated: 2000,
+			messages: [
+				{ type: "user", text: "hello" },
+				{ type: "system", text: "ignored system" },
+				{ type: "synthetic", text: "ignored synthetic" },
+				{ type: "agent-switched", text: "ignored switch" },
+				{ type: "model-switched", text: "ignored switch" },
+				{ type: "compaction", text: "ignored compaction" },
+				{ type: "idle", text: "ignored idle" },
+				{ type: "assistant", content: [textPart("hi")] },
+			],
+		});
+		db = created.db;
+
+		expect(created.reader.getMessageCount("s1")).toBe(2);
+		expect(created.reader.getFirstUserMessage("s1")).toBe("hello");
+		expect(created.reader.getConversationText("s1")).toBe("hello\nhi");
+	});
+
+	it("returns an empty first message when user text is empty", () => {
+		const created = createV2ReaderFor(tempDir, {
+			sessionId: "s1",
+			projectId: "proj-1",
+			timeCreated: 1000,
+			timeUpdated: 2000,
+			messages: [{ type: "user", text: "" }],
+		});
+		db = created.db;
+
+		expect(created.reader.getFirstUserMessage("s1")).toBe("");
+	});
+
+	it("skips malformed message JSON without throwing", () => {
+		const created = createV2ReaderFor(tempDir, {
+			sessionId: "s1",
+			projectId: "proj-1",
+			timeCreated: 1000,
+			timeUpdated: 2000,
+			messages: [
+				{ type: "user", malformed: true },
+				{ type: "assistant", content: [textPart("still readable")] },
+			],
+		});
+		db = created.db;
+
+		expect(created.reader.getMessageCount("s1")).toBe(2);
+		expect(created.reader.getFirstUserMessage("s1")).toBe("");
+		expect(created.reader.getConversationText("s1")).toBe("still readable");
+	});
+});
+
+describe("V2 message parts", () => {
+	let tempDir: string;
+	let db: Database | null = null;
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(path.join(tmpdir(), "ocm-backfill-v2-parts-"));
+	});
+
+	afterEach(() => {
+		db?.close();
+		db = null;
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("reads user text and assistant content embedded in message data", () => {
+		const created = createV2ReaderFor(tempDir, {
+			sessionId: "s1",
+			projectId: "proj-1",
+			timeCreated: 1000,
+			timeUpdated: 2000,
+			messages: [
+				{ type: "user", text: "embedded question" },
+				{ type: "assistant", content: [textPart("embedded answer")] },
+			],
+		});
+		db = created.db;
+
+		expect(created.reader.getFirstUserMessage("s1")).toBe("embedded question");
+		expect(created.reader.getConversationText("s1")).toBe("embedded question\nembedded answer");
+	});
+
+	it("prefers session_part rows over embedded content, in ordinal order", () => {
+		const created = createV2ReaderFor(tempDir, {
+			sessionId: "s1",
+			projectId: "proj-1",
+			timeCreated: 1000,
+			timeUpdated: 2000,
+			messages: [
+				{ type: "user", text: "from data", parts: [textPart("from part")] },
+				{
+					type: "assistant",
+					content: [textPart("embedded answer")],
+					parts: [textPart("part answer one"), textPart("part answer two")],
+				},
+			],
+		});
+		db = created.db;
+
+		expect(created.reader.getFirstUserMessage("s1")).toBe("from part");
+		expect(created.reader.getConversationText("s1")).toBe(
+			"from part\npart answer one\npart answer two",
+		);
+	});
+
+	it("falls back to embedded content when no part rows exist", () => {
+		const created = createV2ReaderFor(tempDir, {
+			sessionId: "s1",
+			projectId: "proj-1",
+			timeCreated: 1000,
+			timeUpdated: 2000,
+			messages: [
+				{ type: "user", text: "question", parts: [] },
+				{ type: "assistant", content: [textPart("embedded answer")], parts: [] },
+			],
+		});
+		db = created.db;
+
+		expect(created.reader.getConversationText("s1")).toBe("question\nembedded answer");
+	});
+
+	it("excludes reasoning parts from conversation text", () => {
+		const created = createV2ReaderFor(tempDir, {
+			sessionId: "s1",
+			projectId: "proj-1",
+			timeCreated: 1000,
+			timeUpdated: 2000,
+			messages: [
+				{ type: "user", text: "question" },
+				{ type: "assistant", content: [reasoningPart("secret"), textPart("visible")] },
+			],
+		});
+		db = created.db;
+
+		expect(created.reader.getConversationText("s1")).toBe("question\nvisible");
+	});
+});
+
+describe("V2 tool parts", () => {
+	let tempDir: string;
+	let db: Database | null = null;
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(path.join(tmpdir(), "ocm-backfill-v2-tools-"));
+	});
+
+	afterEach(() => {
+		db?.close();
+		db = null;
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("extracts bash and shell calls and flattens completed output", () => {
+		const created = createV2ReaderFor(tempDir, {
+			sessionId: "s1",
+			projectId: "proj-1",
+			timeCreated: 1000,
+			timeUpdated: 2000,
+			messages: [
+				{ type: "user", text: "run things" },
+				{
+					type: "assistant",
+					content: [
+						toolPart("bash", {
+							command: "gh pr create --fill",
+							output: ["https://github.com/acme/widgets/pull/7", "done"],
+						}),
+						toolPart("shell", {
+							command: "ls -la",
+							status: "running",
+							output: ["partial"],
+						}),
+						toolPart("Bash", {
+							command: "git status",
+							status: "error",
+							output: ["boom"],
+						}),
+						toolPart("read", { command: "ignored" }),
+						toolPart("bash", {}),
+					],
+				},
+			],
+		});
+		db = created.db;
+
+		const calls = created.reader.getBashToolCalls("s1");
+		expect(calls).toHaveLength(3);
+		expect(calls[0]).toEqual({
+			command: "gh pr create --fill",
+			output: "https://github.com/acme/widgets/pull/7\ndone",
+		});
+		expect(calls[1]).toEqual({ command: "ls -la", output: undefined });
+		expect(calls[2]).toEqual({ command: "git status", output: undefined });
+		expect(created.reader.getBashCommands("s1")).toEqual([
+			"gh pr create --fill",
+			"ls -la",
+			"git status",
+		]);
+	});
+
+	it("keeps only text entries when flattening tool output", () => {
+		const created = createV2ReaderFor(tempDir, {
+			sessionId: "s1",
+			projectId: "proj-1",
+			timeCreated: 1000,
+			timeUpdated: 2000,
+			messages: [
+				{ type: "user", text: "run" },
+				{
+					type: "assistant",
+					content: [
+						toolPart("shell", {
+							command: "echo hi",
+							output: ["line one"],
+							extraContent: [{ type: "image", data: "ignored" }],
+						}),
+					],
+				},
+			],
+		});
+		db = created.db;
+
+		expect(created.reader.getBashToolCalls("s1")).toEqual([
+			{ command: "echo hi", output: "line one" },
+		]);
+	});
+
+	it("reads tool parts from session_part rows", () => {
+		const created = createV2ReaderFor(tempDir, {
+			sessionId: "s1",
+			projectId: "proj-1",
+			timeCreated: 1000,
+			timeUpdated: 2000,
+			messages: [
+				{ type: "user", text: "run" },
+				{
+					type: "assistant",
+					content: [],
+					parts: [toolPart("shell", { command: "pwd", output: ["/tmp"] })],
+				},
+			],
+		});
+		db = created.db;
+
+		expect(created.reader.getBashToolCalls("s1")).toEqual([
+			{ command: "pwd", output: "/tmp" },
+		]);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// V2 provenance and parent links
+// ---------------------------------------------------------------------------
+
+describe("V2 provenance and parent links", () => {
+	let tempDir: string;
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(path.join(tmpdir(), "ocm-backfill-v2-prov-"));
+	});
+
+	afterEach(() => {
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("resolves agent and model from session, message, and fallback labels", async () => {
+		const sourcePath = path.join(tempDir, "source.db");
+		const destDir = path.join(tempDir, "dest");
+		const db = createV2SourceDb(sourcePath);
+
+		insertProject(db, "proj-1", "test-project", "/home/user/test-project");
+		insertV2Session(db, {
+			sessionId: "sess-session",
+			projectId: "proj-1",
+			agent: "plan",
+			model: '{"id":"session-model"}',
+			timeCreated: 1000,
+			timeUpdated: 2000,
+			messages: [
+				{ type: "user", text: "question" },
+				{ type: "assistant", agent: "message-agent", modelId: "message-model" },
+			],
+		});
+		insertV2Session(db, {
+			sessionId: "sess-message",
+			projectId: "proj-1",
+			agent: null,
+			model: null,
+			timeCreated: 3000,
+			timeUpdated: 4000,
+			messages: [
+				{ type: "user", text: "question" },
+				{ type: "assistant", agent: "message-agent", modelId: "message-model" },
+			],
+		});
+		insertV2Session(db, {
+			sessionId: "sess-empty",
+			projectId: "proj-1",
+			agent: null,
+			model: null,
+			timeCreated: 5000,
+			timeUpdated: 6000,
+			messages: [],
+		});
+		insertV2Session(db, {
+			sessionId: "sess-unknown",
+			projectId: "proj-1",
+			agent: null,
+			model: null,
+			timeCreated: 7000,
+			timeUpdated: 8000,
+			messages: [{ type: "user", text: "question" }],
+		});
+		insertV2Session(db, {
+			sessionId: "sess-child",
+			projectId: "proj-1",
+			parentId: "sess-session",
+			timeCreated: 9000,
+			timeUpdated: 10000,
+		});
+		db.close();
+
+		await runQuietBackfill({
+			source: sourcePath,
+			dest: destDir,
+			dryRun: false,
+			withDeltas: false,
+			since: null,
+			help: false,
+		});
+
+		const dest = new Database(path.join(destDir, "metrics.db"), { readonly: true });
+		try {
+			const rows = dest
+				.prepare("SELECT session_id, agent, model, parent_session_id FROM sessions")
+				.all() as Array<{
+				session_id: string;
+				agent: string;
+				model: string;
+				parent_session_id: string | null;
+			}>;
+			const byId = Object.fromEntries(rows.map((row) => [row.session_id, row]));
+
+			expect(byId["sess-session"].agent).toBe("plan");
+			expect(byId["sess-session"].model).toBe("session-model");
+			expect(byId["sess-message"].agent).toBe("message-agent");
+			expect(byId["sess-message"].model).toBe("message-model");
+			expect(byId["sess-empty"].agent).toBe("empty-session");
+			expect(byId["sess-empty"].model).toBe("empty-session");
+			expect(byId["sess-unknown"].agent).toBe("unknown");
+			expect(byId["sess-unknown"].model).toBe("unknown");
+			expect(byId["sess-child"].parent_session_id).toBe("sess-session");
+			expect(byId["sess-session"].parent_session_id).toBeNull();
+		} finally {
+			dest.close();
+		}
+	});
+});
+
+// ---------------------------------------------------------------------------
+// V2 end-to-end backfill
+// ---------------------------------------------------------------------------
+
+describe("V2 end-to-end backfill", () => {
+	let tempDir: string;
+	let sourcePath: string;
+	let destDir: string;
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(path.join(tmpdir(), "ocm-backfill-v2-e2e-"));
+		sourcePath = path.join(tempDir, "source.db");
+		destDir = path.join(tempDir, "dest");
+		mkdirSync(destDir, { recursive: true });
+
+		const db = createV2SourceDb(sourcePath);
+		insertProject(db, "proj-1", "test-project", "/home/user/test-project");
+
+		insertV2Session(db, {
+			sessionId: "sess-1",
+			projectId: "proj-1",
+			cost: 0.15,
+			tokensInput: 1000,
+			tokensOutput: 500,
+			tokensReasoning: 200,
+			tokensCacheRead: 800,
+			tokensCacheWrite: 100,
+			agent: "build",
+			model: '{"id":"claude-opus-4-6"}',
+			title: "Implement feature",
+			timeCreated: 1700000000000,
+			timeUpdated: 1700003600000,
+			summaryFiles: 3,
+			summaryAdditions: 50,
+			summaryDeletions: 10,
+			messages: [
+				{ type: "user", text: "implement feature A" },
+				{
+					type: "assistant",
+					content: [
+						textPart("Implemented feature A."),
+						toolPart("bash", {
+							command: "gh pr create --fill",
+							output: ["https://github.com/acme/widgets/pull/42"],
+						}),
+					],
+				},
+			],
+		});
+
+		insertV2Session(db, {
+			sessionId: "sess-2",
+			projectId: "proj-1",
+			cost: 0.05,
+			tokensInput: 200,
+			tokensOutput: 100,
+			agent: null,
+			model: null,
+			timeCreated: 1700010000000,
+			timeUpdated: 1700011000000,
+			summaryFiles: null,
+			summaryAdditions: null,
+			summaryDeletions: null,
+			messages: [],
+		});
+
+		insertV2Session(db, {
+			sessionId: "sess-child",
+			projectId: "proj-1",
+			parentId: "sess-1",
+			agent: "explore",
+			model: '{"id":"claude-sonnet-4-20250514"}',
+			timeCreated: 1700020000000,
+			timeUpdated: 1700021000000,
+			messages: [{ type: "user", text: "explore the code" }],
+		});
+		db.close();
+
+		writeFileSync(
+			path.join(destDir, "config.yaml"),
+			[
+				"budget_rules:",
+				"  - budget_tag: build-work",
+				"    conditions:",
+				"      - field: agent",
+				'        values: ["build"]',
+				"",
+			].join("\n"),
+		);
+	});
+
+	afterEach(() => {
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("imports sessions, projects, measurements, artifacts, classifications, and budget tags", async () => {
+		const stats = await runQuietBackfill({
+			source: sourcePath,
+			dest: destDir,
+			dryRun: false,
+			withDeltas: false,
+			since: null,
+			help: false,
+		});
+
+		expect(stats.layout).toBe("v2");
+		expect(stats.totalSessions).toBe(3);
+		expect(stats.totalCost).toBeCloseTo(0.2);
+
+		const dest = new Database(path.join(destDir, "metrics.db"), { readonly: true });
+		try {
+			const sessions = dest
+				.prepare(
+					"SELECT session_id, agent, model, classification, budget_tag, parent_session_id FROM sessions",
+				)
+				.all() as Array<{
+				session_id: string;
+				agent: string;
+				model: string;
+				classification: string;
+				budget_tag: string | null;
+				parent_session_id: string | null;
+			}>;
+			const byId = Object.fromEntries(sessions.map((row) => [row.session_id, row]));
+
+			expect(sessions).toHaveLength(3);
+			expect(byId["sess-1"].model).toBe("claude-opus-4-6");
+			expect(byId["sess-1"].classification).toBe("pr-creation");
+			expect(byId["sess-1"].budget_tag).toBe("build-work");
+			expect(byId["sess-child"].classification).toBe("exploration");
+			expect(byId["sess-child"].parent_session_id).toBe("sess-1");
+			expect(byId["sess-2"].agent).toBe("empty-session");
+			expect(byId["sess-2"].budget_tag).toBeNull();
+
+			const projects = dest
+				.prepare("SELECT project_id, name FROM projects")
+				.all() as Array<{ project_id: string; name: string }>;
+			expect(projects).toEqual([{ project_id: "proj-1", name: "test-project" }]);
+
+			const measurementCount = dest
+				.prepare("SELECT COUNT(*) AS cnt FROM measurements")
+				.get() as { cnt: number };
+			expect(measurementCount.cnt).toBe(45); // 3 sessions × 15 metrics
+
+			const artifacts = dest
+				.prepare("SELECT artifact_type, reference FROM session_artifacts")
+				.all();
+			expect(artifacts).toEqual([
+				{ artifact_type: "pr-created", reference: "acme/widgets#42" },
+			]);
+
+			const messagesTotal = dest
+				.prepare(
+					"SELECT value FROM measurements WHERE session_id = ? AND metric_name = 'messages_total'",
+				)
+				.get("sess-1") as { value: number };
+			expect(messagesTotal.value).toBe(2);
+		} finally {
+			dest.close();
+		}
+	});
+
+	it("records NULL summaries as 0 and counts them", async () => {
+		const stats = await runQuietBackfill({
+			source: sourcePath,
+			dest: destDir,
+			dryRun: false,
+			withDeltas: false,
+			since: null,
+			help: false,
+		});
+
+		expect(stats.missingSummary).toBe(1);
+
+		const dest = new Database(path.join(destDir, "metrics.db"), { readonly: true });
+		try {
+			const read = (sessionId: string, metric: string): number => {
+				const row = dest
+					.prepare(
+						"SELECT value FROM measurements WHERE session_id = ? AND metric_name = ?",
+					)
+					.get(sessionId, metric) as { value: number };
+				return row.value;
+			};
+
+			expect(read("sess-1", "files_changed")).toBe(3);
+			expect(read("sess-1", "lines_added")).toBe(50);
+			expect(read("sess-1", "lines_deleted")).toBe(10);
+			expect(read("sess-2", "files_changed")).toBe(0);
+			expect(read("sess-2", "lines_added")).toBe(0);
+			expect(read("sess-2", "lines_deleted")).toBe(0);
+		} finally {
+			dest.close();
+		}
+	});
+
+	it("is idempotent on a V2 source", async () => {
+		const args = {
+			source: sourcePath,
+			dest: destDir,
+			dryRun: false,
+			withDeltas: false,
+			since: null,
+			help: false,
+		};
+		await runQuietBackfill(args);
+
+		const first = new Database(path.join(destDir, "metrics.db"), { readonly: true });
+		const firstCounts = {
+			sessions: (first.prepare("SELECT COUNT(*) AS cnt FROM sessions").get() as { cnt: number })
+				.cnt,
+			measurements: (
+				first.prepare("SELECT COUNT(*) AS cnt FROM measurements").get() as { cnt: number }
+			).cnt,
+		};
+		first.close();
+
+		await runQuietBackfill(args);
+
+		const second = new Database(path.join(destDir, "metrics.db"), { readonly: true });
+		try {
+			const secondCounts = {
+				sessions: (second.prepare("SELECT COUNT(*) AS cnt FROM sessions").get() as { cnt: number })
+					.cnt,
+				measurements: (
+					second.prepare("SELECT COUNT(*) AS cnt FROM measurements").get() as { cnt: number }
+				).cnt,
+			};
+			expect(secondCounts).toEqual(firstCounts);
+			expect(secondCounts).toEqual({ sessions: 3, measurements: 45 });
+		} finally {
+			second.close();
+		}
+	});
+
+	it("writes deltas when --with-deltas is set", async () => {
+		await runQuietBackfill({
+			source: sourcePath,
+			dest: destDir,
+			dryRun: false,
+			withDeltas: true,
+			since: null,
+			help: false,
+		});
+
+		const dest = new Database(path.join(destDir, "metrics.db"), { readonly: true });
+		try {
+			const deltas = dest
+				.prepare(
+					"SELECT COUNT(*) AS cnt FROM measurement_deltas WHERE session_id = 'sess-1'",
+				)
+				.get() as { cnt: number };
+			expect(deltas.cnt).toBeGreaterThan(0);
+
+			const costDelta = dest
+				.prepare(
+					"SELECT delta FROM measurement_deltas WHERE session_id = 'sess-1' AND metric_name = 'cost'",
+				)
+				.get() as { delta: number };
+			expect(costDelta.delta).toBeCloseTo(0.15);
+		} finally {
+			dest.close();
+		}
+	});
+
+	it("writes nothing in --dry-run mode", async () => {
+		const stats = await runQuietBackfill({
+			source: sourcePath,
+			dest: destDir,
+			dryRun: true,
+			withDeltas: false,
+			since: null,
+			help: false,
+		});
+
+		expect(stats.layout).toBe("v2");
+		expect(stats.totalSessions).toBe(3);
+		expect(existsSync(path.join(destDir, "metrics.db"))).toBe(false);
+	});
+
+	it("rejects an ambiguous layout without touching the destination", async () => {
+		const partialPath = path.join(tempDir, "partial.db");
+		const partial = createV2SourceDb(partialPath);
+		partial.run("DROP TABLE session_part");
+		partial.close();
+
+		let error: unknown;
+		try {
+			await runQuietBackfill({
+				source: partialPath,
+				dest: destDir,
+				dryRun: false,
+				withDeltas: false,
+				since: null,
+				help: false,
+			});
+		} catch (err) {
+			error = err;
+		}
+
+		expect(error).toBeInstanceOf(SourceSchemaError);
+		expect((error as Error).message).toContain("session_part");
+		expect(existsSync(path.join(destDir, "metrics.db"))).toBe(false);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Legacy reader end-to-end — confirms the reader seam preserves V1 behavior
+// ---------------------------------------------------------------------------
+
+describe("legacy reader end-to-end", () => {
+	let tempDir: string;
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(path.join(tmpdir(), "ocm-backfill-legacy-e2e-"));
+	});
+
+	afterEach(() => {
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("keeps legacy session, metric, classification, and artifact results", async () => {
+		const sourcePath = path.join(tempDir, "source.db");
+		const destDir = path.join(tempDir, "dest");
+		const db = createSourceDb(sourcePath);
+
+		insertProject(db, "proj-1", "test-project", "/home/user/test-project");
+		insertSessionWithData(db, {
+			sessionId: "sess-root",
+			projectId: "proj-1",
+			cost: 0.15,
+			tokensInput: 1000,
+			tokensOutput: 500,
+			tokensCacheRead: 800,
+			agent: "build",
+			model: '{"id":"claude-opus-4-6"}',
+			title: "Implement feature",
+			timeCreated: 1700000000000,
+			timeUpdated: 1700003600000,
+			summaryFiles: 3,
+			summaryAdditions: 50,
+			summaryDeletions: 10,
+			userMessage: "implement the feature",
+		});
+		insertSessionWithData(db, {
+			sessionId: "sess-child",
+			projectId: "proj-1",
+			parentId: "sess-root",
+			cost: 0.05,
+			tokensInput: 200,
+			tokensOutput: 100,
+			agent: "explore",
+			model: '{"id":"claude-sonnet-4-20250514"}',
+			timeCreated: 1700010000000,
+			timeUpdated: 1700011000000,
+			userMessage: "explore the code",
+		});
+
+		// Legacy tool part: both the classification command query and the
+		// artifact extractor read state.input.command; the artifact path also
+		// reads state.output. This is the pre-change runBackfill behavior.
+		db.run(
+			`INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
+			[
+				"part-tool-sess-root",
+				"msg-asst-sess-root",
+				"sess-root",
+				1700000000300,
+				1700000000400,
+				JSON.stringify({
+					type: "tool",
+					tool: "bash",
+					state: {
+						input: { command: "gh pr create --fill" },
+						output: "https://github.com/acme/widgets/pull/9",
+					},
+				}),
+			],
+		);
+		db.close();
+
+		const stats = await runQuietBackfill({
+			source: sourcePath,
+			dest: destDir,
+			dryRun: false,
+			withDeltas: false,
+			since: null,
+			help: false,
+		});
+
+		expect(stats.layout).toBe("legacy");
+		expect(stats.totalSessions).toBe(2);
+
+		const dest = new Database(path.join(destDir, "metrics.db"), { readonly: true });
+		try {
+			const sessions = dest
+				.prepare(
+					"SELECT session_id, model, classification, parent_session_id FROM sessions",
+				)
+				.all() as Array<{
+				session_id: string;
+				model: string;
+				classification: string;
+				parent_session_id: string | null;
+			}>;
+			const byId = Object.fromEntries(sessions.map((row) => [row.session_id, row]));
+
+			expect(byId["sess-root"].model).toBe("claude-opus-4-6");
+			expect(byId["sess-root"].classification).toBe("pr-creation");
+			expect(byId["sess-root"].parent_session_id).toBeNull();
+			expect(byId["sess-child"].classification).toBe("exploration");
+			expect(byId["sess-child"].parent_session_id).toBe("sess-root");
+
+			const measurements = dest
+				.prepare("SELECT COUNT(*) AS cnt FROM measurements")
+				.get() as { cnt: number };
+			expect(measurements.cnt).toBe(30); // 2 sessions × 15 metrics
+
+			const read = (sessionId: string, metric: string): number => {
+				const row = dest
+					.prepare(
+						"SELECT value FROM measurements WHERE session_id = ? AND metric_name = ?",
+					)
+					.get(sessionId, metric) as { value: number };
+				return row.value;
+			};
+			expect(read("sess-root", "files_changed")).toBe(3);
+			expect(read("sess-root", "lines_added")).toBe(50);
+			expect(read("sess-root", "lines_deleted")).toBe(10);
+			expect(read("sess-root", "cache_hit_ratio")).toBeCloseTo(800 / 1800, 5);
+
+			const artifacts = dest
+				.prepare("SELECT artifact_type, reference FROM session_artifacts")
+				.all();
+			expect(artifacts).toEqual([
+				{ artifact_type: "pr-created", reference: "acme/widgets#9" },
+			]);
+		} finally {
+			dest.close();
+		}
 	});
 });

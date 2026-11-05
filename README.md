@@ -318,11 +318,23 @@ from OpenCode's internal database into the opencode-metrics database. This
 gives you full visibility into past sessions without waiting for new data
 to accumulate through the live plugin.
 
-> **Coverage caveat:** OpenCode's legacy `session`/`message`/`part` tables
-> stop at 2026-10-30. `make backfill` reads only those tables, so it cannot
-> import sessions created after that date. Sessions recorded through the
-> OpenCode V2 plugin are collected live from the time the plugin is
-> installed forward; `make backfill` does not close that gap.
+The script detects the source layout automatically and supports both
+OpenCode's legacy `session`/`message`/`part` tables and the V2
+`session_v2`/`session_message`/`session_part` tables. The detected layout is
+printed as `Source layout: legacy` or `Source layout: v2` at startup and in
+the completion summary.
+
+> **Coverage:** V2-backed databases are imported from `session_v2`, so
+> `make backfill` recovers history created after the V1 to V2 upgrade.
+> Databases that predate V2 are still read from the legacy tables.
+
+> **V2 diff-summary limitation:** OpenCode V2 does not populate
+> `summary_files`, `summary_additions`, and `summary_deletions` for every
+> session. When those columns are NULL, the backfill records
+> `files_changed`, `lines_added`, and `lines_deleted` as `0` instead of
+> fabricating values, and the completion summary reports
+> `Missing diff summary: <count>`. This is the upstream gap described in
+> [Known metric limitations](#metric-reference), not a backfill defect.
 
 ### Quick start
 
@@ -373,12 +385,28 @@ classification distribution before committing any writes.
 
 ### Verifying the backfill
 
-After running the backfill, verify the imported data:
+After running the backfill, verify the imported data. The startup output
+reports the detected layout, for example:
+
+```text
+Source: /home/you/.local/share/opencode/opencode.db
+Source layout: v2
+Found 1980 sessions to process
+```
 
 ```sh
 # Total sessions imported
 sqlite3 ~/.local/share/opencode-metrics/metrics.db \
   "SELECT COUNT(*) AS sessions FROM sessions;"
+
+# Sessions imported from the V2 source (created on or after the cutover)
+sqlite3 ~/.local/share/opencode-metrics/metrics.db \
+  "SELECT COUNT(*) AS v2_sessions FROM sessions
+   WHERE started_at >= strftime('%s', '2026-10-30') * 1000;"
+
+# Compare with the source database's session_v2 count
+sqlite3 ~/.local/share/opencode/opencode.db \
+  "SELECT COUNT(*) AS source_v2_sessions FROM session_v2;"
 
 # Total cost across all sessions
 sqlite3 ~/.local/share/opencode-metrics/metrics.db \
@@ -702,9 +730,9 @@ The fastest way to populate the metrics database is to run
 This imports all historical sessions in one step, giving you immediate
 data to query and visualize.
 
-> **Covers history only up to 2026-10-30.** The backfill reads OpenCode's
-> legacy tables, so it cannot import later sessions. `make backfill` does
-> not close that gap; V2-era sessions come from the live plugin only.
+> **Covers both layouts.** The backfill reads OpenCode's legacy tables or
+> the V2 tables, whichever the source database uses, so V2-era sessions are
+> imported as well. The startup output names the detected layout.
 
 For ongoing collection, the plugin records metrics automatically. After
 completing at least one OpenCode prompt/response cycle, verify data is
@@ -1746,10 +1774,12 @@ What stops being populated:
   `files_changed` continues to be populated.
 - No metrics are written between the V1 plugin stopping and the V2 plugin
   starting. Upgrade the host and plugin in one step to keep that window
-  short; sessions that run entirely inside the gap are not captured, and
-  `make backfill` does not recover them.
-- `make backfill` cannot import sessions created after 2026-10-30 (see the
-  [coverage caveat](#historical-data-backfill)).
+  short; sessions that run entirely inside the gap are not captured by the
+  live plugin, but `make backfill` imports them from OpenCode's database.
+- `make backfill` imports both legacy and V2 sessions and prints the
+  detected `Source layout` (see
+  [Historical Data Backfill](#historical-data-backfill)). Sessions imported
+  from V2 record 0 line counts when the source summary columns are NULL.
 
 Historical rows are **not** re-attributed or rewritten. Project-level
 totals for new sessions may differ from what you saw before, and a time
@@ -2009,8 +2039,9 @@ after upgrading OpenCode and the plugin.
   plugin stops subscribing for that session. Restart OpenCode after fixing
   the cause.
 - **Gap during the upgrade:** sessions that ran entirely between the V1
-  plugin stopping and the V2 plugin starting are not captured, and
-  `make backfill` does not recover them.
+  plugin stopping and the V2 plugin starting are not captured by the live
+  plugin. `make backfill` imports them from OpenCode's database when they
+  are present there; the startup output reports the detected layout.
 
 #### Missing console log lines
 
@@ -2088,6 +2119,23 @@ after starting OpenCode.
 
 The plugin never crashes on config errors — it logs a warning and skips
 the malformed rule. Remaining valid rules continue to work.
+
+#### Backfill reports an incomplete OpenCode V2 layout
+
+**Symptom:** `make backfill` exits with an error like:
+
+```text
+Source database has an incomplete OpenCode V2 layout. Missing required tables: session_part.
+```
+
+**Cause:** any `session_v2`-family table is present, but the V2 trio
+(`session_v2`, `session_message`, `session_part`) is incomplete. The
+backfill refuses to guess: reading the stale legacy tables or a partial V2
+schema would import incorrect data.
+
+**Fix:** point `--source` at a complete OpenCode database, or let OpenCode
+finish creating the V2 tables before running the backfill. The destination
+metrics database is not created or modified when detection fails.
 
 ### Diagnostic commands
 
