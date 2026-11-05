@@ -46,29 +46,35 @@ automatically on its next idle event. Remove the loader later with
 ## Step 2: Import Your History
 
 If you've been using OpenCode before installing the plugin, import your
-existing session history:
+existing session history. Run this after OpenCode has created its internal
+database at `~/.local/share/opencode/opencode.db` (use `--source` to point
+at a different location).
 
 ```bash
 make backfill
 ```
 
-This reads OpenCode's internal database (read-only), classifies every
-historical session, and writes the metrics into
-`~/.local/share/opencode-metrics/metrics.db`. Typical output:
+This reads OpenCode's internal database (read-only), detects whether it uses
+the legacy or V2 layout, classifies every historical session, and writes the
+metrics into `~/.local/share/opencode-metrics/metrics.db`. Typical output:
 
 ```
 opencode-metrics backfill
 ========================
 
+Source: /home/you/.local/share/opencode/opencode.db
+Source layout: v2
 Found 905 sessions to process
 Destination: /home/you/.local/share/opencode-metrics/metrics.db
 Imported 30 projects
 Processed 905/905 sessions...
 
 --- Summary ---
+Layout:    v2
 Sessions:  905
 Cost:      $3430.26
 Skipped:   0
+Missing diff summary: 147
 Elapsed:   0.9s
 
 Classification distribution:
@@ -83,10 +89,10 @@ Classification distribution:
 Backfill complete.
 ```
 
-> **Coverage caveat:** OpenCode's legacy tables stop at 2026-10-30, so the
-> backfill cannot import sessions created after that date. `make backfill`
-> does not close that gap; V2-era sessions are collected by the live plugin
-> from the time it is installed forward.
+> **Coverage:** the backfill imports both OpenCode layouts. On a V2 database
+> it reads `session_v2` and reports `Source layout: v2`, so post-upgrade
+> history is imported too. Sessions whose V2 diff-summary columns are NULL
+> record 0 line counts and are counted in `Missing diff summary`.
 
 Preview first without writing: `bun run scripts/backfill.ts --dry-run`
 
