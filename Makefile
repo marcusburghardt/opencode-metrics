@@ -4,7 +4,7 @@
 
 .DEFAULT_GOAL := help
 
-.PHONY: build test lint check clean install uninstall backfill grafana grafana-provision grafana-stop help
+.PHONY: build test lint check report clean install uninstall backfill grafana grafana-provision grafana-stop help
 
 ##@ Core
 
@@ -23,6 +23,9 @@ lint: ## run linters (biome)
 
 check: ## run diagnostic checks (plugin loaded? sessions recording?)
 	@bash scripts/check.sh
+
+report: ## show sub-agent cost, model-time, and throughput leaderboard
+	@bash scripts/report.sh
 
 clean: ## remove build artifacts
 	rm -rf dist

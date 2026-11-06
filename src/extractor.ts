@@ -281,9 +281,12 @@ export function collectSnapshotFiles(messages: MessageInfo[]): string[] {
 /** Flow metrics derived from the raw message history. */
 export interface FlowMetrics {
 	turns_total: number;
+	/** Turns that carry both `time.created` and `time.streamed`. */
+	timed_turns: number;
 	context_tokens_max: number;
 	context_tokens_final: number;
 	generation_seconds: number;
+	generation_output_tokens: number;
 	post_generation_seconds: number;
 	compactions: number;
 }
@@ -291,9 +294,11 @@ export interface FlowMetrics {
 /** Empty flow metric set, used when no raw messages are available. */
 const EMPTY_FLOW_METRICS: FlowMetrics = {
 	turns_total: 0,
+	timed_turns: 0,
 	context_tokens_max: 0,
 	context_tokens_final: 0,
 	generation_seconds: 0,
+	generation_output_tokens: 0,
 	post_generation_seconds: 0,
 	compactions: 0,
 };
@@ -304,6 +309,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function finiteNumber(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/** Output tokens produced by one assistant turn, defaulting to 0. */
+function turnOutputTokens(tokens: unknown): number {
+	if (!isRecord(tokens)) return 0;
+	return finiteNumber(tokens.output) ?? 0;
 }
 
 /** Per-turn context: input + cache.read + cache.write, defaulting each to 0. */
@@ -359,7 +370,12 @@ export function deriveFlowMetrics(rawMessages: readonly unknown[]): FlowMetrics 
 		const completed = finiteNumber(time.completed);
 
 		if (created !== undefined && streamed !== undefined && streamed >= created) {
+			metrics.timed_turns += 1;
 			metrics.generation_seconds += (streamed - created) / 1000;
+			// Token count aligned with the timed window. Without this, a
+			// session whose turns are only partially timed would divide all
+			// output tokens by a fraction of the generation time.
+			metrics.generation_output_tokens += turnOutputTokens(raw.tokens);
 		}
 		if (streamed !== undefined && completed !== undefined && completed >= streamed) {
 			metrics.post_generation_seconds += (completed - streamed) / 1000;
@@ -554,17 +570,31 @@ export async function extractSessionData(
 			recorded_at: recordedAt,
 		},
 		{
-			metric_name: "generation_seconds",
-			value: flowMetrics.generation_seconds,
-			recorded_at: recordedAt,
-		},
-		{
 			metric_name: "post_generation_seconds",
 			value: flowMetrics.post_generation_seconds,
 			recorded_at: recordedAt,
 		},
 		{ metric_name: "compactions", value: flowMetrics.compactions, recorded_at: recordedAt },
 	);
+
+	// Generation speed is only meaningful when every assistant turn in the
+	// session was timed. A partially timed session would divide a subset of
+	// output tokens by a subset of generation time and report a plausible but
+	// wrong rate, so the metric is omitted instead.
+	if (flowMetrics.turns_total > 0 && flowMetrics.timed_turns === flowMetrics.turns_total) {
+		metrics.push(
+			{
+				metric_name: "generation_seconds",
+				value: flowMetrics.generation_seconds,
+				recorded_at: recordedAt,
+			},
+			{
+				metric_name: "generation_output_tokens",
+				value: flowMetrics.generation_output_tokens,
+				recorded_at: recordedAt,
+			},
+		);
+	}
 
 	return {
 		project: {

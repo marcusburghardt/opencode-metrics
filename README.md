@@ -58,7 +58,7 @@ the alternative of referencing `dist/index.js` directly.
 | Artifacts      | `prs_created`, `prs_reviewed`, `issues_referenced`               |
 | Flow           | `permission_prompts`, `permission_wait_seconds`, `turns_total`, `context_tokens_max`, `context_tokens_final`, `generation_seconds`, `post_generation_seconds`, `compactions`, `child_sessions` |
 
-All 24 metrics are recorded per session into a local SQLite database at
+Up to 25 metrics are recorded per session into a local SQLite database at
 `~/.local/share/opencode-metrics/metrics.db`.
 
 ### Key commands
@@ -126,6 +126,7 @@ container and point the datasource at `metrics.db`. See
   - [CLI options](#cli-options)
   - [Verifying the backfill](#verifying-the-backfill)
   - [Idempotency and concurrency](#idempotency-and-concurrency)
+- [Sub-agent Analytics](#sub-agent-analytics)
 - [Configuration](#configuration)
   - [Config file location](#config-file-location)
   - [Config fields](#config-fields)
@@ -349,7 +350,7 @@ metrics database at `~/.local/share/opencode-metrics/metrics.db`.
 ### What gets imported
 
 The backfill reads every session from OpenCode's internal database and
-writes all 24 metrics for each one:
+writes up to 23 of the 25 metrics for each one:
 
 - **Token metrics:** `tokens_input`, `tokens_output`, `tokens_reasoning`,
   `tokens_cache_read`, `tokens_cache_write`
@@ -358,6 +359,22 @@ writes all 24 metrics for each one:
 - **Diff stats:** `files_changed`, `lines_added`, `lines_deleted`
 - **Activity:** `messages_total`
 - **Artifacts:** `prs_created`, `prs_reviewed`, `issues_referenced`
+- **Flow:** `turns_total`, `context_tokens_max`, `context_tokens_final`,
+  `generation_seconds`, `generation_output_tokens`, `post_generation_seconds`,
+  `compactions`
+- **Tree:** `child_sessions`
+
+The two permission metrics (`permission_prompts`,
+`permission_wait_seconds`) are **not** backfilled: OpenCode does not persist
+the permission events, so their history cannot be reconstructed. They remain
+available only for sessions captured live by the plugin.
+
+Flow metrics come from the persisted message history. Generation time needs
+a `time.streamed` timestamp per assistant turn. The
+`generation_seconds`/`generation_output_tokens` pair is written only when
+**every** assistant turn in the session is timed; a partially timed session
+would otherwise report a plausible but wrong token rate. Turns without a
+timestamp still count toward `turns_total` and context metrics.
 
 PR and issue references are extracted from `gh` CLI commands in tool-call
 output. Each extracted reference is also stored as a row in the
@@ -436,6 +453,87 @@ sessions are running). While the database uses WAL mode and handles
 contention with `busy_timeout` and retry logic, avoiding concurrent
 writes eliminates the possibility of lock contention during the bulk
 import.
+
+## Sub-agent Analytics
+
+Every sub-agent invocation is stored as its own session row with
+`parent_session_id`, `agent`, and `model`, so cost and time can be attributed
+without estimation. Two views expose the rollups:
+
+### `v_agent_performance`
+
+One row per `agent` × `model` × `session_role` (`root` or `subagent`).
+
+| Column | Meaning |
+|---|---|
+| `runs` | Number of sessions in this group |
+| `total_cost_usd`, `avg_cost_usd` | Provider-reported cost |
+| `total_output_tokens`, `total_input_tokens` | Token totals |
+| `total_wall_seconds`, `avg_wall_seconds` | End-to-end wall clock; includes permission waits, tool execution, and idle |
+| `total_generation_seconds`, `avg_generation_seconds` | Sum of `streamed - created` per assistant turn (true model time) |
+| `total_generation_output_tokens` | Output tokens from the same timed turns |
+| `runs_with_generation_time` | Coverage of the generation-time column |
+| `avg_permission_wait_seconds` | Live-captured sessions only |
+| `output_tokens_per_generation_second` | True model speed (`generation_output_tokens / generation_seconds`) |
+| `output_tokens_per_wall_second` | Effective throughput, including waiting |
+| `usd_per_1k_output_tokens` | Price efficiency |
+
+```sql
+-- Leaderboard: cost, true speed, and effective throughput per model
+SELECT agent, model, session_role, runs,
+       runs_with_generation_time AS timed_runs,
+       total_cost_usd, avg_wall_seconds, avg_generation_seconds,
+       output_tokens_per_generation_second AS gen_tok_s,
+       output_tokens_per_wall_second AS wall_tok_s,
+       usd_per_1k_output_tokens AS usd_per_1k_out
+FROM v_agent_performance
+ORDER BY total_cost_usd DESC;
+```
+
+`generation_output_tokens` counts output only from turns that also have a
+generation time, so sessions with partially timed histories do not inflate
+the speed. Generation speed is NULL for groups whose sessions have no
+backfilled or live generation time. Compare it with wall-clock throughput to estimate how
+much time permissions, tools, and idle add. `avg_wall_seconds -
+avg_generation_seconds` approximates that overhead only for sessions that
+have both values.
+
+### `v_workflow_cost`
+
+One row per root session, rolling up every descendant at any depth:
+
+| Column | Meaning |
+|---|---|
+| `root_cost_usd` | Orchestrator's own model spend |
+| `subagent_cost_usd` | Sum of all descendant sessions |
+| `total_cost_usd` | Root + descendants |
+| `subagent_cost_share` | Fraction of the workflow spent on sub-agents |
+| `subagent_sessions` | Number of descendant sessions |
+| `root_wall_seconds`, `subagent_wall_seconds` | Wall-clock totals (children can overlap) |
+| `total_output_tokens`, `total_generation_seconds` | Workflow token and model-time totals |
+
+```sql
+-- Most expensive workflows, showing how much went to sub-agents
+SELECT root_title, root_agent, root_model, subagent_sessions,
+       root_cost_usd, subagent_cost_usd, total_cost_usd,
+       subagent_cost_share
+FROM v_workflow_cost
+ORDER BY total_cost_usd DESC
+LIMIT 20;
+```
+
+A root session's `cost` metric excludes its children. Use
+`v_workflow_cost` (or sum `cost` across all sessions) for workflow totals.
+
+### Human-readable report
+
+```sh
+make report
+```
+
+Prints the agent leaderboard and the top workflows from the standard metrics
+database. Pass a different database path as the first argument to
+`scripts/report.sh`.
 
 ## Configuration
 
@@ -1420,7 +1518,7 @@ make lint
 
 ## Metric Reference
 
-All 24 metrics are recorded per session on every idle event (UPSERT
+Up to 25 metrics are recorded per session on every idle event (UPSERT
 semantics — the latest cumulative value is stored). Descriptions below
 match the `metric_definitions` table in the database.
 
@@ -1447,12 +1545,17 @@ match the `metric_definitions` table in the database.
 | `context_tokens_max` | count | Peak per-turn context tokens (input + cache read + cache write) | sum |
 | `context_tokens_final` | count | Per-turn context tokens of the last assistant message (input + cache read + cache write) | sum |
 | `generation_seconds` | seconds | Total model generation time across assistant turns | sum    |
+| `generation_output_tokens` | tokens | Output tokens produced during timed generation windows; pairs with `generation_seconds` for true model speed | sum |
 | `post_generation_seconds` | seconds | Total time between stream completion and turn completion; includes tool and approval wait | sum |
 | `compactions`      | count   | Number of compaction markers in the session message history | sum |
 | `child_sessions`   | count   | Number of direct child sessions created by this session | sum |
 
 **Known metric limitations:**
 
+- `generation_seconds` and `generation_output_tokens` are omitted for
+  sessions whose assistant turns are only partially timed. They are the
+  only metrics that require complete event-level timestamps; all other flow
+  metrics degrade independently.
 - `lines_added` / `lines_deleted` are recorded as **0** for sessions
   captured through the OpenCode V2 plugin API, because V2 does not expose
   session diff data to plugins. `files_changed` is still populated, from
