@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/marcusburghardt/opencode-metrics/compare/v0.5.0...v0.5.1) (2026-11-06)
+
+
+### Bug Fixes
+
+* **ci:** publish with npm OIDC trusted publishing ([ed922ae](https://github.com/marcusburghardt/opencode-metrics/commit/ed922ae44dbe6deb2d6662001d728cdc66435692))
+
 ## [0.5.0](https://github.com/marcusburghardt/opencode-metrics/compare/v0.4.1...v0.5.0) (2026-11-06)
 
 
