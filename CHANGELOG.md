@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.5.0](https://github.com/marcusburghardt/opencode-metrics/compare/v0.4.1...v0.5.0) (2026-11-06)
+
+
+### ⚠ BREAKING CHANGES
+
+* requires OpenCode 2.2+. OpenCode V1 hosts cannot load this release and must pin @mburghardt/opencode-metrics@0.4.1. Sessions captured through V2 record lines_added/lines_deleted as 0, and historical rows are not re-attributed to a different project.
+
+### Features
+
+* add session flow metrics ([24b4758](https://github.com/marcusburghardt/opencode-metrics/commit/24b4758efb7afd244d5a73bcd033834571c94579))
+* add sub-agent cost, time, and speed analytics ([5f3baf0](https://github.com/marcusburghardt/opencode-metrics/commit/5f3baf072cb258f6ca2d4bbdee8f93e1ef621381))
+* **backfill:** support OpenCode V2 source layout ([a02969d](https://github.com/marcusburghardt/opencode-metrics/commit/a02969da2b2fe008b841bcf15ca1e2232ec87fdc))
+* port plugin to OpenCode V2 plugin API ([7ebdbc4](https://github.com/marcusburghardt/opencode-metrics/commit/7ebdbc4f2bfbac73dd3632c4f4ca4a8bad5c73a7))
+
+
+### Bug Fixes
+
+* capture on every terminal session event and use a flat-file loader ([b57af6b](https://github.com/marcusburghardt/opencode-metrics/commit/b57af6b831c870ee12cf4941dd83a7f67e54a059))
+* publish to npm from release workflow to bypass GITHUB_TOKEN event limits ([7f31588](https://github.com/marcusburghardt/opencode-metrics/commit/7f31588e195f42b72a0954d9f4f24e971590ffb0))
+* report console-capture reality in check.sh and record live evidence ([9de25db](https://github.com/marcusburghardt/opencode-metrics/commit/9de25db63022ad2ed4dd7213fbe1e80f13af231b))
+* use PluginInput directory as fallback for project detection ([2faa726](https://github.com/marcusburghardt/opencode-metrics/commit/2faa7262a6834b9313015c17c6f189b4a46a9047))
+
+
+### Documentation
+
+* **changelog:** fold stale unreleased entries into 0.3.0 ([69c580f](https://github.com/marcusburghardt/opencode-metrics/commit/69c580f82f6b925a9e7da325b12a7733a34c2ae3))
+* document the OpenCode V2 install, upgrade, and migration path ([ec5f4df](https://github.com/marcusburghardt/opencode-metrics/commit/ec5f4df0bc2daf7180f74afd573f3d884b4eb354))
+* **openspec:** add OpenCode V2 plugin migration change ([1965e60](https://github.com/marcusburghardt/opencode-metrics/commit/1965e601a0c7915d610976e6179aca8dde511395))
+* **openspec:** add session flow metrics change ([04b54ae](https://github.com/marcusburghardt/opencode-metrics/commit/04b54ae41c562806bd378095c8bc0ffed0f1ade1))
+* **openspec:** add V2 backfill source change ([3d6e502](https://github.com/marcusburghardt/opencode-metrics/commit/3d6e502eb89ee5400af132416fbb3890b1c028d4))
+* **openspec:** archive backfill-v2-source ([a1b4867](https://github.com/marcusburghardt/opencode-metrics/commit/a1b4867325ed36d6edc39114ac137bf3a52505be))
+* **openspec:** check off completed migration tasks ([f78c369](https://github.com/marcusburghardt/opencode-metrics/commit/f78c3696120ecf29a28bee3398e6988c973d7d14))
+* **openspec:** complete V2 backfill planning artifacts ([9b85f9f](https://github.com/marcusburghardt/opencode-metrics/commit/9b85f9f122d1596b382f098d5263be9d4837771e))
+
 ## [0.4.1](https://github.com/marcusburghardt/opencode-metrics/compare/v0.4.0...v0.4.1) (2026-09-22)
 
 
