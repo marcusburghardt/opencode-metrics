@@ -33,6 +33,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # Required for npm trusted publishing (OIDC). No NPM_TOKEN is used.
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -44,6 +46,9 @@ jobs:
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
+      # Trusted publishing needs npm >= 11.5.1; dist-tag OIDC needs >= 11.21.
+      - name: Use npm with OIDC support
+        run: npm install --global npm@^11.21.0
       - run: bun install --frozen-lockfile
       - run: make build
 
@@ -56,10 +61,10 @@ jobs:
           echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
           echo "latest before publish: ${CURRENT:-<none>}"
 
+      # Authentication comes from the GitHub OIDC token configured as a
+      # trusted publisher on npmjs.com for this repository and workflow.
       - name: Publish under the next dist-tag
         run: npm publish --access public --tag next
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Verify publish
         env:
@@ -84,7 +89,6 @@ jobs:
       - name: Verify published artifact
         env:
           TAG: ${{ needs.release-please.outputs.tag_name }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: bash scripts/verify-published-artifact.sh "${TAG#v}"
 
       - name: Assert latest is unchanged before promotion
@@ -98,8 +102,8 @@ jobs:
           fi
           echo "latest is unchanged (${ACTUAL:-<none>})"
 
+      # Requires "Allow npm dist-tag" on the trusted publisher configuration.
       - name: Promote latest
         env:
           TAG: ${{ needs.release-please.outputs.tag_name }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm dist-tag add "@mburghardt/opencode-metrics@${TAG#v}" latest

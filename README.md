@@ -2043,6 +2043,27 @@ fix the problem, land another commit, and let the next release PR run. The
 GitHub Release and its tag remain in place and can stay published once a
 working artifact is promoted.
 
+#### npm trusted publishing (OIDC)
+
+Both publish workflows authenticate with GitHub OIDC; no `NPM_TOKEN`
+secret is required. Configure the package on npmjs.com under
+**Settings → Trusted Publisher**:
+
+- **Publisher:** GitHub Actions
+- **Organization or user:** `marcusburghardt`
+- **Repository:** `opencode-metrics`
+- **Workflow filename:** `ci_release.yml`
+- Add a second entry for `ci_publish.yml` if you use the manual fallback.
+- **Allowed actions:** enable `npm publish` **and** `npm dist-tag`.
+
+The `package.json` `repository.url` must keep matching this GitHub
+repository; npm validates it during OIDC token exchange. The workflows
+install npm 11.21 or later because `npm dist-tag` over OIDC requires it.
+
+Without a trusted publisher entry, npm falls back to token authentication
+and fails with `E404` for a scoped package. If publishing fails that way,
+check the trusted publisher configuration rather than rotating a token.
+
 ## Troubleshooting
 
 ### Common issues
