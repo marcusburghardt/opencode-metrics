@@ -38,7 +38,7 @@ When reading the V2 layout, the script SHALL:
 - **GIVEN** OpenCode's internal database exists at the default path
   (~/.local/share/opencode/opencode.db) and contains session data
 - **WHEN** the user runs `make backfill`
-- **THEN** the script SHALL read all sessions from the source database
+- **THEN** the script SHALL read all sessions from the detected source layout
 - **AND** SHALL write session records, project records, and
   measurement records per session into the metrics database
 - **AND** SHALL report the total count, total cost, and classification

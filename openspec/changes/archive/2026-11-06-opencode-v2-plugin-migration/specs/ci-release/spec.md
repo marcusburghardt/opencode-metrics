@@ -97,7 +97,8 @@ below. Every publish path — the `publish` job in `ci_release.yml` (which runs
 for release-please releases) and `ci_publish.yml` (the manual/out-of-band
 fallback) — MUST publish under a non-`latest` dist-tag and MUST run the same
 verification. Promoting `latest` is a separate maintainer step performed only
-after verification passes.
+after verification passes. Both paths SHOULD authenticate with npm trusted
+publishing over GitHub OIDC; a long-lived `NPM_TOKEN` SHOULD NOT be required.
 
 #### Scenario: GitHub Release published
 
@@ -118,11 +119,13 @@ after verification passes.
 - **AND** if the verification fails, the workflow MUST exit with a non-zero
   status to signal a partial release
 
-#### Scenario: Missing NPM_TOKEN
+#### Scenario: Missing registry credentials
 
-- **GIVEN** the `NPM_TOKEN` secret is not configured
-- **WHEN** `ci_publish.yml` runs
+- **GIVEN** neither a configured trusted publisher nor a valid npm token is
+  available
+- **WHEN** a publish workflow runs
 - **THEN** the `npm publish` step MUST fail with an authentication error
+- **AND** the failure MUST occur before any artifact is promoted to `latest`
 
 #### Scenario: Published artifact is installed and loaded before promotion
 

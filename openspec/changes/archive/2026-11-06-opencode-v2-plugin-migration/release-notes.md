@@ -4,21 +4,22 @@ Review text for the release-please PR. Release-please owns `CHANGELOG.md`,
 the `package.json` version, and `.release-please-manifest.json`; this file is
 the human-authored narrative that must survive into the GitHub Release body.
 
-Target version: **0.5.0** (breaking change on a pre-1.0 line, so release-please
-bumps `0.4.1` to `0.5.0` via `bump-minor-pre-major`).
+Target version: **0.5.1**. The `0.5.0` tag was created but never published to
+npm; `0.5.1` is the first published V2 release and carries the same breaking
+change.
 
 ## ⚠ BREAKING CHANGES
 
 ### OpenCode V2 is now required
 
-opencode-metrics `0.5.0` targets the OpenCode V2 plugin API
+opencode-metrics `0.5.1` targets the OpenCode V2 plugin API
 (`@opencode/plugin@2.2.5`, `Plugin.define`). It does not load on OpenCode V1.
 
 - **Supported host**: OpenCode 2.2 or later.
 - **OpenCode V1 users**: stay on the `0.4.x` line and pin it explicitly
   (`@mburghardt/opencode-metrics@0.4.1`). `0.4.x` remains installable; no
   further releases are planned on that line.
-- Loading `0.5.0` on an OpenCode V1 host fails to load: the host cannot consume
+- Loading `0.5.1` on an OpenCode V1 host fails to load: the host cannot consume
   the `Plugin.define` export, and OpenCode continues to start without the
   plugin. If you cannot upgrade OpenCode, pin
   `@mburghardt/opencode-metrics@0.4.1`.
@@ -42,7 +43,7 @@ opencode-metrics `0.5.0` targets the OpenCode V2 plugin API
 
 `files_changed` is now the count of distinct files reported in assistant
 session snapshots. It remains populated, but it can include files that were
-touched rather than modified, so compare it with pre-0.5.0 values with that in
+touched rather than modified, so compare it with pre-migration values with that in
 mind. The companion line counts are covered under Known Limitations.
 
 ### Session metrics are attributed to the session's own project

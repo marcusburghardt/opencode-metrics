@@ -145,5 +145,58 @@ sub-agent:
 - `lines_added` is 0, as specified.
 - Sub-agent rows carry `parent_session_id`.
 - Classification runs on the live path.
-- Not yet exercised: attribution of a session from a *different* project
-  (task 11.10) and loading `0.5.0` on an OpenCode V1 host (task 11.12).
+- Cross-project attribution and the V1-host behavior are recorded in §8
+  and §9.
+
+## 8. Cross-project attribution (2026-11-06, task 11.10)
+
+**Claim**: a session started in another project is stored under that
+project's id and worktree, not under the plugin repository.
+
+**Query**:
+
+```sql
+SELECT s.session_id, s.project_id, p.name, p.worktree
+FROM sessions s JOIN projects p ON p.project_id = s.project_id
+WHERE p.worktree NOT LIKE '%opencode-metrics%'
+ORDER BY s.started_at DESC LIMIT 5;
+```
+
+**Recorded**:
+
+- Session `ses_e4f3b4448ffe5HFObQFIRWPr4f`
+- Metrics DB project: id `bca8c24f1305ed5b92e80b88bbe405e4c41db7e7`,
+  name `complyctl`, worktree `/home/maburgha/GIT/ProdSec/complyctl`
+- OpenCode source `session_v2` row: same id, directory
+  `/home/maburgha/GIT/ProdSec/complyctl`, same project id
+- Interpretation: attribution follows the session's own project, not the
+  directory where the plugin process was launched.
+
+## 9. Real-release gate and promotion (2026-11-06, tasks 10.7 and 11.13)
+
+**Release**: `v0.5.1` (0.5.0 was tagged but never published to npm).
+
+- Release PR #11 was merged by a human; release-please created `v0.5.1`.
+- Run `42215758640` (`CI Release`): OIDC publish succeeded; `Verify publish`
+  passed; `Verify published artifact` failed because `npm pack` ran before the
+  tarball propagated. `latest` remained `0.4.1` (promotion never ran).
+- Fix landed in `75c1cf0`: the verification script retries `npm pack`, and
+  both publish workflows skip publishing when the version already exists.
+- Recovery run `42218338914` (`CI Publish`, `tag=v0.5.1`): publish step
+  skipped, `Verify published artifact` passed, `latest` unchanged assertion
+  passed, promotion passed.
+- Local reproduction of the blocking gate:
+
+  ```text
+  $ bash scripts/verify-published-artifact.sh 0.5.1
+  PASS published package.json declares @opencode/plugin@2.2.5
+  PASS @opencode/plugin resolves and exports Plugin.define
+  PASS dist/index.js default-exports { id: "opencode-metrics", setup: [function] }
+  PASS setup runs against a stub context and creates the metrics database
+  Verified @mburghardt/opencode-metrics@0.5.1
+  ```
+
+- Dist-tags before recovery: `latest = 0.4.1`, `next = 0.5.1`
+- Dist-tags after recovery: `latest = 0.5.1`, `next = 0.5.1`
+- Not exercised: loading the V2-only package on an OpenCode V1 host
+  (task 11.12); no V1 CLI build is published on npm for a reproducible test.
