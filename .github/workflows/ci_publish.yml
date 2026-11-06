@@ -52,9 +52,25 @@ jobs:
           echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
           echo "latest before publish: ${CURRENT:-<none>}"
 
+      # A partially completed release (publish succeeded, a later gate
+      # failed) must be re-runnable without republishing an existing version.
+      - name: Check if version is already published
+        id: version_state
+        env:
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+        run: |
+          VERSION="${TAG#v}"
+          if npm view "@mburghardt/opencode-metrics@${VERSION}" version >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Version ${VERSION} already on the registry; skipping publish"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       # Authentication comes from the GitHub OIDC token configured as a
       # trusted publisher on npmjs.com for this repository and workflow.
       - name: Publish under the next dist-tag
+        if: steps.version_state.outputs.exists != 'true'
         run: npm publish --access public --tag next
 
       - name: Verify publish

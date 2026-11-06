@@ -63,9 +63,27 @@ if [ -n "${NODE_AUTH_TOKEN:-}" ]; then
 fi
 
 echo "==> Packing ${PACKAGE_NAME}@${VERSION}"
-TARBALL="$(cd "${WORK_DIR}" && npm pack "${PACKAGE_NAME}@${VERSION}" --silent)"
+# Registry metadata can become visible before the tarball itself is
+# downloadable. Retry rather than failing the release on propagation lag.
+PACK_ATTEMPTS=12
+PACK_INTERVAL=10
+PACK_STDERR="${WORK_DIR}/npm-pack.err"
+TARBALL=""
+for attempt in $(seq 1 "${PACK_ATTEMPTS}"); do
+	if TARBALL="$(cd "${WORK_DIR}" && npm pack "${PACKAGE_NAME}@${VERSION}" --silent 2>"${PACK_STDERR}")"; then
+		if [ -n "${TARBALL}" ] && [ -f "${WORK_DIR}/${TARBALL}" ]; then
+			break
+		fi
+	fi
+	TARBALL=""
+	if [ "${attempt}" -lt "${PACK_ATTEMPTS}" ]; then
+		echo "Attempt ${attempt}/${PACK_ATTEMPTS}: tarball not available yet, retrying in ${PACK_INTERVAL}s..." >&2
+		sleep "${PACK_INTERVAL}"
+	fi
+done
 if [ -z "${TARBALL}" ] || [ ! -f "${WORK_DIR}/${TARBALL}" ]; then
-	echo "FAIL [install] tarball for ${PACKAGE_NAME}@${VERSION} was not downloaded" >&2
+	cat "${PACK_STDERR}" >&2 2>/dev/null || true
+	echo "FAIL [install] tarball for ${PACKAGE_NAME}@${VERSION} was not downloaded after ${PACK_ATTEMPTS} attempts" >&2
 	exit 1
 fi
 
