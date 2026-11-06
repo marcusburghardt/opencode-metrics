@@ -101,8 +101,9 @@ describe("extractSessionData", () => {
 		expect(result?.session.ended_at).toBe(1700003600000);
 		expect(result?.session.classification).toBe("unknown");
 
-		// Metrics: all 21 present (12 base + 3 artifact counts + 6 flow metrics)
-		expect(result?.metrics.length).toBe(21);
+		// Metrics: all 20 present (12 base + 3 artifact counts + 5 unconditional flow metrics).
+		// The generation-timing pair is omitted because this fixture is untimed.
+		expect(result?.metrics.length).toBe(20);
 
 		const costMetric = result?.metrics.find((m) => m.metric_name === "cost");
 		expect(costMetric?.value).toBeCloseTo(0.42);
@@ -701,6 +702,27 @@ describe("deriveFlowMetrics", () => {
 
 		expect(flow.generation_seconds).toBe(4);
 		expect(flow.post_generation_seconds).toBe(5);
+	});
+
+	it("pairs output tokens with the timed generation window", () => {
+		const flow = deriveFlowMetrics([
+			{
+				type: "assistant",
+				tokens: { input: 0, output: 1000, cache: { read: 0, write: 0 } },
+				time: { created: 0, streamed: 5000, completed: 6000 },
+			},
+			// Untimed turn: its output must not inflate the token/time ratio.
+			{
+				type: "assistant",
+				tokens: { input: 0, output: 9000, cache: { read: 0, write: 0 } },
+				time: { created: 3000, completed: 4000 },
+			},
+		]);
+
+		expect(flow.turns_total).toBe(2);
+		expect(flow.timed_turns).toBe(1);
+		expect(flow.generation_seconds).toBe(5);
+		expect(flow.generation_output_tokens).toBe(1000);
 	});
 
 	it("skips only the timing metric whose timestamps are missing", () => {

@@ -28,6 +28,8 @@ const EXPECTED_VIEWS = [
 	"v_session_artifacts",
 	"v_adjusted_costs",
 	"v_adjusted_cost_deltas",
+	"v_agent_performance",
+	"v_workflow_cost",
 ];
 
 /** Helper indexes expected in the v2 schema. */
@@ -319,7 +321,7 @@ describe("initDatabase", () => {
 		const row = db.prepare("SELECT COUNT(*) AS count FROM metric_definitions").get() as {
 			count: number;
 		};
-		expect(row.count).toBe(24);
+		expect(row.count).toBe(25);
 	});
 
 	it("seeds correct metric names", () => {
@@ -360,7 +362,7 @@ describe("initDatabase", () => {
 		const row = db.prepare("SELECT COUNT(*) AS count FROM metric_definitions").get() as {
 			count: number;
 		};
-		expect(row.count).toBe(24);
+		expect(row.count).toBe(25);
 	});
 
 	it("returns the resolved data directory path", () => {
@@ -1135,7 +1137,7 @@ describe("metric catalog descriptions", () => {
 			)
 			.all() as Array<{ metric_name: string; unit: string; aggregation: string }>;
 
-		expect(rows).toHaveLength(24);
+		expect(rows).toHaveLength(25);
 
 		const byName = new Map(rows.map((row) => [row.metric_name, row]));
 		expect(byName.get("cost")).toMatchObject({ unit: "usd", aggregation: "sum" });
@@ -1238,5 +1240,144 @@ describe("countChildSessions", () => {
 		insertSession("root", "root");
 
 		expect(countChildSessions(db, "root")).toBe(0);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Sub-agent performance and workflow cost views
+// ---------------------------------------------------------------------------
+
+describe("v_agent_performance", () => {
+	let tempDir: string;
+	let db: Database;
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(path.join(tmpdir(), "ocm-agent-perf-"));
+		const result = initDatabase(tempDir);
+		db = result.db;
+	});
+
+	afterEach(() => {
+		db.close();
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	function insertSession(
+		sessionID: string,
+		agent: string,
+		model: string,
+		parentID: string | null,
+	) {
+		db.run(
+			"INSERT INTO sessions (session_id, project_id, agent, model, classification, title, started_at, ended_at, parent_session_id) VALUES (?, 'p', ?, ?, 'c', 't', 0, 0, ?)",
+			[sessionID, agent, model, parentID],
+		);
+	}
+
+	function insertMetric(sessionID: string, metric: string, value: number) {
+		db.run(
+			"INSERT INTO measurements (session_id, metric_name, value, recorded_at) VALUES (?, ?, ?, 0)",
+			[sessionID, metric, value],
+		);
+	}
+
+	it("separates root and subagent rows and computes both speed flavors", () => {
+		insertSession("root-1", "build", "opus", null);
+		insertSession("child-1", "explore", "sonnet", "root-1");
+
+		insertMetric("child-1", "cost", 0.5);
+		insertMetric("child-1", "tokens_output", 1000);
+		insertMetric("child-1", "duration_seconds", 100);
+		insertMetric("child-1", "generation_seconds", 50);
+		insertMetric("child-1", "generation_output_tokens", 1000);
+		insertMetric("child-1", "permission_wait_seconds", 20);
+		insertMetric("child-1", "child_sessions", 0);
+
+		const row = db
+			.prepare("SELECT * FROM v_agent_performance WHERE agent = 'explore' AND model = 'sonnet'")
+			.get() as Record<string, unknown>;
+
+		expect(row.session_role).toBe("subagent");
+		expect(row.runs).toBe(1);
+		expect(row.total_cost_usd).toBeCloseTo(0.5);
+		expect(row.total_output_tokens).toBe(1000);
+		expect(row.avg_wall_seconds).toBe(100);
+		expect(row.avg_generation_seconds).toBe(50);
+		expect(row.total_generation_output_tokens).toBe(1000);
+		expect(row.runs_with_generation_time).toBe(1);
+		expect(row.avg_permission_wait_seconds).toBe(20);
+		// True model speed: 1000 tokens / 50 s.
+		expect(row.output_tokens_per_generation_second).toBeCloseTo(20);
+		// Effective throughput: 1000 tokens / 100 s wall clock.
+		expect(row.output_tokens_per_wall_second).toBeCloseTo(10);
+		expect(row.usd_per_1k_output_tokens).toBeCloseTo(0.5);
+	});
+
+	it("leaves generation speed NULL when no session has generation time", () => {
+		insertSession("child-2", "general", "opus", "root-1");
+		insertMetric("child-2", "cost", 0.1);
+		insertMetric("child-2", "tokens_output", 200);
+		insertMetric("child-2", "duration_seconds", 40);
+
+		const row = db
+			.prepare("SELECT * FROM v_agent_performance WHERE agent = 'general'")
+			.get() as Record<string, unknown>;
+
+		expect(row.output_tokens_per_wall_second).toBeCloseTo(5);
+		expect(row.output_tokens_per_generation_second).toBeNull();
+		expect(row.runs_with_generation_time).toBe(0);
+	});
+});
+
+describe("v_workflow_cost", () => {
+	let tempDir: string;
+	let db: Database;
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(path.join(tmpdir(), "ocm-workflow-cost-"));
+		const result = initDatabase(tempDir);
+		db = result.db;
+	});
+
+	afterEach(() => {
+		db.close();
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("rolls root, child, and grandchild cost into one workflow total", () => {
+		const insertSession = (id: string, parent: string | null) => {
+			db.run(
+				"INSERT INTO sessions (session_id, project_id, agent, model, classification, title, started_at, ended_at, parent_session_id) VALUES (?, 'p', 'build', 'opus', 'impl', 'workflow', 0, 0, ?)",
+				[id, parent],
+			);
+		};
+		insertSession("root-1", null);
+		insertSession("child-1", "root-1");
+		insertSession("grandchild-1", "child-1");
+		insertSession("unrelated-root", null);
+
+		const metrics: Array<[string, number]> = [
+			["root-1", 1.0],
+			["child-1", 2.0],
+			["grandchild-1", 3.0],
+			["unrelated-root", 9.0],
+		];
+		for (const [sessionID, cost] of metrics) {
+			db.run(
+				"INSERT INTO measurements (session_id, metric_name, value, recorded_at) VALUES (?, 'cost', ?, 0)",
+				[sessionID, cost],
+			);
+		}
+
+		const row = db
+			.prepare("SELECT * FROM v_workflow_cost WHERE root_session_id = 'root-1'")
+			.get() as Record<string, unknown>;
+
+		expect(row.subagent_sessions).toBe(2);
+		expect(row.root_cost_usd).toBeCloseTo(1.0);
+		expect(row.subagent_cost_usd).toBeCloseTo(5.0);
+		expect(row.total_cost_usd).toBeCloseTo(6.0);
+		expect(row.subagent_cost_share).toBeCloseTo(5 / 6, 4);
+		expect(row.root_title).toBe("workflow");
 	});
 });

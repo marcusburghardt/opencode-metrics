@@ -422,6 +422,11 @@ interface V2MessageFixture {
 	content?: V2PartFixture[];
 	parts?: V2PartFixture[];
 	malformed?: boolean;
+	/** Assistant token usage, matching `session_message.data.tokens`. */
+	tokens?: { input?: number; cache?: { read?: number; write?: number } };
+	/** Streaming/completion timestamps used by flow-metric extraction. */
+	timeStreamed?: number;
+	timeCompleted?: number;
 }
 
 interface V2SessionFixture {
@@ -520,10 +525,20 @@ function buildV2MessageData(
 		return data;
 	}
 
+	// Compactions carry only a timestamp and an id in the real payload.
+	if (message.type === "compaction") return data;
+
 	data.content = message.content ?? [];
 	if (message.text !== undefined) data.text = message.text;
 	if (message.agent !== undefined) data.agent = message.agent;
 	if (message.modelId !== undefined) data.model = { id: message.modelId };
+	if (message.tokens !== undefined) data.tokens = message.tokens;
+	if (message.timeStreamed !== undefined) {
+		(data.time as Record<string, number>).streamed = message.timeStreamed;
+	}
+	if (message.timeCompleted !== undefined) {
+		(data.time as Record<string, number>).completed = message.timeCompleted;
+	}
 	return data;
 }
 
@@ -2018,7 +2033,11 @@ describe("V2 end-to-end backfill", () => {
 							output: ["https://github.com/acme/widgets/pull/42"],
 						}),
 					],
+					tokens: { input: 1000, cache: { read: 400, write: 100 } },
+					timeStreamed: 1700000000500,
+					timeCompleted: 1700000001500,
 				},
+				{ type: "compaction" },
 			],
 		});
 
@@ -2114,7 +2133,7 @@ describe("V2 end-to-end backfill", () => {
 			const measurementCount = dest
 				.prepare("SELECT COUNT(*) AS cnt FROM measurements")
 				.get() as { cnt: number };
-			expect(measurementCount.cnt).toBe(45); // 3 sessions × 15 metrics
+			expect(measurementCount.cnt).toBe(65); // 21 metrics each + 2 timed-generation metrics for sess-1
 
 			const artifacts = dest
 				.prepare("SELECT artifact_type, reference FROM session_artifacts")
@@ -2168,6 +2187,47 @@ describe("V2 end-to-end backfill", () => {
 		}
 	});
 
+	it("derives flow metrics and child counts from persisted history", async () => {
+		await runQuietBackfill({
+			source: sourcePath,
+			dest: destDir,
+			dryRun: false,
+			withDeltas: false,
+			since: null,
+			help: false,
+		});
+
+		const dest = new Database(path.join(destDir, "metrics.db"), { readonly: true });
+		try {
+			const read = (sessionId: string, metric: string): number | null => {
+				const row = dest
+					.prepare(
+						"SELECT value FROM measurements WHERE session_id = ? AND metric_name = ?",
+					)
+					.get(sessionId, metric) as { value: number } | null;
+				return row?.value ?? null;
+			};
+
+			// One assistant turn with 1000 input + 400 cache-read + 100
+			// cache-write tokens; generated for 400 ms and completed after
+			// another 1000 ms.
+			expect(read("sess-1", "turns_total")).toBe(1);
+			expect(read("sess-1", "context_tokens_final")).toBe(1500);
+			expect(read("sess-1", "context_tokens_max")).toBe(1500);
+			expect(read("sess-1", "generation_seconds")).toBeCloseTo(0.4);
+			expect(read("sess-1", "post_generation_seconds")).toBeCloseTo(1.0);
+			expect(read("sess-1", "compactions")).toBe(1);
+
+			// Child counts are computed after every session is stored.
+			expect(read("sess-1", "child_sessions")).toBe(1);
+			expect(read("sess-child", "child_sessions")).toBe(0);
+			expect(read("sess-2", "child_sessions")).toBe(0);
+			expect(read("sess-2", "turns_total")).toBe(0);
+		} finally {
+			dest.close();
+		}
+	});
+
 	it("is idempotent on a V2 source", async () => {
 		const args = {
 			source: sourcePath,
@@ -2201,7 +2261,7 @@ describe("V2 end-to-end backfill", () => {
 				).cnt,
 			};
 			expect(secondCounts).toEqual(firstCounts);
-			expect(secondCounts).toEqual({ sessions: 3, measurements: 45 });
+			expect(secondCounts).toEqual({ sessions: 3, measurements: 65 });
 		} finally {
 			second.close();
 		}
@@ -2389,7 +2449,7 @@ describe("legacy reader end-to-end", () => {
 			const measurements = dest
 				.prepare("SELECT COUNT(*) AS cnt FROM measurements")
 				.get() as { cnt: number };
-			expect(measurements.cnt).toBe(30); // 2 sessions × 15 metrics
+			expect(measurements.cnt).toBe(42); // 2 sessions × 21 metrics (no fully timed history)
 
 			const read = (sessionId: string, metric: string): number => {
 				const row = dest
@@ -2403,6 +2463,9 @@ describe("legacy reader end-to-end", () => {
 			expect(read("sess-root", "lines_added")).toBe(50);
 			expect(read("sess-root", "lines_deleted")).toBe(10);
 			expect(read("sess-root", "cache_hit_ratio")).toBeCloseTo(800 / 1800, 5);
+			expect(read("sess-root", "child_sessions")).toBe(1);
+			expect(read("sess-child", "child_sessions")).toBe(0);
+			expect(read("sess-root", "turns_total")).toBeGreaterThan(0);
 
 			const artifacts = dest
 				.prepare("SELECT artifact_type, reference FROM session_artifacts")

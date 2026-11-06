@@ -168,6 +168,13 @@ const METRIC_DEFINITIONS: ReadonlyArray<{
 		aggregation: "sum",
 	},
 	{
+		metric_name: "generation_output_tokens",
+		unit: "tokens",
+		description:
+			"Output tokens produced during timed generation windows (pairs with generation_seconds)",
+		aggregation: "sum",
+	},
+	{
 		metric_name: "post_generation_seconds",
 		unit: "seconds",
 		description:
@@ -479,6 +486,141 @@ function createSchema(db: Database): void {
 		FROM delta_metrics dm
 		JOIN sessions s ON s.session_id = dm.session_id
 		LEFT JOIN matched_pricing mp ON mp.session_id = dm.session_id AND mp.recorded_at = dm.recorded_at AND mp.rn = 1
+	`);
+
+	// Sub-agent performance view — one row per agent/model/role combination.
+	//
+	// Both speed flavors are exposed deliberately:
+	// - generation_seconds is time the model spent generating (true speed),
+	//   available for live-captured sessions and backfilled sessions that
+	//   carried `time.streamed` in their message history.
+	// - duration_seconds is wall clock and includes permission prompts, tool
+	//   execution, and idle time (effective throughput).
+	//
+	// Recreated on every init because `CREATE VIEW IF NOT EXISTS` would keep
+	// a stale definition after a future schema change.
+	db.run("DROP VIEW IF EXISTS v_agent_performance");
+	db.run(`
+		CREATE VIEW v_agent_performance AS
+		WITH session_metrics AS (
+			SELECT
+				session_id,
+				SUM(CASE WHEN metric_name = 'cost' THEN value END) AS cost,
+				SUM(CASE WHEN metric_name = 'tokens_input' THEN value END) AS tokens_input,
+				SUM(CASE WHEN metric_name = 'tokens_output' THEN value END) AS tokens_output,
+				SUM(CASE WHEN metric_name = 'tokens_reasoning' THEN value END) AS tokens_reasoning,
+				SUM(CASE WHEN metric_name = 'tokens_cache_read' THEN value END) AS tokens_cache_read,
+				SUM(CASE WHEN metric_name = 'tokens_cache_write' THEN value END) AS tokens_cache_write,
+				SUM(CASE WHEN metric_name = 'duration_seconds' THEN value END) AS duration_seconds,
+				SUM(CASE WHEN metric_name = 'generation_seconds' THEN value END) AS generation_seconds,
+				SUM(CASE WHEN metric_name = 'generation_output_tokens' THEN value END) AS generation_output_tokens,
+				SUM(CASE WHEN metric_name = 'permission_wait_seconds' THEN value END) AS permission_wait_seconds,
+				SUM(CASE WHEN metric_name = 'messages_total' THEN value END) AS messages_total,
+				SUM(CASE WHEN metric_name = 'turns_total' THEN value END) AS turns_total,
+				MAX(CASE WHEN metric_name = 'child_sessions' THEN value END) AS child_sessions
+			FROM measurements
+			GROUP BY session_id
+		)
+		SELECT
+			s.agent,
+			s.model,
+			CASE WHEN s.parent_session_id IS NULL THEN 'root' ELSE 'subagent' END AS session_role,
+			COUNT(*) AS runs,
+			ROUND(SUM(sm.cost), 4) AS total_cost_usd,
+			ROUND(AVG(sm.cost), 4) AS avg_cost_usd,
+			ROUND(SUM(sm.tokens_input), 0) AS total_input_tokens,
+			ROUND(SUM(sm.tokens_output), 0) AS total_output_tokens,
+			ROUND(SUM(sm.tokens_cache_read), 0) AS total_cache_read_tokens,
+			ROUND(SUM(sm.tokens_cache_write), 0) AS total_cache_write_tokens,
+			ROUND(SUM(sm.duration_seconds), 0) AS total_wall_seconds,
+			ROUND(AVG(sm.duration_seconds), 0) AS avg_wall_seconds,
+			ROUND(SUM(sm.generation_seconds), 1) AS total_generation_seconds,
+			ROUND(SUM(sm.generation_output_tokens), 0) AS total_generation_output_tokens,
+			ROUND(AVG(sm.generation_seconds), 1) AS avg_generation_seconds,
+			COUNT(CASE WHEN sm.generation_output_tokens IS NOT NULL THEN 1 END) AS runs_with_generation_time,
+			ROUND(AVG(sm.permission_wait_seconds), 1) AS avg_permission_wait_seconds,
+			ROUND(AVG(sm.messages_total), 1) AS avg_messages,
+			ROUND(AVG(sm.turns_total), 1) AS avg_turns,
+			ROUND(AVG(sm.child_sessions), 1) AS avg_child_sessions,
+			ROUND(
+				SUM(sm.tokens_output) / NULLIF(SUM(sm.duration_seconds), 0), 1
+			) AS output_tokens_per_wall_second,
+			ROUND(
+				SUM(sm.generation_output_tokens)
+				/ NULLIF(
+					SUM(CASE WHEN sm.generation_output_tokens IS NOT NULL THEN sm.generation_seconds ELSE 0 END),
+					0
+				), 1
+			) AS output_tokens_per_generation_second,
+			ROUND(
+				SUM(sm.cost) / NULLIF(SUM(sm.tokens_output), 0) * 1000, 4
+			) AS usd_per_1k_output_tokens
+		FROM sessions s
+		JOIN session_metrics sm ON sm.session_id = s.session_id
+		GROUP BY s.agent, s.model, session_role
+	`);
+
+	// Workflow cost rollup — attributes every session, at any depth, to its
+	// root session. Root cost (the orchestrator's own model spend) and
+	// sub-agent cost are reported separately so a workflow total is not
+	// confused with a single session's cost.
+	db.run("DROP VIEW IF EXISTS v_workflow_cost");
+	db.run(`
+		CREATE VIEW v_workflow_cost AS
+		WITH RECURSIVE workflow(root_session_id, session_id, depth) AS (
+			SELECT session_id, session_id, 0
+			FROM sessions
+			WHERE parent_session_id IS NULL
+			   OR parent_session_id NOT IN (SELECT session_id FROM sessions)
+			UNION ALL
+			SELECT w.root_session_id, c.session_id, w.depth + 1
+			FROM workflow w
+			JOIN sessions c ON c.parent_session_id = w.session_id
+		),
+		per_session AS (
+			SELECT
+				session_id,
+				SUM(CASE WHEN metric_name = 'cost' THEN value END) AS cost,
+				SUM(CASE WHEN metric_name = 'tokens_output' THEN value END) AS tokens_output,
+				SUM(CASE WHEN metric_name = 'duration_seconds' THEN value END) AS duration_seconds,
+				SUM(CASE WHEN metric_name = 'generation_seconds' THEN value END) AS generation_seconds
+			FROM measurements
+			GROUP BY session_id
+		),
+		rollup AS (
+			SELECT
+				w.root_session_id,
+				SUM(CASE WHEN w.depth = 0 THEN ps.cost ELSE 0 END) AS root_cost_usd,
+				SUM(CASE WHEN w.depth > 0 THEN ps.cost ELSE 0 END) AS subagent_cost_usd,
+				SUM(ps.cost) AS total_cost_usd,
+				COUNT(*) - 1 AS subagent_sessions,
+				SUM(CASE WHEN w.depth = 0 THEN ps.duration_seconds ELSE 0 END) AS root_wall_seconds,
+				SUM(CASE WHEN w.depth > 0 THEN ps.duration_seconds ELSE 0 END) AS subagent_wall_seconds,
+				SUM(ps.tokens_output) AS total_output_tokens,
+				SUM(ps.generation_seconds) AS total_generation_seconds
+			FROM workflow w
+			LEFT JOIN per_session ps ON ps.session_id = w.session_id
+			GROUP BY w.root_session_id
+		)
+		SELECT
+			r.root_session_id,
+			s.title AS root_title,
+			s.agent AS root_agent,
+			s.model AS root_model,
+			s.classification,
+			s.budget_tag,
+			s.project_id,
+			r.subagent_sessions,
+			ROUND(r.root_cost_usd, 4) AS root_cost_usd,
+			ROUND(r.subagent_cost_usd, 4) AS subagent_cost_usd,
+			ROUND(r.total_cost_usd, 4) AS total_cost_usd,
+			ROUND(r.subagent_cost_usd / NULLIF(r.total_cost_usd, 0), 4) AS subagent_cost_share,
+			ROUND(r.root_wall_seconds, 0) AS root_wall_seconds,
+			ROUND(r.subagent_wall_seconds, 0) AS subagent_wall_seconds,
+			ROUND(r.total_output_tokens, 0) AS total_output_tokens,
+			ROUND(r.total_generation_seconds, 1) AS total_generation_seconds
+		FROM rollup r
+		JOIN sessions s ON s.session_id = r.root_session_id
 	`);
 }
 

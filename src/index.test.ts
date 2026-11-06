@@ -201,7 +201,7 @@ describe("handleSessionIdle", () => {
 			.prepare("SELECT * FROM measurements WHERE session_id = ? ORDER BY metric_name")
 			.all("sess-001") as Array<{ metric_name: string; value: number }>;
 
-		expect(metrics.length).toBe(24);
+		expect(metrics.length).toBe(23);
 
 		const costMetric = metrics.find((m) => m.metric_name === "cost");
 		expect(costMetric?.value).toBeCloseTo(0.42);
@@ -1766,7 +1766,7 @@ describe("event subscription loop", () => {
 				.get("sess-inflight") as { count: number };
 			// Either the write rolled back (no row) or completed fully.
 			if (session.count === 1) {
-				expect(measurements.count).toBe(24);
+				expect(measurements.count).toBe(23);
 			} else {
 				expect(measurements.count).toBe(0);
 			}

@@ -34,6 +34,7 @@ import { getDataDir, initDatabase } from "../src/db";
 import {
 	computeCacheHitRatio,
 	computeDurationSeconds,
+	deriveFlowMetrics,
 } from "../src/extractor";
 import { upsertArtifacts, upsertProject, upsertSession, writeMetrics } from "../src/writer";
 
@@ -290,6 +291,13 @@ export interface BackfillSource {
 	getBashToolCalls(sessionId: string): BashToolCall[];
 	getAgentFallback(sessionId: string): string | null;
 	getModelFallback(sessionId: string): string | null;
+	/**
+	 * Decoded message history in the shape `deriveFlowMetrics` expects
+	 * (`type`, `tokens`, `time`). Used to recover turn, context, timing,
+	 * and compaction metrics from historical sessions. Permission metrics
+	 * cannot be recovered: their event history is not persisted.
+	 */
+	getRawMessages(sessionId: string): unknown[];
 }
 
 export function extractModelId(modelJson: string | null): string {
@@ -462,6 +470,26 @@ function createLegacySource(sourceDb: Database): BackfillSource {
 		getBashToolCalls: (sessionId) => getBashToolCalls(sourceDb, sessionId),
 		getAgentFallback: (sessionId) => getAgentFromMessages(sourceDb, sessionId),
 		getModelFallback: (sessionId) => getModelFromMessages(sourceDb, sessionId),
+		getRawMessages: (sessionId) => {
+			// Legacy messages store the discriminator as `role`; map it to the
+			// V2 `type` field so the shared flow-metric extractor can read
+			// both layouts. Compaction parts are not included.
+			const rows = sourceDb.prepare(
+				"SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created ASC",
+			).all(sessionId) as Array<{ id: string; data: string }>;
+
+			const messages: unknown[] = [];
+			for (const row of rows) {
+				const decoded = decodeJsonObject(row.data);
+				if (!decoded) continue;
+				messages.push({
+					...decoded,
+					id: row.id,
+					type: typeof decoded.role === "string" ? decoded.role : "unknown",
+				});
+			}
+			return messages;
+		},
 	};
 }
 
@@ -690,6 +718,25 @@ function createV2Source(sourceDb: Database): BackfillSource {
 		getModelFallback: (sessionId) => {
 			const model = asObject(firstAssistantMessage(sessionId)?.data?.model);
 			return typeof model?.id === "string" ? model.id : null;
+		},
+		getRawMessages: (sessionId) => {
+			// Every message type participates: the flow extractor needs
+			// assistant turns plus compaction markers. The table's `type`
+			// and `id` are injected because the JSON payload may omit them.
+			const rows = sourceDb.prepare(`
+				SELECT id, type, data
+				FROM session_message
+				WHERE session_id = ?
+				ORDER BY time_created ASC, seq ASC
+			`).all(sessionId) as Array<{ id: string; type: string; data: string }>;
+
+			const messages: unknown[] = [];
+			for (const row of rows) {
+				const decoded = decodeJsonObject(row.data);
+				if (!decoded) continue;
+				messages.push({ ...decoded, id: row.id, type: row.type });
+			}
+			return messages;
 		},
 	};
 }
@@ -960,6 +1007,11 @@ export async function runBackfill(args: CliArgs): Promise<BackfillStats> {
 					const issuesReferenced = extractIssuesReferenced(toolCalls, repoContext);
 					const allArtifacts = [...prsCreated, ...prsReviewed, ...issuesReferenced];
 
+					// Flow metrics reconstructed from the persisted message
+					// history. Permission prompts and waits are absent by
+					// design: OpenCode does not persist those events.
+					const flowMetrics = deriveFlowMetrics(source.getRawMessages(session.id));
+
 					if (destDb) {
 						upsertSession(destDb, {
 							session_id: session.id,
@@ -991,7 +1043,55 @@ export async function runBackfill(args: CliArgs): Promise<BackfillStats> {
 							{ metric_name: "prs_created", value: prsCreated.length, recorded_at: recordedAt },
 							{ metric_name: "prs_reviewed", value: prsReviewed.length, recorded_at: recordedAt },
 							{ metric_name: "issues_referenced", value: issuesReferenced.length, recorded_at: recordedAt },
+							{ metric_name: "turns_total", value: flowMetrics.turns_total, recorded_at: recordedAt },
+							{
+								metric_name: "context_tokens_max",
+								value: flowMetrics.context_tokens_max,
+								recorded_at: recordedAt,
+							},
+							{
+								metric_name: "context_tokens_final",
+								value: flowMetrics.context_tokens_final,
+								recorded_at: recordedAt,
+							},
+							{
+								metric_name: "post_generation_seconds",
+								value: flowMetrics.post_generation_seconds,
+								recorded_at: recordedAt,
+							},
+							{ metric_name: "compactions", value: flowMetrics.compactions, recorded_at: recordedAt },
 						];
+
+						// Generation speed requires every assistant turn to be
+						// timed. For partially timed histories, drop any stale
+						// values from an earlier run rather than publish a rate
+						// built from mismatched numerators and denominators.
+						const completeGenerationTiming =
+							flowMetrics.turns_total > 0 &&
+							flowMetrics.timed_turns === flowMetrics.turns_total;
+						if (completeGenerationTiming) {
+							metricRows.push(
+								{
+									metric_name: "generation_seconds",
+									value: flowMetrics.generation_seconds,
+									recorded_at: recordedAt,
+								},
+								{
+									metric_name: "generation_output_tokens",
+									value: flowMetrics.generation_output_tokens,
+									recorded_at: recordedAt,
+								},
+							);
+						} else {
+							destDb.run(
+								"DELETE FROM measurements WHERE session_id = ? AND metric_name IN ('generation_seconds', 'generation_output_tokens')",
+								[session.id],
+							);
+							destDb.run(
+								"DELETE FROM measurement_deltas WHERE session_id = ? AND metric_name IN ('generation_seconds', 'generation_output_tokens')",
+								[session.id],
+							);
+						}
 
 						// By default, skip delta writes: backfilled sessions only
 						// have cumulative totals. Recording delta = cumulative can
@@ -1035,6 +1135,29 @@ export async function runBackfill(args: CliArgs): Promise<BackfillStats> {
 
 			offset += sessions.length;
 			console.log(`Processed ${Math.min(offset, totalCount)}/${totalCount} sessions...`);
+		}
+
+		// Recompute child counts after every session exists. Counting during
+		// the per-session pass would see zero children for a parent processed
+		// before its child (sessions are ordered by creation time).
+		if (destDb) {
+			destDb.run(`
+				INSERT INTO measurements (session_id, metric_name, value, recorded_at)
+				SELECT
+					s.session_id,
+					'child_sessions',
+					COUNT(c.session_id),
+					COALESCE(NULLIF(s.ended_at, 0), CAST(strftime('%s', 'now') AS INTEGER) * 1000)
+				FROM sessions s
+				LEFT JOIN sessions c
+					ON c.parent_session_id = s.session_id
+					AND c.session_id != s.session_id
+				WHERE true
+				GROUP BY s.session_id
+				ON CONFLICT(session_id, metric_name) DO UPDATE SET
+					value = excluded.value,
+					recorded_at = excluded.recorded_at
+			`);
 		}
 	} finally {
 		sourceDb.close();
