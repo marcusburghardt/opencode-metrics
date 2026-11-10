@@ -68,6 +68,10 @@ GRAFANA_REPO_URL   = https://raw.githubusercontent.com/marcusburghardt/ansible-r
 GRAFANA_PORT       = 3033
 GRAFANA_CONTAINER  = opencode-grafana
 GRAFANA_VOLUME     = opencode-grafana-data
+# Mounted read-write: the database uses SQLite WAL mode, which requires a
+# writable directory for the -shm shared-memory index even for read-only
+# connections. A read-only mount makes every Grafana query fail with
+# "unable to open database file (14)". The datasource stays queryOnly.
 GRAFANA_DATA_DIR   = $(HOME)/.local/share/opencode-metrics
 GRAFANA_IMAGE      = docker.io/grafana/grafana:latest
 
@@ -99,12 +103,13 @@ grafana: grafana-provision ## start Grafana container with the metrics dashboard
 		echo "Grafana is already running at http://localhost:$(GRAFANA_PORT)"; \
 	else \
 		podman rm -f $(GRAFANA_CONTAINER) >/dev/null 2>&1 || true; \
+		chmod g+w $(GRAFANA_DATA_DIR); \
 		echo "Starting Grafana container..."; \
 		podman run -d \
 			--name $(GRAFANA_CONTAINER) \
 			-p $(GRAFANA_PORT):3000 \
 			-v $(GRAFANA_VOLUME):/var/lib/grafana \
-			-v $(GRAFANA_DATA_DIR):/data/metrics:ro,Z \
+			-v $(GRAFANA_DATA_DIR):/data/metrics:rw,Z \
 			-v $(GRAFANA_DIR)/provisioning:/etc/grafana/provisioning:ro,Z \
 			-v $(GRAFANA_DIR)/dashboards:/var/lib/grafana/dashboards:ro,Z \
 			-e GF_INSTALL_PLUGINS=frser-sqlite-datasource \

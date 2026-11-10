@@ -2544,7 +2544,7 @@ If Grafana runs in a container, bind-mount the database directory:
 
 ```yaml
 volumes:
-  - ~/.local/share/opencode-metrics:/data/opencode-metrics:ro
+  - ~/.local/share/opencode-metrics:/data/opencode-metrics:rw
 ```
 
 Then set the datasource path to `/data/opencode-metrics/metrics.db`.
@@ -2558,18 +2558,25 @@ files (`metrics.db-wal` and `metrics.db-shm`) that must be in the same
 directory as the main database file.
 
 ```yaml
-# Correct — mount the directory:
+# Correct — mount the whole directory read-write:
 volumes:
-  - ~/.local/share/opencode-metrics:/data/opencode-metrics:ro
+  - ~/.local/share/opencode-metrics:/data/opencode-metrics:rw
 
 # Incorrect — mounting just the file breaks WAL mode:
 # volumes:
 #   - ~/.local/share/opencode-metrics/metrics.db:/data/metrics.db:ro
 ```
 
-The `:ro` (read-only) mount is recommended for Grafana since it only
-reads the database. WAL mode supports concurrent readers without
-blocking writers.
+Mount the directory read-write and make it writable by the Grafana
+process (for the container image that is uid 472 / gid 0). Although
+Grafana only reads the database, SQLite requires write access to the
+directory to create or update the `metrics.db-shm` shared-memory index
+in WAL mode, even for read-only connections. With a `:ro` mount, every
+query fails with `unable to open database file (14)` (shown as "No
+data" in the dashboard) as soon as the `-wal`/`-shm` files are gone.
+Keep the datasource in `queryOnly: true` mode so Grafana still never
+modifies the data. See the frser-sqlite-datasource FAQ, "I want to open
+a read only database and get errors".
 
 #### 4. Create panels
 
