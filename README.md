@@ -2523,15 +2523,15 @@ Install the [frser-sqlite-datasource](https://github.com/fr-ser/grafana-sqlite-d
 plugin in your Grafana instance:
 
 ```sh
-grafana cli plugins install frser-sqlite-datasource
+grafana cli plugins install frser-sqlite-datasource 4.0.6
 ```
 
-Or add it to your Grafana container's `GF_INSTALL_PLUGINS` environment
-variable:
+Or pin it in your Grafana container's `GF_INSTALL_PLUGINS` environment
+variable (`<plugin> <version>`):
 
 ```yaml
 environment:
-  GF_INSTALL_PLUGINS: frser-sqlite-datasource
+  GF_INSTALL_PLUGINS: "frser-sqlite-datasource 4.0.6"
 ```
 
 #### 2. Configure the datasource

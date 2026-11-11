@@ -73,7 +73,10 @@ GRAFANA_VOLUME     = opencode-grafana-data
 # connections. A read-only mount makes every Grafana query fail with
 # "unable to open database file (14)". The datasource stays queryOnly.
 GRAFANA_DATA_DIR   = $(HOME)/.local/share/opencode-metrics
-GRAFANA_IMAGE      = docker.io/grafana/grafana:latest
+# Pinned so a floating tag or plugin release cannot change behavior.
+GRAFANA_IMAGE      = docker.io/grafana/grafana:13.3.0
+GRAFANA_PLUGIN     = frser-sqlite-datasource
+GRAFANA_PLUGIN_VERSION = 4.0.6
 
 grafana-provision: ## download provisioning files from ansible-role-ai
 	@mkdir -p $(GRAFANA_DIR)/provisioning/datasources
@@ -112,7 +115,7 @@ grafana: grafana-provision ## start Grafana container with the metrics dashboard
 			-v $(GRAFANA_DATA_DIR):/data/metrics:rw,Z \
 			-v $(GRAFANA_DIR)/provisioning:/etc/grafana/provisioning:ro,Z \
 			-v $(GRAFANA_DIR)/dashboards:/var/lib/grafana/dashboards:ro,Z \
-			-e GF_INSTALL_PLUGINS=frser-sqlite-datasource \
+			-e GF_INSTALL_PLUGINS="$(GRAFANA_PLUGIN) $(GRAFANA_PLUGIN_VERSION)" \
 			-e GF_SECURITY_ADMIN_PASSWORD=admin \
 			-e GF_AUTH_ANONYMOUS_ENABLED=true \
 			-e GF_AUTH_ANONYMOUS_ORG_ROLE=Admin \
