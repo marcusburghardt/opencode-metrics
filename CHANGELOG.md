@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.6.0](https://github.com/marcusburghardt/opencode-metrics/compare/v0.5.1...v0.6.0) (2026-11-11)
+
+
+### Features
+
+* **grafana:** pin image and plugin versions ([50283d8](https://github.com/marcusburghardt/opencode-metrics/commit/50283d8d8fe84068607afa544c6cfcfe44cc2065))
+
+
+### Bug Fixes
+
+* **ci:** retry artifact verification and publish reruns ([592d9ff](https://github.com/marcusburghardt/opencode-metrics/commit/592d9ff1d65ffb3f2f526b76e4bd309c4e80da91))
+* **grafana:** mount metrics dir writable for WAL ([9614d9c](https://github.com/marcusburghardt/opencode-metrics/commit/9614d9c9b8bcaad5afbbe31ec94e144546496d1a))
+
+
+### Documentation
+
+* **openspec:** sync V2 specs and archive migration change ([440bc95](https://github.com/marcusburghardt/opencode-metrics/commit/440bc951542e62918945a4cd181c98e296831646))
+
 ## [0.5.1](https://github.com/marcusburghardt/opencode-metrics/compare/v0.5.0...v0.5.1) (2026-11-06)
 
 
