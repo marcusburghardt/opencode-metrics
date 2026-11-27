@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/marcusburghardt/opencode-metrics/compare/v0.7.0...v0.7.1) (2026-11-27)
+
+
+### Documentation
+
+* link npm package in README ([f130c2b](https://github.com/marcusburghardt/opencode-metrics/commit/f130c2b0af6283d50455b67e20a042b09f4f5d78))
+
 ## [0.7.0](https://github.com/marcusburghardt/opencode-metrics/compare/v0.6.0...v0.7.0) (2026-11-27)
 
 
