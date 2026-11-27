@@ -4,7 +4,7 @@
 
 .DEFAULT_GOAL := help
 
-.PHONY: build test lint check report clean install uninstall backfill grafana grafana-provision grafana-stop help
+.PHONY: build test lint check report permission-report clean install uninstall backfill grafana grafana-provision grafana-stop help
 
 ##@ Core
 
@@ -26,6 +26,9 @@ check: ## run diagnostic checks (plugin loaded? sessions recording?)
 
 report: ## show sub-agent cost, model-time, and throughput leaderboard
 	@bash scripts/report.sh
+
+permission-report: ## print the permission friction JSON report (ARGS="--days 30")
+	bun run scripts/permission-report.ts $(ARGS)
 
 clean: ## remove build artifacts
 	rm -rf dist

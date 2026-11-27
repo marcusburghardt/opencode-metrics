@@ -57,6 +57,7 @@ the alternative of referencing `dist/index.js` directly.
 | Activity       | `messages_total`                                                 |
 | Artifacts      | `prs_created`, `prs_reviewed`, `issues_referenced`               |
 | Flow           | `permission_prompts`, `permission_wait_seconds`, `turns_total`, `context_tokens_max`, `context_tokens_final`, `generation_seconds`, `post_generation_seconds`, `compactions`, `child_sessions` |
+| Permission detail | Sanitized `permission_events` rows and the `v_permission_friction` view (contract version 1; see [Permission Capture](#permission-capture)) |
 
 Up to 25 metrics are recorded per session into a local SQLite database at
 `~/.local/share/opencode-metrics/metrics.db`.
@@ -64,10 +65,11 @@ Up to 25 metrics are recorded per session into a local SQLite database at
 ### Key commands
 
 ```sh
-make backfill   # Import historical sessions from OpenCode's database
-make test       # Run test suite with coverage
-make lint       # Check code with Biome linter
-make build      # Compile plugin to dist/index.js
+make backfill          # Import historical sessions from OpenCode's database
+make permission-report # Print the permission friction JSON report
+make test              # Run test suite with coverage
+make lint              # Check code with Biome linter
+make build             # Compile plugin to dist/index.js
 ```
 
 ### Configuration
@@ -77,6 +79,10 @@ Config file: `~/.local/share/opencode-metrics/config.yaml`
 
 ```yaml
 version: 1
+permission_capture:           # Sanitized permission event capture
+  enabled: true
+  retention_days: 90
+  store_raw: false
 classification_rules: [...]   # Session work-type classification
 budget_rules: [...]           # Cost allocation tags
 cost_pricing: [...]           # Custom per-token pricing for adjusted cost
@@ -127,6 +133,12 @@ container and point the datasource at `metrics.db`. See
   - [Verifying the backfill](#verifying-the-backfill)
   - [Idempotency and concurrency](#idempotency-and-concurrency)
 - [Sub-agent Analytics](#sub-agent-analytics)
+- [Permission Capture](#permission-capture)
+  - [Contract version 1](#contract-version-1)
+  - [Configuration and retention](#configuration-and-retention)
+  - [Sanitization rules](#sanitization-rules)
+  - [Friction queries](#friction-queries)
+  - [JSON report](#json-report)
 - [Configuration](#configuration)
   - [Config file location](#config-file-location)
   - [Config fields](#config-fields)
@@ -365,9 +377,10 @@ writes up to 23 of the 25 metrics for each one:
 - **Tree:** `child_sessions`
 
 The two permission metrics (`permission_prompts`,
-`permission_wait_seconds`) are **not** backfilled: OpenCode does not persist
-the permission events, so their history cannot be reconstructed. They remain
-available only for sessions captured live by the plugin.
+`permission_wait_seconds`) and the sanitized `permission_events` rows are
+**not** backfilled: OpenCode does not persist the permission events, so their
+history cannot be reconstructed. They remain available only for sessions
+captured live by the plugin, starting from the enablement date.
 
 Flow metrics come from the persisted message history. Generation time needs
 a `time.streamed` timestamp per assistant turn. The
@@ -535,6 +548,172 @@ Prints the agent leaderboard and the top workflows from the standard metrics
 database. Pass a different database path as the first argument to
 `scripts/report.sh`.
 
+## Permission Capture
+
+The plugin records `permission.asked` and `permission.replied` events in the
+local database. Capture is **observer-only**: it never approves, rejects,
+delays, or modifies a permission decision. It is also **fail-open**: a database
+or write failure is logged and the session and prompt continue normally.
+
+Permission events are ephemeral in OpenCode, so **earlier history cannot be
+backfilled**. Capture starts on the enablement date; the existing
+`permission_prompts` and `permission_wait_seconds` cumulative metrics are
+unchanged and still cover the whole session.
+
+### Contract version 1
+
+The contract is exposed through three database objects:
+
+| Object | Kind | Purpose |
+|--------|------|---------|
+| `permission_contract` | table | One row with `version = 1` and the local `salt`. |
+| `permission_events` | table | One sanitized row per permission request. |
+| `v_permission_friction` | view | Aggregates events by action, canonical resource, project, agent, and model. |
+
+`permission_events` columns:
+
+| Column | Description |
+|--------|-------------|
+| `permission_id` | Stable permission identifier (primary key). |
+| `session_id`, `project_id`, `agent`, `model` | Provenance copied from the session. |
+| `action` | Permission action such as `shell` or `external_directory`. |
+| `resource` | Canonical resource; never the full raw command or path. |
+| `resource_hash` | `sha256(salt + "\0" + raw)` truncated to 32 hex characters. |
+| `raw_resource` | Redacted raw resource only when `store_raw` is enabled. |
+| `reply` | `once`, `always`, or `reject`; null before a reply. |
+| `asked_at`, `replied_at`, `wait_ms` | Epoch milliseconds and the reply wait. |
+| `source_tool`, `source_message_id` | Optional tool provenance from the event. |
+| `save_patterns` | JSON array of canonical patterns from an `always` reply. |
+| `save_reusable` | `1` when every saved pattern is reusable, `0` otherwise. |
+| `contract_version` | Contract version for the row (currently `1`). |
+
+`v_permission_friction` exposes `prompt_count`, `median_wait_ms`,
+`p95_wait_ms`, `always_count`, `reject_count`, `first_seen_iso`, and
+`last_seen_iso` for each grouping.
+
+Repeated deliveries upsert by `permission_id`; a repeated ask never resets a
+recorded reply. A reply with no matching ask is ignored.
+
+### Configuration and retention
+
+```yaml
+permission_capture:
+  enabled: true        # default; stop new writes when false
+  retention_days: 90   # default; events older than this are deleted
+  store_raw: false     # default; redacted raw resources are never stored
+```
+
+Cleanup runs on startup and at most once per day while the plugin is active.
+It only deletes rows from `permission_events`; session measurements and every
+other table remain intact. Disabling capture stops new writes but leaves
+existing rows and the view readable.
+
+The metrics database is owner-readable and owner-writable only (`0o600`); the
+data directory created by the plugin uses `0o700`. Enabling `store_raw` still
+redacts secrets before storage.
+
+### Sanitization rules
+
+Canonicalization is intentionally lossy. Consumers only need recurrence and
+risk class, not the original command.
+
+- **Shell**: leading environment assignments and quoting are removed. At most
+  the command head and one subcommand are kept. URLs, paths, flags, numeric
+  arguments, and shell operators are dropped.
+  - `git push origin feature/secret-name` becomes `git push`.
+  - `FOO=bar make test` becomes `make test`.
+  - `curl -H "Authorization: Bearer ..." https://api` becomes `curl`.
+- **Files**: the full path is never stored. The value is a path class
+  (`project`, `home`, `tmp`, `system`, or `external`) plus the extension, for
+  example `project:file.ts`. Directories use `<class>:dir`.
+- **Secrets**: authorization headers, bearer/basic tokens, token, password,
+  and API-key assignments, private-key material, credentials in URLs, and long
+  encoded blobs are redacted before a canonical value or opted-in raw value is
+  stored.
+- **Unrecognized resources**: only the action and salted hash are stored.
+- **Saved patterns**: patterns from an `always` reply are canonicalized
+  separately from the presented resource. `$cmd *` and other placeholder heads
+  are marked non-reusable (`save_reusable = 0`).
+
+### Friction queries
+
+```sql
+-- Top canonical resources by prompt count
+SELECT action, resource, project_id, prompt_count, median_wait_ms, p95_wait_ms
+FROM v_permission_friction
+ORDER BY prompt_count DESC, median_wait_ms DESC
+LIMIT 20;
+
+-- Wait percentiles for a project and window
+SELECT action, resource, prompt_count, median_wait_ms, p95_wait_ms,
+       first_seen_iso, last_seen_iso
+FROM v_permission_friction
+WHERE project_id = 'proj-1'
+  AND last_seen_iso >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-30 days')
+ORDER BY p95_wait_ms DESC;
+
+-- Always grants and the patterns they saved
+SELECT resource, save_patterns, COUNT(*) AS events
+FROM permission_events
+WHERE reply = 'always'
+GROUP BY resource, save_patterns
+ORDER BY events DESC;
+
+-- Saved patterns that cannot match a real command
+SELECT permission_id, session_id, save_patterns, asked_at
+FROM permission_events
+WHERE save_reusable = 0
+ORDER BY asked_at DESC;
+```
+
+### JSON report
+
+```sh
+make permission-report                 # default 30-day window
+make permission-report ARGS="--days 7 --project proj-1"
+bun run scripts/permission-report.ts --days 30 --db /path/to/metrics.db
+```
+
+The report opens the database **read-only** and prints:
+
+```json
+{
+  "contract_version": 1,
+  "generated_at": "2026-01-10T12:00:00Z",
+  "window": { "days": 30, "since": "...", "until": "..." },
+  "project": null,
+  "totals": {
+    "prompts": 0,
+    "always": 0,
+    "reject": 0,
+    "median_wait_ms": null,
+    "p95_wait_ms": null
+  },
+  "friction": [
+    {
+      "action": "shell",
+      "resource": "git push",
+      "project_id": "proj-1",
+      "agent": "build",
+      "model": "anthropic/claude-opus-4",
+      "prompt_count": 3,
+      "median_wait_ms": 1200,
+      "p95_wait_ms": 4000,
+      "always_count": 1,
+      "reject_count": 0,
+      "first_seen": "...",
+      "last_seen": "..."
+    }
+  ]
+}
+```
+
+**Companion consumer.** The `ansible-role-ai` change `session-retro-loop`
+reads contract version 1 through `permission_contract` and
+`v_permission_friction` (or the JSON report). Consumers must check the contract
+version and fall back to session-level metrics when it is missing or
+unsupported. Version `1` is the minimum supported contract.
+
 ## Configuration
 
 ### Config file location
@@ -556,6 +735,12 @@ are preserved across upgrades.
 # Schema version (currently 1)
 version: 1
 
+# Permission capture (contract version 1). See "Permission Capture".
+permission_capture:
+  enabled: true
+  retention_days: 90
+  store_raw: false
+
 # Classification rules evaluated in order — first match wins.
 classification_rules:
   - name: rule-name
@@ -571,6 +756,7 @@ classification_rules:
 | Field                  | Type   | Required | Description                                       |
 |------------------------|--------|----------|---------------------------------------------------|
 | `version`              | number | yes      | Config schema version. Currently `1`.              |
+| `permission_capture`   | object | no       | Permission capture settings. Defaults: `enabled: true`, `retention_days: 90`, `store_raw: false`. |
 | `classification_rules` | array  | yes      | Ordered list of classification rules.              |
 | `budget_rules`         | array  | no       | Ordered list of budget tagging rules. Defaults to `[]`. |
 
@@ -1825,7 +2011,7 @@ make build
 `config.yaml` are preserved across same-line upgrades. The schema uses
 `CREATE TABLE IF NOT EXISTS` and `INSERT OR IGNORE` for metric definitions,
 so the database is never destructively modified. New metrics are additive
-rows. Schema versioning (`PRAGMA user_version`, currently `6`) ensures
+rows. Schema versioning (`PRAGMA user_version`, currently `7`) ensures
 migrations are applied automatically on startup.
 
 #### Across the breaking line (OpenCode V1 → V2)
@@ -2199,8 +2385,8 @@ after starting OpenCode.
 
 - **Plugin not loaded:** See "Plugin not loading" above.
 - **Directory permissions:** The plugin creates
-  `~/.local/share/opencode-metrics/` with mode `0o755`. Verify the parent
-  directory is writable:
+  `~/.local/share/opencode-metrics/` with owner-only mode `0o700` and the
+  database with `0o600`. Verify the parent directory is writable:
 
   ```sh
   ls -la ~/.local/share/

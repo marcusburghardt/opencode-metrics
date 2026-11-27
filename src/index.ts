@@ -8,6 +8,11 @@ import { loadConfig, writeDefaultConfig } from "./config";
 import { initDatabase } from "./db";
 import type { MessageInfo, PartInfo, SDKClient } from "./extractor";
 import { extractSessionData } from "./extractor";
+import {
+	backfillAllPermissionMetadata,
+	PermissionRetention,
+	PermissionStore,
+} from "./permission-store";
 import { PERMISSION_EVENT_TYPES, PermissionTracker } from "./permissions";
 import { syncCostPricing } from "./pricing";
 import { isVersionSupported, resolvePluginVersion, SUPPORTED_PLUGIN_RANGE } from "./version";
@@ -104,6 +109,10 @@ export interface PluginRuntime {
 	sdkClient: SDKClient;
 	/** Accumulates permission prompts and approval wait per session. */
 	permissionTracker: PermissionTracker;
+	/** Persists sanitized permission events when capture is enabled. */
+	permissionStore?: PermissionStore;
+	/** Runs daily retention cleanup for permission events. */
+	permissionRetention?: PermissionRetention;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -370,6 +379,35 @@ export function initializePlugin(ctx: Plugin.Context): PluginRuntime {
 		console.error(`${LOG_PREFIX} failed to sync cost pricing: ${describeError(error)}`);
 	}
 
+	const permissionStore = new PermissionStore({
+		db,
+		projectDirectory: ctx.location.directory,
+		storeRaw: config.permission_capture.store_raw,
+	});
+	const permissionRetention = new PermissionRetention(
+		db,
+		config.permission_capture.retention_days,
+	);
+
+	// Retention runs on startup as well as at most once per day while the
+	// plugin is active. Skipped when capture is disabled so existing rows stay
+	// untouched until the user re-enables capture.
+	if (config.permission_capture.enabled) {
+		try {
+			permissionRetention.maybeRun();
+		} catch (error) {
+			console.warn(`${LOG_PREFIX} permission retention cleanup failed: ${describeError(error)}`);
+		}
+
+		// Repair grouping metadata for events captured before their session
+		// row existed, or while the plugin was stopped. Fail-open.
+		try {
+			backfillAllPermissionMetadata(db);
+		} catch (error) {
+			console.warn(`${LOG_PREFIX} permission metadata backfill failed: ${describeError(error)}`);
+		}
+	}
+
 	console.info(`${LOG_PREFIX} initialized`);
 
 	return {
@@ -379,6 +417,8 @@ export function initializePlugin(ctx: Plugin.Context): PluginRuntime {
 		budgetCache: new ClassificationCache(),
 		sdkClient: createSDKAdapter(ctx),
 		permissionTracker: new PermissionTracker(),
+		permissionStore,
+		permissionRetention,
 	};
 }
 
@@ -445,17 +485,100 @@ function isTerminalStatusEvent(eventType: string, data: Record<string, unknown>)
  * Exported for testing — this is the core event handling logic separated from
  * the plugin boilerplate and SDK adapter.
  */
+/** Read the optional `source` object carried by an asked event. */
+function translatePermissionSource(
+	value: unknown,
+): { type?: string; messageID?: string; id?: string } | undefined {
+	if (!isRecord(value)) return undefined;
+	const source: { type?: string; messageID?: string; id?: string } = {};
+	if (typeof value.type === "string") source.type = value.type;
+	if (typeof value.messageID === "string") source.messageID = value.messageID;
+	if (typeof value.id === "string") source.id = value.id;
+	return Object.keys(source).length > 0 ? source : undefined;
+}
+
+/** Extract the string entries of an event's resource or save array. */
+function stringArray(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	return value.filter((entry): entry is string => typeof entry === "string");
+}
+
 /**
- * Update the permission tracker from a `permission.asked`/`replied` event.
- * These events never trigger a capture; the next lifecycle capture reads the
- * accumulated state. Events without a usable session id are dropped, and an
- * asked event without a permission id still counts the prompt.
+ * Persist one sanitized `permission.asked` event.
+ *
+ * Capture is observer-only and fail-open: any error is logged and swallowed so
+ * the session and the user-visible permission prompt continue normally.
+ */
+function capturePermissionAsked(
+	runtime: PluginRuntime,
+	sessionID: string,
+	permissionID: string,
+	data: Record<string, unknown>,
+	timestamp: number,
+): void {
+	const store = runtime.permissionStore;
+	if (!store || !runtime.config.permission_capture.enabled) return;
+
+	const action = typeof data.action === "string" ? data.action.trim() : "";
+	if (action.length === 0) {
+		console.warn(`${LOG_PREFIX} skipping permission capture for ${permissionID}: missing action`);
+		return;
+	}
+
+	try {
+		store.recordAsked({
+			sessionID,
+			permissionID,
+			action,
+			resources: stringArray(data.resources),
+			save: stringArray(data.save),
+			source: translatePermissionSource(data.source),
+			timestamp,
+		});
+	} catch (error) {
+		console.warn(
+			`${LOG_PREFIX} failed to capture permission.asked for session ${sessionID}: ${describeError(error)}`,
+		);
+	}
+}
+
+/** Persist one sanitized `permission.replied` event, fail-open. */
+function capturePermissionReplied(
+	runtime: PluginRuntime,
+	sessionID: string,
+	permissionID: string,
+	reply: string,
+	timestamp: number,
+): void {
+	const store = runtime.permissionStore;
+	if (!store || !runtime.config.permission_capture.enabled) return;
+
+	try {
+		store.recordReplied({ sessionID, permissionID, reply, timestamp });
+	} catch (error) {
+		console.warn(
+			`${LOG_PREFIX} failed to capture permission.replied for session ${sessionID}: ${describeError(error)}`,
+		);
+	}
+}
+
+/**
+ * Update the permission tracker and capture path from a
+ * `permission.asked`/`replied` event.
+ *
+ * These events never trigger a session capture; the next lifecycle capture
+ * reads the accumulated tracker state. The tracker remains the source of the
+ * cumulative `permission_prompts` and `permission_wait_seconds` metrics, while
+ * the capture path writes a separate, sanitized event row. The two paths are
+ * independent: a capture failure never changes metric accounting. Events
+ * without a usable session id are dropped, and an asked event without a
+ * permission id still counts the prompt.
  */
 function handlePermissionEvent(
 	eventType: string,
 	event: Record<string, unknown>,
 	data: Record<string, unknown>,
-	tracker: PermissionTracker,
+	runtime: PluginRuntime,
 ): void {
 	const sessionId = data.sessionID;
 	if (typeof sessionId !== "string" || sessionId.length === 0) {
@@ -467,16 +590,25 @@ function handlePermissionEvent(
 		typeof event.created === "number" && Number.isFinite(event.created)
 			? event.created
 			: undefined;
+	const captureTimestamp = timestamp ?? Date.now();
 
 	if (eventType === "permission.asked") {
 		const permissionId = typeof data.id === "string" && data.id.length > 0 ? data.id : undefined;
-		tracker.handleAsked(sessionId, permissionId, timestamp);
+		runtime.permissionTracker.handleAsked(sessionId, permissionId, timestamp);
+		if (permissionId) {
+			capturePermissionAsked(runtime, sessionId, permissionId, data, captureTimestamp);
+		}
 		return;
 	}
 
 	const requestId =
 		typeof data.requestID === "string" && data.requestID.length > 0 ? data.requestID : undefined;
-	tracker.handleReplied(sessionId, requestId, timestamp);
+	runtime.permissionTracker.handleReplied(sessionId, requestId, timestamp);
+
+	const reply = typeof data.reply === "string" ? data.reply : undefined;
+	if (requestId && reply) {
+		capturePermissionReplied(runtime, sessionId, requestId, reply, captureTimestamp);
+	}
 }
 
 export async function handleSessionEvent(
@@ -500,8 +632,18 @@ export async function handleSessionEvent(
 		return;
 	}
 
+	// Retention is checked on every handled event but only executes once per
+	// day. It runs separately from capture so cleanup never blocks a prompt.
+	if (runtime.permissionRetention && runtime.config.permission_capture.enabled) {
+		try {
+			runtime.permissionRetention.maybeRun();
+		} catch (error) {
+			console.warn(`${LOG_PREFIX} permission retention cleanup failed: ${describeError(error)}`);
+		}
+	}
+
 	if (isPermissionEvent) {
-		handlePermissionEvent(eventType, event, data, runtime.permissionTracker);
+		handlePermissionEvent(eventType, event, data, runtime);
 		return;
 	}
 
