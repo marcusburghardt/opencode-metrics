@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.7.0](https://github.com/marcusburghardt/opencode-metrics/compare/v0.6.0...v0.7.0) (2026-11-27)
+
+
+### Features
+
+* capture permission events for retrospective analysis ([d9e99f7](https://github.com/marcusburghardt/opencode-metrics/commit/d9e99f7f378ba5eff6e829f968b5761e4fc6ed46))
+* **openspec:** specify permission capture contract ([277c4ce](https://github.com/marcusburghardt/opencode-metrics/commit/277c4cea2768f22de9bcb7434aeed41a10bb51ff))
+
+
+### Miscellaneous
+
+* **openspec:** archive permission-capture ([9dbf80e](https://github.com/marcusburghardt/opencode-metrics/commit/9dbf80e594e99f1a2e833737df2c1f658abf7c8c))
+
 ## [0.6.0](https://github.com/marcusburghardt/opencode-metrics/compare/v0.5.1...v0.6.0) (2026-11-11)
 
 
