@@ -675,3 +675,98 @@ describe("config", () => {
 		});
 	});
 });
+
+describe("permission_capture configuration", () => {
+	let tempDir: string;
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(path.join(tmpdir(), "ocm-permission-config-"));
+	});
+
+	afterEach(() => {
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	function writeConfig(lines: readonly string[]): void {
+		writeFileSync(path.join(tempDir, "config.yaml"), lines.join("\n"));
+	}
+
+	it("defaults to enabled capture with 90-day retention and raw storage off", () => {
+		const config = loadConfig(tempDir);
+
+		expect(config.permission_capture).toEqual({
+			enabled: true,
+			retention_days: 90,
+			store_raw: false,
+		});
+	});
+
+	it("allows capture to be disabled", () => {
+		writeConfig(["version: 1", "permission_capture:", "  enabled: false"]);
+
+		const config = loadConfig(tempDir);
+
+		expect(config.permission_capture.enabled).toBe(false);
+		expect(config.permission_capture.retention_days).toBe(90);
+	});
+
+	it("accepts a custom retention window", () => {
+		writeConfig(["version: 1", "permission_capture:", "  retention_days: 30"]);
+
+		const config = loadConfig(tempDir);
+
+		expect(config.permission_capture.retention_days).toBe(30);
+	});
+
+	it("accepts the store_raw opt-in", () => {
+		writeConfig(["version: 1", "permission_capture:", "  store_raw: true"]);
+
+		const config = loadConfig(tempDir);
+
+		expect(config.permission_capture.store_raw).toBe(true);
+	});
+
+	it("falls back to defaults for invalid values and logs warnings", () => {
+		writeConfig([
+			"version: 1",
+			"permission_capture:",
+			"  enabled: yes-please",
+			"  retention_days: -5",
+			"  store_raw: sometimes",
+		]);
+		const warnings: string[] = [];
+
+		const config = loadConfig(tempDir, (message) => warnings.push(message));
+
+		expect(config.permission_capture).toEqual({
+			enabled: true,
+			retention_days: 90,
+			store_raw: false,
+		});
+		expect(warnings).toHaveLength(3);
+	});
+
+	it("rejects a non-integer retention window", () => {
+		writeConfig(["version: 1", "permission_capture:", "  retention_days: 1.5"]);
+		const warnings: string[] = [];
+
+		const config = loadConfig(tempDir, (message) => warnings.push(message));
+
+		expect(config.permission_capture.retention_days).toBe(90);
+		expect(warnings.some((message) => message.includes("retention_days"))).toBe(true);
+	});
+
+	it("falls back to defaults when the block is not an object", () => {
+		writeConfig(["version: 1", "permission_capture: enabled"]);
+		const warnings: string[] = [];
+
+		const config = loadConfig(tempDir, (message) => warnings.push(message));
+
+		expect(config.permission_capture).toEqual({
+			enabled: true,
+			retention_days: 90,
+			store_raw: false,
+		});
+		expect(warnings.some((message) => message.includes("permission_capture"))).toBe(true);
+	});
+});

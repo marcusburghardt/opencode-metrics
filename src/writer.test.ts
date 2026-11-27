@@ -378,6 +378,31 @@ describe("writer", () => {
 			expect(metricCount.count).toBe(4);
 		});
 
+		it("backfills permission metadata when the session is written later", async () => {
+			db.run(
+				`INSERT INTO permission_events (
+					permission_id, session_id, action, contract_version
+				 ) VALUES ('perm-late', 'sess-001', 'shell', 1)`,
+			);
+
+			await writeSessionData(db, {
+				project: makeProject(),
+				session: makeSession(),
+				metrics: makeMetrics(),
+			});
+
+			const row = db
+				.prepare("SELECT project_id, agent, model FROM permission_events WHERE permission_id = ?")
+				.get("perm-late") as {
+				project_id: string | null;
+				agent: string | null;
+				model: string | null;
+			};
+			expect(row.project_id).toBe("proj-001");
+			expect(row.agent).toBe("build");
+			expect(row.model).toBe("claude-opus-4-20250514");
+		});
+
 		it("rolls back all writes when a measurement insert fails", async () => {
 			// Insert a valid session first to verify rollback clears the update.
 			await writeSessionData(db, {

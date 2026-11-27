@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { Database } from "bun:sqlite";
+import { randomBytes } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -9,7 +10,94 @@ import path from "node:path";
  * Schema version for the metrics database.
  * Increment when altering table definitions or adding required migrations.
  */
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
+
+/**
+ * Version of the permission capture contract exposed through
+ * `permission_contract`. Consumers use it to decide whether
+ * `permission_events` and `v_permission_friction` are available.
+ */
+export const PERMISSION_CONTRACT_VERSION = 1;
+
+/** Definition of the permission friction aggregation view. */
+const V_PERMISSION_FRICTION_VIEW_SQL = `
+	CREATE VIEW v_permission_friction AS
+	WITH grouped AS (
+		SELECT
+			action,
+			COALESCE(resource, '') AS resource,
+			COALESCE(project_id, '') AS project_id,
+			COALESCE(agent, '') AS agent,
+			COALESCE(model, '') AS model,
+			COUNT(*) AS prompt_count,
+			SUM(CASE WHEN reply = 'always' THEN 1 ELSE 0 END) AS always_count,
+			SUM(CASE WHEN reply = 'reject' THEN 1 ELSE 0 END) AS reject_count,
+			MIN(asked_at) AS first_seen_ms,
+			MAX(COALESCE(replied_at, asked_at)) AS last_seen_ms
+		FROM permission_events
+		GROUP BY action, COALESCE(resource, ''), COALESCE(project_id, ''),
+			COALESCE(agent, ''), COALESCE(model, '')
+	),
+	ranked AS (
+		SELECT
+			action,
+			COALESCE(resource, '') AS resource,
+			COALESCE(project_id, '') AS project_id,
+			COALESCE(agent, '') AS agent,
+			COALESCE(model, '') AS model,
+			wait_ms,
+			ROW_NUMBER() OVER (
+				PARTITION BY action, COALESCE(resource, ''), COALESCE(project_id, ''),
+					COALESCE(agent, ''), COALESCE(model, '')
+				ORDER BY wait_ms
+			) AS rn,
+			COUNT(*) OVER (
+				PARTITION BY action, COALESCE(resource, ''), COALESCE(project_id, ''),
+					COALESCE(agent, ''), COALESCE(model, '')
+			) AS cnt
+		FROM permission_events
+		WHERE wait_ms IS NOT NULL
+	),
+	waits AS (
+		SELECT
+			action,
+			resource,
+			project_id,
+			agent,
+			model,
+			AVG(CASE WHEN rn IN ((cnt + 1) / 2, (cnt + 2) / 2) THEN wait_ms END)
+				AS median_wait_ms,
+			MIN(CASE WHEN rn >= (cnt * 95 + 99) / 100 THEN wait_ms END) AS p95_wait_ms
+		FROM ranked
+		GROUP BY action, resource, project_id, agent, model
+	)
+	SELECT
+		g.action,
+		g.resource,
+		g.project_id,
+		g.agent,
+		g.model,
+		g.prompt_count,
+		w.median_wait_ms,
+		w.p95_wait_ms,
+		g.always_count,
+		g.reject_count,
+		g.first_seen_ms / 1000 AS first_seen_epoch,
+		CASE WHEN g.first_seen_ms IS NOT NULL
+			THEN strftime('%Y-%m-%dT%H:%M:%SZ', g.first_seen_ms / 1000, 'unixepoch')
+		END AS first_seen_iso,
+		g.last_seen_ms / 1000 AS last_seen_epoch,
+		CASE WHEN g.last_seen_ms IS NOT NULL
+			THEN strftime('%Y-%m-%dT%H:%M:%SZ', g.last_seen_ms / 1000, 'unixepoch')
+		END AS last_seen_iso
+	FROM grouped g
+	LEFT JOIN waits w
+		ON w.action = g.action
+		AND w.resource = g.resource
+		AND w.project_id = g.project_id
+		AND w.agent = g.agent
+		AND w.model = g.model
+`;
 
 /**
  * Definition of the v_sessions convenience view. Kept as a constant because
@@ -622,6 +710,61 @@ function createSchema(db: Database): void {
 		FROM rollup r
 		JOIN sessions s ON s.session_id = r.root_session_id
 	`);
+
+	// Permission capture contract (schema v7). The marker table exposes the
+	// contract version and the per-install salt used for resource hashing.
+	db.run(`
+		CREATE TABLE IF NOT EXISTS permission_contract (
+			id         INTEGER PRIMARY KEY CHECK (id = 1),
+			version    INTEGER NOT NULL,
+			salt       TEXT NOT NULL,
+			created_at INTEGER
+		)
+	`);
+
+	// One row per permission request. Discrete observations do not fit the
+	// cumulative `measurements` model, so they keep their own table.
+	db.run(`
+		CREATE TABLE IF NOT EXISTS permission_events (
+			permission_id     TEXT PRIMARY KEY,
+			session_id        TEXT,
+			project_id        TEXT,
+			agent             TEXT,
+			model             TEXT,
+			action            TEXT NOT NULL,
+			resource          TEXT,
+			resource_hash     TEXT,
+			raw_resource      TEXT,
+			reply             TEXT,
+			asked_at          INTEGER,
+			replied_at        INTEGER,
+			wait_ms           INTEGER,
+			source_tool       TEXT,
+			source_message_id TEXT,
+			save_patterns     TEXT,
+			save_reusable     INTEGER,
+			contract_version  INTEGER NOT NULL DEFAULT 1
+		)
+	`);
+
+	db.run(
+		"CREATE INDEX IF NOT EXISTS idx_permission_events_permission ON permission_events (permission_id)",
+	);
+	db.run(
+		"CREATE INDEX IF NOT EXISTS idx_permission_events_session ON permission_events (session_id, asked_at)",
+	);
+	db.run(
+		"CREATE INDEX IF NOT EXISTS idx_permission_events_resource ON permission_events (resource, action)",
+	);
+	db.run("CREATE INDEX IF NOT EXISTS idx_permission_events_action ON permission_events (action)");
+	db.run(
+		"CREATE INDEX IF NOT EXISTS idx_permission_events_asked_at ON permission_events (asked_at)",
+	);
+
+	// Recreated on every init so a definition change is not masked by
+	// `CREATE VIEW IF NOT EXISTS`. Views hold no data.
+	db.run("DROP VIEW IF EXISTS v_permission_friction");
+	db.run(V_PERMISSION_FRICTION_VIEW_SQL);
 }
 
 /**
@@ -642,6 +785,45 @@ export function ensureMetricDefinitions(db: Database): void {
 	for (const metric of METRIC_DEFINITIONS) {
 		stmt.run(metric.metric_name, metric.unit, metric.description, metric.aggregation);
 	}
+}
+
+/**
+ * Create the contract marker row once and keep its version current.
+ *
+ * The salt is generated locally and never reset by a later initialization:
+ * rotating it would break recurrence grouping for existing rows. An existing
+ * salt is preserved even when the contract version changes.
+ */
+export function ensurePermissionContract(db: Database): string {
+	db.run(`
+		CREATE TABLE IF NOT EXISTS permission_contract (
+			id         INTEGER PRIMARY KEY CHECK (id = 1),
+			version    INTEGER NOT NULL,
+			salt       TEXT NOT NULL,
+			created_at INTEGER
+		)
+	`);
+
+	const existing = db
+		.prepare("SELECT version, salt FROM permission_contract WHERE id = 1")
+		.get() as { version: number; salt: string } | null;
+
+	if (!existing) {
+		const salt = randomBytes(32).toString("hex");
+		db.prepare(
+			`INSERT INTO permission_contract (id, version, salt, created_at)
+			 VALUES (1, ?, ?, ?)`,
+		).run(PERMISSION_CONTRACT_VERSION, salt, Date.now());
+		return salt;
+	}
+
+	if (existing.version !== PERMISSION_CONTRACT_VERSION) {
+		db.prepare("UPDATE permission_contract SET version = ? WHERE id = 1").run(
+			PERMISSION_CONTRACT_VERSION,
+		);
+	}
+
+	return existing.salt;
 }
 
 /**
@@ -685,16 +867,24 @@ export function initDatabase(dataDirOverride?: string): InitDatabaseResult {
 	const dataDir = dataDirOverride ?? getDataDir();
 
 	if (!existsSync(dataDir)) {
-		mkdirSync(dataDir, { recursive: true, mode: 0o755 });
+		mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 	}
 
 	const dbPath = path.join(dataDir, "metrics.db");
 	const isNewDb = !existsSync(dbPath);
 	const db = new Database(dbPath, { create: true });
 
-	// Ensure restrictive permissions on the database file (0o644).
+	// The database contains permission resources, so it stays owner-readable
+	// and owner-writable only. Re-apply on every init so an older installation
+	// with 0o644 is tightened. A failure is non-fatal (read-only filesystems).
 	if (isNewDb) {
-		chmodSync(dbPath, 0o644);
+		chmodSync(dbPath, 0o600);
+	} else {
+		try {
+			chmodSync(dbPath, 0o600);
+		} catch (_error: unknown) {
+			// Non-fatal: the database may be on a read-only mount.
+		}
 	}
 
 	// WAL mode for concurrent read access and busy_timeout for contention.
@@ -758,6 +948,12 @@ export function initDatabase(dataDirOverride?: string): InitDatabaseResult {
 		db.run("DROP VIEW IF EXISTS v_sessions");
 		db.run(V_SESSIONS_VIEW_SQL);
 	}
+
+	// V6 → V7 migration: add the permission capture contract. The tables,
+	// indexes, and view are created by createSchema() with IF NOT EXISTS; this
+	// step seeds the contract row exactly once and preserves an existing salt.
+	// It is safe on a fresh database and on repeated initialization.
+	ensurePermissionContract(db);
 
 	// Secondary index for sub-agent tree queries (subagent-linking spec).
 	// Created after the migration so it can rely on the column existing on

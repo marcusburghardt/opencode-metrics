@@ -2,6 +2,7 @@
 
 import type { Database } from "bun:sqlite";
 import { countChildSessions } from "./db";
+import { backfillPermissionMetadata } from "./permission-store";
 
 /** Record for the projects dimension table. */
 export interface ProjectRecord {
@@ -288,6 +289,15 @@ export async function writeSessionData(db: Database, data: WriteSessionDataInput
 	const transactionFn = db.transaction(() => {
 		upsertProject(db, data.project);
 		upsertSession(db, data.session);
+
+		// Permission asks can arrive before this session row exists. Repair
+		// any null grouping metadata now that project, agent, and model are
+		// known. This is fail-open and never touches event content.
+		backfillPermissionMetadata(db, data.session.session_id, {
+			project_id: data.session.project_id,
+			agent: data.session.agent,
+			model: data.session.model,
+		});
 
 		// Derive the child count inside the transaction so it reflects the
 		// sessions stored at write time. A child captured later is picked up

@@ -3,7 +3,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { parse } from "yaml";
-import { DEFAULT_CONFIG, DEFAULT_CONFIG_YAML } from "./defaults";
+import { DEFAULT_CONFIG, DEFAULT_CONFIG_YAML, DEFAULT_PERMISSION_CAPTURE } from "./defaults";
 
 /** A single condition within a classification rule. */
 export interface ClassificationCondition {
@@ -61,9 +61,23 @@ export interface CostPricingRule {
 	description?: string;
 }
 
+/**
+ * Permission capture settings. Capture is observer-only and fail-open.
+ *
+ * - `enabled` stops new event writes when false; existing events stay readable.
+ * - `retention_days` bounds stored events; session metrics are never removed.
+ * - `store_raw` opts into storing redacted raw resources.
+ */
+export interface PermissionCaptureConfig {
+	enabled: boolean;
+	retention_days: number;
+	store_raw: boolean;
+}
+
 /** Top-level metrics configuration schema. */
 export interface MetricsConfig {
 	version: number;
+	permission_capture: PermissionCaptureConfig;
 	classification_rules: ClassificationRule[];
 	budget_rules: BudgetRule[];
 	cost_pricing: CostPricingRule[];
@@ -321,6 +335,53 @@ function validateCostPricingRule(
 }
 
 /**
+ * Resolve the `permission_capture` block.
+ *
+ * Invalid or out-of-range values fall back to the safe default for that field
+ * and are logged. The block is optional; when absent every field uses its
+ * default. A non-integer or non-positive retention window is rejected because
+ * it would either disable cleanup silently or delete everything at once.
+ */
+function resolvePermissionCapture(
+	raw: unknown,
+	log?: (msg: string) => void,
+): PermissionCaptureConfig {
+	const resolved: PermissionCaptureConfig = { ...DEFAULT_PERMISSION_CAPTURE };
+
+	if (raw === undefined) return resolved;
+	if (typeof raw !== "object" || raw === null) {
+		log?.("permission_capture is not an object, using defaults");
+		return resolved;
+	}
+
+	const obj = raw as Record<string, unknown>;
+
+	if (typeof obj.enabled === "boolean") {
+		resolved.enabled = obj.enabled;
+	} else if ("enabled" in obj) {
+		log?.("permission_capture.enabled must be a boolean, using default");
+	}
+
+	if (
+		typeof obj.retention_days === "number" &&
+		Number.isInteger(obj.retention_days) &&
+		obj.retention_days > 0
+	) {
+		resolved.retention_days = obj.retention_days;
+	} else if ("retention_days" in obj) {
+		log?.("permission_capture.retention_days must be a positive integer, using default");
+	}
+
+	if (typeof obj.store_raw === "boolean") {
+		resolved.store_raw = obj.store_raw;
+	} else if ("store_raw" in obj) {
+		log?.("permission_capture.store_raw must be a boolean, using default");
+	}
+
+	return resolved;
+}
+
+/**
  * Load the metrics configuration from dataDir/config.yaml.
  *
  * Behavior:
@@ -364,6 +425,7 @@ export function loadConfig(dataDir: string, log?: (msg: string) => void): Metric
 	// Merge with defaults: use user-provided values, fall back to defaults.
 	const config: MetricsConfig = {
 		version: typeof raw.version === "number" ? raw.version : DEFAULT_CONFIG.version,
+		permission_capture: resolvePermissionCapture(raw.permission_capture, log),
 		classification_rules: [],
 		budget_rules: [],
 		cost_pricing: [],

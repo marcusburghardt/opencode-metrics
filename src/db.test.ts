@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import type { Database } from "bun:sqlite";
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { CostPricingRule } from "./config";
-import { countChildSessions, initDatabase } from "./db";
+import { countChildSessions, ensurePermissionContract, initDatabase } from "./db";
 import { syncCostPricing } from "./pricing";
 
 /** Helper tables expected in the v4 schema. */
@@ -18,6 +18,8 @@ const EXPECTED_TABLES = [
 	"measurement_deltas",
 	"session_artifacts",
 	"cost_pricing",
+	"permission_contract",
+	"permission_events",
 ];
 
 /** Helper views expected in the v4 schema. */
@@ -30,6 +32,7 @@ const EXPECTED_VIEWS = [
 	"v_adjusted_cost_deltas",
 	"v_agent_performance",
 	"v_workflow_cost",
+	"v_permission_friction",
 ];
 
 /** Helper indexes expected in the v2 schema. */
@@ -38,6 +41,11 @@ const EXPECTED_INDEXES = [
 	"idx_measurements_metric",
 	"idx_deltas_metric_time",
 	"idx_artifacts_reference",
+	"idx_permission_events_permission",
+	"idx_permission_events_session",
+	"idx_permission_events_resource",
+	"idx_permission_events_action",
+	"idx_permission_events_asked_at",
 ];
 
 describe("initDatabase", () => {
@@ -107,7 +115,7 @@ describe("initDatabase", () => {
 
 	it("sets user_version to 6", () => {
 		const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
-		expect(row.user_version).toBe(6);
+		expect(row.user_version).toBe(7);
 	});
 
 	it("preserves user_version on subsequent calls", () => {
@@ -120,7 +128,7 @@ describe("initDatabase", () => {
 		db = second.db;
 
 		const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
-		expect(row.user_version).toBe(6);
+		expect(row.user_version).toBe(7);
 	});
 
 	it("fresh database has budget_tag column on sessions table", () => {
@@ -218,7 +226,7 @@ describe("initDatabase", () => {
 		db = migrated.db;
 
 		const versionRow = db.prepare("PRAGMA user_version").get() as { user_version: number };
-		expect(versionRow.user_version).toBe(6);
+		expect(versionRow.user_version).toBe(7);
 
 		const columns = db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>;
 		expect(columns.map((col) => col.name)).toContain("parent_session_id");
@@ -276,16 +284,16 @@ describe("initDatabase", () => {
 		v2Db.run("PRAGMA user_version = 2");
 		v2Db.close();
 
-		// Now run initDatabase on this v2 directory — should migrate to v6
+		// Now run initDatabase on this v2 directory — should migrate to v7
 		// (applying all pending migrations: v2→v3 adds budget_tag, v3→v4
 		// adds cost_pricing table and adjusted cost views, v4→v5 fixes
 		// empty project names, v5→v6 adds parent_session_id).
 		const migrated = initDatabase(v2Dir);
 		db = migrated.db;
 
-		// Schema version should be 6 (latest).
+		// Schema version should be 7 (latest).
 		const versionRow = db.prepare("PRAGMA user_version").get() as { user_version: number };
-		expect(versionRow.user_version).toBe(6);
+		expect(versionRow.user_version).toBe(7);
 
 		// budget_tag column should exist.
 		const columns = db.prepare("PRAGMA table_info(sessions)").all() as Array<{
@@ -593,13 +601,13 @@ describe("initDatabase", () => {
 		v3Db.run("PRAGMA user_version = 3");
 		v3Db.close();
 
-		// Run initDatabase — should migrate to v5.
+		// Run initDatabase — should migrate to the latest schema.
 		const migrated = initDatabase(v3Dir);
 		db = migrated.db;
 
-		// Schema version should be 5.
+		// Schema version should be the latest.
 		const versionRow = db.prepare("PRAGMA user_version").get() as { user_version: number };
-		expect(versionRow.user_version).toBe(6);
+		expect(versionRow.user_version).toBe(7);
 
 		// cost_pricing table should exist.
 		const tables = db
@@ -1379,5 +1387,206 @@ describe("v_workflow_cost", () => {
 		expect(row.total_cost_usd).toBeCloseTo(6.0);
 		expect(row.subagent_cost_share).toBeCloseTo(5 / 6, 4);
 		expect(row.root_title).toBe("workflow");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Permission capture schema (V6 → V7)
+// ---------------------------------------------------------------------------
+
+describe("permission capture schema", () => {
+	let tempDir: string;
+	let db: Database;
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(path.join(tmpdir(), "ocm-permission-schema-"));
+		db = initDatabase(tempDir).db;
+	});
+
+	afterEach(() => {
+		try {
+			db.close();
+		} catch {
+			// already closed
+		}
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	function contractRow(): { version: number; salt: string } {
+		return db.prepare("SELECT version, salt FROM permission_contract WHERE id = 1").get() as {
+			version: number;
+			salt: string;
+		};
+	}
+
+	it("fresh creation seeds contract version 1 with a salt", () => {
+		const row = contractRow();
+		expect(row.version).toBe(1);
+		expect(row.salt.length).toBeGreaterThanOrEqual(32);
+	});
+
+	it("fresh creation exposes the permission event columns", () => {
+		const columns = db.prepare("PRAGMA table_info(permission_events)").all() as Array<{
+			name: string;
+			type: string;
+		}>;
+		const names = new Set(columns.map((column) => column.name));
+		for (const expected of [
+			"permission_id",
+			"session_id",
+			"project_id",
+			"agent",
+			"model",
+			"action",
+			"resource",
+			"resource_hash",
+			"reply",
+			"asked_at",
+			"replied_at",
+			"wait_ms",
+			"source_tool",
+			"source_message_id",
+			"save_patterns",
+			"save_reusable",
+			"contract_version",
+		]) {
+			expect(names.has(expected)).toBe(true);
+		}
+	});
+
+	it("fresh creation exposes an empty friction view", () => {
+		const rows = db.prepare("SELECT * FROM v_permission_friction").all();
+		expect(rows).toEqual([]);
+	});
+
+	it("aggregates friction by action, resource, project, agent, and model", () => {
+		const now = 1_700_000_000_000;
+		const events: Array<[string, number, number | null, string]> = [
+			["perm-1", 1000, 100, "once"],
+			["perm-2", 2000, 200, "always"],
+			["perm-3", 3000, 300, "reject"],
+			["perm-4", 4000, 400, "once"],
+		];
+		for (const [id, offset, wait, reply] of events) {
+			db.run(
+				`INSERT INTO permission_events (
+					permission_id, session_id, project_id, agent, model, action, resource,
+					reply, asked_at, replied_at, wait_ms, contract_version
+				 ) VALUES (?, 'sess-1', 'proj-1', 'build', 'opus', 'shell', 'git push', ?, ?, ?, ?, 1)`,
+				[id, reply, now + offset, now + offset + (wait ?? 0), wait],
+			);
+		}
+		db.run(
+			`INSERT INTO permission_events (
+				permission_id, session_id, action, resource, asked_at, contract_version
+			 ) VALUES ('perm-5', 'sess-1', 'shell', 'make test', ?, 1)`,
+			[now + 5000],
+		);
+
+		const rows = db
+			.prepare("SELECT * FROM v_permission_friction ORDER BY resource")
+			.all() as Array<Record<string, unknown>>;
+
+		expect(rows).toHaveLength(2);
+		const gitPush = rows.find((row) => row.resource === "git push") as Record<string, unknown>;
+		expect(gitPush.prompt_count).toBe(4);
+		expect(gitPush.median_wait_ms).toBe(250);
+		expect(gitPush.p95_wait_ms).toBe(400);
+		expect(gitPush.always_count).toBe(1);
+		expect(gitPush.reject_count).toBe(1);
+		expect(gitPush.project_id).toBe("proj-1");
+		expect(gitPush.agent).toBe("build");
+		expect(gitPush.model).toBe("opus");
+		expect(gitPush.first_seen_epoch).toBe((now + 1000) / 1000);
+		expect(gitPush.last_seen_epoch).toBe(Math.floor((now + 4400) / 1000));
+	});
+
+	it("migration from v6 creates the contract and preserves existing rows", () => {
+		db.close();
+
+		const v6Dir = mkdtempSync(path.join(tmpdir(), "ocm-v6-migration-"));
+		const v6Db = new Database(path.join(v6Dir, "metrics.db"), { create: true });
+		v6Db.run(`
+			CREATE TABLE sessions (
+				session_id     TEXT PRIMARY KEY,
+				project_id     TEXT,
+				agent          TEXT,
+				model          TEXT,
+				classification TEXT,
+				title          TEXT,
+				started_at     INTEGER,
+				ended_at       INTEGER,
+				metadata       TEXT,
+				budget_tag     TEXT,
+				parent_session_id TEXT
+			)
+		`);
+		v6Db.run(`
+			CREATE TABLE measurements (
+				session_id  TEXT,
+				metric_name TEXT,
+				value       REAL,
+				recorded_at INTEGER,
+				PRIMARY KEY (session_id, metric_name)
+			)
+		`);
+		v6Db.run(
+			`INSERT INTO sessions (session_id, project_id, agent, model, started_at, ended_at, parent_session_id)
+			 VALUES ('legacy', 'proj', 'build', 'opus', 1700000000000, 1700003600000, NULL)`,
+		);
+		v6Db.run(
+			`INSERT INTO measurements (session_id, metric_name, value, recorded_at)
+			 VALUES ('legacy', 'cost', 1.25, 1700000000000)`,
+		);
+		v6Db.run("PRAGMA user_version = 6");
+		v6Db.close();
+
+		const migrated = initDatabase(v6Dir);
+		db = migrated.db;
+
+		const version = db.prepare("PRAGMA user_version").get() as { user_version: number };
+		expect(version.user_version).toBe(7);
+
+		const contract = contractRow();
+		expect(contract.version).toBe(1);
+		expect(contract.salt.length).toBeGreaterThanOrEqual(32);
+
+		const measurement = db
+			.prepare(
+				"SELECT value FROM measurements WHERE session_id = 'legacy' AND metric_name = 'cost'",
+			)
+			.get() as { value: number };
+		expect(measurement.value).toBeCloseTo(1.25);
+
+		rmSync(v6Dir, { recursive: true, force: true });
+	});
+
+	it("repeated initialization preserves the salt and existing events", () => {
+		const firstSalt = contractRow().salt;
+		db.run(`
+			INSERT INTO permission_events (permission_id, session_id, action, asked_at, contract_version)
+			VALUES ('perm-keep', 'sess-1', 'shell', 1700000000000, 1)
+		`);
+		db.close();
+
+		db = initDatabase(tempDir).db;
+
+		expect(contractRow().salt).toBe(firstSalt);
+		const event = db
+			.prepare("SELECT permission_id FROM permission_events WHERE permission_id = 'perm-keep'")
+			.get() as { permission_id: string } | null;
+		expect(event?.permission_id).toBe("perm-keep");
+	});
+
+	it("ensurePermissionContract is idempotent and keeps the salt stable", () => {
+		const first = ensurePermissionContract(db);
+		const second = ensurePermissionContract(db);
+		expect(second).toBe(first);
+		expect(contractRow().salt).toBe(first);
+
+		const count = db.prepare("SELECT COUNT(*) AS count FROM permission_contract").get() as {
+			count: number;
+		};
+		expect(count.count).toBe(1);
 	});
 });

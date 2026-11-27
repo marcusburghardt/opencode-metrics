@@ -19,6 +19,7 @@ import {
 	runSubscriptionLoop,
 	setupPlugin,
 } from "./index";
+import { PermissionRetention, PermissionStore } from "./permission-store";
 import { PermissionTracker } from "./permissions";
 import { syncCostPricing } from "./pricing";
 import { isVersionSupported, resolvePluginVersion } from "./version";
@@ -812,6 +813,36 @@ function permissionReplied(
 	return { type: "permission.replied", created, data: { sessionID, requestID } };
 }
 
+/** Full asked payload used by the capture tests. */
+function fullPermissionAsked(
+	sessionID: string,
+	id: string,
+	created: number,
+	overrides: Record<string, unknown> = {},
+): unknown {
+	return {
+		type: "permission.asked",
+		created,
+		data: {
+			sessionID,
+			id,
+			action: "shell",
+			resources: ["git push origin main"],
+			...overrides,
+		},
+	};
+}
+
+/** Full replied payload used by the capture tests. */
+function fullPermissionReplied(
+	sessionID: string,
+	requestID: string,
+	reply: string,
+	created: number,
+): unknown {
+	return { type: "permission.replied", created, data: { sessionID, requestID, reply } };
+}
+
 function emptyStream(): AsyncIterable<unknown> {
 	return {
 		[Symbol.asyncIterator]() {
@@ -988,6 +1019,11 @@ describe("event subscription loop", () => {
 			budgetCache: new ClassificationCache(),
 			sdkClient: client,
 			permissionTracker: new PermissionTracker(),
+			permissionStore: new PermissionStore({ db }),
+			permissionRetention: new PermissionRetention(
+				db,
+				DEFAULT_CONFIG.permission_capture.retention_days,
+			),
 		};
 	}
 
@@ -1427,6 +1463,185 @@ describe("event subscription loop", () => {
 			};
 			expect(count.count).toBe(0);
 			expect(capture.error).toEqual([]);
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("captures an asked/replied sequence alongside the tracker", async () => {
+		const runtime = await makeRuntime();
+		await handleSessionEvent(
+			fullPermissionAsked("sess-cap", "perm-cap", 1000, {
+				resources: ["git push origin feature/x"],
+				source: { type: "tool", messageID: "msg-1", id: "tool-1" },
+			}),
+			runtime,
+		);
+		await handleSessionEvent(fullPermissionReplied("sess-cap", "perm-cap", "once", 4000), runtime);
+
+		const row = runtime.db
+			.prepare("SELECT * FROM permission_events WHERE permission_id = 'perm-cap'")
+			.get() as Record<string, unknown>;
+
+		expect(row.resource).toBe("git push");
+		expect(row.reply).toBe("once");
+		expect(row.wait_ms).toBe(3000);
+		expect(row.source_tool).toBe("tool");
+		expect(row.source_message_id).toBe("msg-1");
+		expect(row.contract_version).toBe(1);
+		expect(runtime.permissionTracker.drain("sess-cap")).toEqual({
+			permission_prompts: 1,
+			permission_wait_seconds: 3,
+		});
+	});
+
+	it("does not duplicate rows on repeated permission deliveries", async () => {
+		const runtime = await makeRuntime();
+		const asked = fullPermissionAsked("sess-dup", "perm-dup", 1000);
+		await handleSessionEvent(asked, runtime);
+		await handleSessionEvent(asked, runtime);
+		await handleSessionEvent(
+			fullPermissionReplied("sess-dup", "perm-dup", "always", 2000),
+			runtime,
+		);
+
+		const count = runtime.db
+			.prepare("SELECT COUNT(*) AS count FROM permission_events WHERE permission_id = 'perm-dup'")
+			.get() as { count: number };
+		expect(count.count).toBe(1);
+	});
+
+	it("captures save patterns from an always reply", async () => {
+		const runtime = await makeRuntime();
+		await handleSessionEvent(
+			fullPermissionAsked("sess-save", "perm-save", 1000, {
+				resources: ["git status"],
+				save: ["git push *"],
+			}),
+			runtime,
+		);
+		await handleSessionEvent(
+			fullPermissionReplied("sess-save", "perm-save", "always", 2000),
+			runtime,
+		);
+
+		const row = runtime.db
+			.prepare(
+				"SELECT resource, save_patterns, save_reusable FROM permission_events WHERE permission_id = 'perm-save'",
+			)
+			.get() as { resource: string; save_patterns: string; save_reusable: number };
+
+		expect(row.resource).toBe("git status");
+		expect(JSON.parse(row.save_patterns)).toEqual(["git push *"]);
+		expect(row.save_reusable).toBe(1);
+	});
+
+	it("ignores an orphan reply without failing the session", async () => {
+		const runtime = await makeRuntime();
+		await handleSessionEvent(
+			fullPermissionReplied("sess-orphan", "perm-missing", "once", 2000),
+			runtime,
+		);
+
+		const count = runtime.db.prepare("SELECT COUNT(*) AS count FROM permission_events").get() as {
+			count: number;
+		};
+		expect(count.count).toBe(0);
+	});
+
+	it("does not capture when permission_capture is disabled", async () => {
+		const runtime = await makeRuntime();
+		runtime.config = {
+			...DEFAULT_CONFIG,
+			permission_capture: { ...DEFAULT_CONFIG.permission_capture, enabled: false },
+		};
+
+		await handleSessionEvent(fullPermissionAsked("sess-off", "perm-off", 1000), runtime);
+		await handleSessionEvent(fullPermissionReplied("sess-off", "perm-off", "once", 2000), runtime);
+
+		const count = runtime.db.prepare("SELECT COUNT(*) AS count FROM permission_events").get() as {
+			count: number;
+		};
+		expect(count.count).toBe(0);
+		expect(runtime.permissionTracker.drain("sess-off")).toEqual({
+			permission_prompts: 1,
+			permission_wait_seconds: 1,
+		});
+	});
+
+	it("still records session metrics when capture is disabled", async () => {
+		const runtime = await makeRuntime();
+		runtime.config = {
+			...DEFAULT_CONFIG,
+			permission_capture: { ...DEFAULT_CONFIG.permission_capture, enabled: false },
+		};
+
+		await handleSessionEvent(fullPermissionAsked("sess-disabled", "perm-disabled", 1000), runtime);
+		await handleSessionEvent(
+			fullPermissionReplied("sess-disabled", "perm-disabled", "once", 4000),
+			runtime,
+		);
+		await handleSessionEvent(idleEvent("sess-disabled"), runtime);
+
+		const prompts = runtime.db
+			.prepare(
+				"SELECT value FROM measurements WHERE session_id = 'sess-disabled' AND metric_name = 'permission_prompts'",
+			)
+			.get() as { value: number } | null;
+		expect(prompts?.value).toBe(1);
+
+		const session = runtime.db
+			.prepare("SELECT COUNT(*) AS count FROM sessions WHERE session_id = 'sess-disabled'")
+			.get() as { count: number };
+		expect(session.count).toBe(1);
+
+		const events = runtime.db.prepare("SELECT COUNT(*) AS count FROM permission_events").get() as {
+			count: number;
+		};
+		expect(events.count).toBe(0);
+	});
+
+	it("still records session metrics when permission tables are absent", async () => {
+		const runtime = await makeRuntime();
+		runtime.db.run("DROP VIEW IF EXISTS v_permission_friction");
+		runtime.db.run("DROP TABLE permission_events");
+
+		await handleSessionEvent(fullPermissionAsked("sess-legacy", "perm-legacy", 1000), runtime);
+		await handleSessionEvent(idleEvent("sess-legacy"), runtime);
+
+		const cost = runtime.db
+			.prepare("SELECT COUNT(*) AS count FROM measurements WHERE session_id = 'sess-legacy'")
+			.get() as { count: number };
+		expect(cost.count).toBeGreaterThan(0);
+
+		const session = runtime.db
+			.prepare("SELECT COUNT(*) AS count FROM sessions WHERE session_id = 'sess-legacy'")
+			.get() as { count: number };
+		expect(session.count).toBe(1);
+	});
+
+	it("fails open when capture hits a closed database", async () => {
+		const capture = captureConsole();
+		try {
+			const runtime = await makeRuntime();
+			// Prime the availability cache while the database is open so the
+			// closed-database error reaches the fail-open logging path.
+			runtime.permissionStore?.isAvailable();
+			runtime.db.close();
+
+			await handleSessionEvent(fullPermissionAsked("sess-closed", "perm-closed", 1000), runtime);
+			await handleSessionEvent(
+				fullPermissionReplied("sess-closed", "perm-closed", "once", 2000),
+				runtime,
+			);
+
+			expect(capture.warn.some((line) => line.includes("failed to capture permission"))).toBe(
+				true,
+			);
+			expect(runtime.permissionTracker.drain("sess-closed")).toEqual({
+				permission_prompts: 1,
+				permission_wait_seconds: 1,
+			});
 		} finally {
 			capture.restore();
 		}
@@ -2073,8 +2288,8 @@ describe("setupPlugin", () => {
 			expect(capture.error).toEqual([]);
 
 			const dataDir = path.join(dataHome, "opencode-metrics");
-			expect(statSync(dataDir).mode & 0o777).toBe(0o755);
-			expect(statSync(path.join(dataDir, "metrics.db")).mode & 0o777).toBe(0o644);
+			expect(statSync(dataDir).mode & 0o777).toBe(0o700);
+			expect(statSync(path.join(dataDir, "metrics.db")).mode & 0o777).toBe(0o600);
 			expect(statSync(path.join(dataDir, "config.yaml")).mode & 0o777).toBe(0o644);
 		} finally {
 			process.umask(previousUmask);

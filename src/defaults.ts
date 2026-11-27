@@ -1,7 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { parse } from "yaml";
-import type { ClassificationCondition, MetricsConfig } from "./config";
+import type { ClassificationCondition, MetricsConfig, PermissionCaptureConfig } from "./config";
+
+/**
+ * Safe defaults for permission capture. Capture is enabled so friction
+ * evidence is collected without configuration; raw resources stay off and
+ * events expire after 90 days.
+ */
+export const DEFAULT_PERMISSION_CAPTURE: PermissionCaptureConfig = {
+	enabled: true,
+	retention_days: 90,
+	store_raw: false,
+};
 
 /**
  * Default config.yaml content with all 8 built-in classification rules.
@@ -21,6 +32,15 @@ export const DEFAULT_CONFIG_YAML = `\
 # opencode-metrics configuration
 # Classification rules are evaluated in order — first match wins.
 version: 1
+
+# Permission capture stores sanitized permission events (contract version 1).
+# Raw commands, paths, tokens, headers, and message text are never stored by
+# default. Retention removes permission events older than the window; session
+# metrics are always kept. Set enabled: false to stop recording new events.
+permission_capture:
+  enabled: true
+  retention_days: 90
+  store_raw: false
 
 classification_rules:
   # PR review sessions — triggered by PR URL in the initial message.
@@ -185,6 +205,12 @@ export const DEFAULT_CONFIG: MetricsConfig = (() => {
 	// Ensure cost_pricing exists as an empty array when not provided.
 	if (!Array.isArray(config.cost_pricing)) {
 		config.cost_pricing = [];
+	}
+
+	// Permission capture defaults are also declared in the YAML above; fall
+	// back to the constant if the document ever omits the block.
+	if (typeof config.permission_capture !== "object" || config.permission_capture === null) {
+		config.permission_capture = { ...DEFAULT_PERMISSION_CAPTURE };
 	}
 
 	return config;
