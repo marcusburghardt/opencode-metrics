@@ -5,6 +5,9 @@ Captures cost, token usage, session duration, code-impact stats, and
 classification data into a local SQLite database — queryable with standard
 SQL tools or Grafana dashboards.
 
+Published on npm as
+[`@mburghardt/opencode-metrics`](https://www.npmjs.com/package/@mburghardt/opencode-metrics).
+
 ## Quick Reference
 
 ### Install
@@ -192,8 +195,9 @@ container and point the datasource at `metrics.db`. See
 
 ### From npm
 
-Add `@mburghardt/opencode-metrics` to the `plugins` array in your OpenCode configuration
-file (`~/.config/opencode/opencode.json` or `opencode.json` in your project):
+Add [`@mburghardt/opencode-metrics`](https://www.npmjs.com/package/@mburghardt/opencode-metrics)
+to the `plugins` array in your OpenCode configuration file
+(`~/.config/opencode/opencode.json` or `opencode.json` in your project):
 
 ```jsonc
 {
